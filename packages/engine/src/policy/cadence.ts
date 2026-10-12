@@ -1,0 +1,193 @@
+import type { EngineDatabase, ObservationRow } from '../db/database.js';
+import { FRESHNESS, freshness, surfaceName, type Surface, type SurfaceRef } from '../kernel/evidence.js';
+
+/**
+ * When a surface is next worth reading.
+ *
+ * Pure: given the latest observation for a scope, the account's tier and its backoff state, it
+ * returns a due time. It reaches no port, opens no transaction and reads no clock of its own.
+ *
+ * The base intervals extend `FRESHNESS` rather than restating it. `FRESHNESS` already answers
+ * "how long is one complete observation worth trusting?", and "refresh before it stops being
+ * trustworthy" is the same number — a second, independently maintained table would drift, and
+ * the drift would show up as evidence going `STALE` in the middle of a planner tick.
+ *
+ * The numbers are the ones settled in
+ * `cslytics-app-docs/plans/completed/continuous-freshness-plan.md` §4.2 and §9. They are engineering
+ * choices, not measured Steam limits. Whether several accounts behind one IP share Steam's
+ * budget or are counted independently is **unmeasured** (plan §9.2), so the runtime keeps both a
+ * per-account and a process-wide budget and this table stays deliberately unhurried.
+ */
+export type Tier = 'ACTIVE' | 'BACKGROUND';
+
+export type CadenceRule = {
+  /** How often to read when the account is the one on screen. */
+  activeMs: number;
+  /** How often to read when the account is signed in but not being looked at. */
+  backgroundMs: number;
+  /**
+   * True when a timer alone should never schedule this surface.
+   *
+   * Casket contents are the case. While this app holds the CS2 session — which is exclusive per
+   * account — nothing else can move an item into or out of a unit, so a periodic walk of every
+   * casket would spend the GC budget proving that nothing changed. They refresh on the events
+   * that imply a change, and on the post-reconnect sweep that covers the one window in which a
+   * change could have gone unseen.
+   */
+  eventDrivenOnly?: boolean;
+};
+
+export const CADENCE: Record<Surface, CadenceRule> = {
+  'csfloat-inventory': { activeMs: 15 * 60_000, backgroundMs: 60 * 60_000, eventDrivenOnly: true },
+  // Admission and dispatch both refuse an item whose sales book has lapsed rather than read an
+  // unwalked book as an empty one (CSF-13), so this interval is the freshness window and not a
+  // separately chosen number. At ninety minutes against a five-minute window the book was outside
+  // it for all but the first five minutes of each cycle, and storing, listing or transferring any
+  // item on a CSFloat-connected account was refused for the rest of it.
+  'csfloat-trades': { activeMs: FRESHNESS['csfloat-trades'].maxAgeMs, backgroundMs: 20 * 60_000 },
+  'csfloat-trade': { activeMs: 60_000, backgroundMs: 5 * 60_000, eventDrivenOnly: true },
+  // One listing by id. The loop has a ref for one only while a delist or reprice waits on it
+  // (`RefreshService.scopes`), so a timer here reads nothing else; it is what keeps reading after
+  // the proof bound, so a delist CSFloat could not be read for during an outage is still read
+  // for once it answers, rather than waiting for someone to refresh (CSF-45).
+  'csfloat-listing': { activeMs: 5 * 60_000, backgroundMs: 20 * 60_000 },
+  'steam-trade-inventory': { activeMs: 5 * 60_000, backgroundMs: 20 * 60_000, eventDrivenOnly: true },
+  'gc-inventory': { activeMs: FRESHNESS['gc-inventory'].maxAgeMs, backgroundMs: 20 * 60_000 },
+  'gc-casket': { activeMs: 15 * 60_000, backgroundMs: 60 * 60_000, eventDrivenOnly: true },
+  'gc-storage-units': { activeMs: 15 * 60_000, backgroundMs: 60 * 60_000 },
+  'gc-event': { activeMs: Number.POSITIVE_INFINITY, backgroundMs: Number.POSITIVE_INFINITY, eventDrivenOnly: true },
+  'steam-market': { activeMs: FRESHNESS['steam-market'].maxAgeMs, backgroundMs: 20 * 60_000 },
+  'steam-market-history': { activeMs: FRESHNESS['steam-market-history'].maxAgeMs, backgroundMs: 60 * 60_000 },
+  'steam-wallet': { activeMs: 10 * 60_000, backgroundMs: 60 * 60_000 },
+  // Trades happen on someone else's schedule, so both surfaces are timer-driven. History is
+  // read less often than offers because a checkpointed walk of an append-only log costs one
+  // page when nothing happened, and an offer is the thing that blocks the user's own work.
+  'steam-trade-offers': { activeMs: FRESHNESS['steam-trade-offers'].maxAgeMs, backgroundMs: 20 * 60_000 },
+  'steam-trade-history': { activeMs: FRESHNESS['steam-trade-history'].maxAgeMs, backgroundMs: 60 * 60_000 },
+  // A face changes rarely. Both tiers use the same 24h interval so a background account still
+  // gets a fresh hash once a day without spending CM budget more often than an active one.
+  'steam-persona': { activeMs: FRESHNESS['steam-persona'].maxAgeMs, backgroundMs: FRESHNESS['steam-persona'].maxAgeMs },
+  // An account's own CSFloat status changes when the venue decides it does — a balance
+  // settles, a restriction lands — so it is timer-driven, and cheap: one request, one row.
+  'csfloat-account-status': { activeMs: FRESHNESS['csfloat-account-status'].maxAgeMs, backgroundMs: 30 * 60_000 },
+  // Roughly 50,000 stall reads a day were remaining after one call (fixtures/csfloat/INDEX.md),
+  // so the cadence is set by what the user needs to see rather than by the budget.
+  'csfloat-stall': { activeMs: FRESHNESS['csfloat-stall'].maxAgeMs, backgroundMs: 20 * 60_000 },
+  // The own buy-order book shares the stall's 50,000-a-day family (fixtures/csfloat/INDEX.md), so
+  // its cadence too is set by what the Buy orders page needs to show rather than by the budget.
+  'csfloat-buy-orders': { activeMs: FRESHNESS['csfloat-buy-orders'].maxAgeMs, backgroundMs: 20 * 60_000 },
+  // Read when the Store screen asks or a purchase is admitted. Nothing in the background needs
+  // to know what Valve is selling today.
+  'gc-store-price-sheet': { activeMs: FRESHNESS['gc-store-price-sheet'].maxAgeMs, backgroundMs: 60 * 60_000, eventDrivenOnly: true }
+};
+
+/**
+ * How long to leave the wallet alone when nothing could have moved it (plan §9.4).
+ *
+ * With no open listing, no live buy order and no recent sale, the only remaining cause of a
+ * balance change is the user adding funds on the Steam website — and every *other* cause already
+ * has a trigger that reads the wallet immediately. So the timer exists solely for the website
+ * case, and six hours is plenty.
+ */
+export const WALLET_QUIET_MS = 6 * 60 * 60_000;
+
+/** The order a pass reads surfaces in: cheapest and most explanatory first. */
+export const SURFACE_ORDER: readonly Surface[] = [
+  'steam-persona', 'gc-inventory', 'gc-storage-units', 'gc-casket', 'steam-market', 'steam-market-history', 'steam-wallet',
+  'steam-trade-offers', 'steam-trade-history'
+];
+
+export type BackoffState = { consecutiveFailures: number; notBeforeMs: number };
+
+export type DueInput = {
+  ref: SurfaceRef;
+  tier: Tier;
+  /** The latest observation for exactly this scope, or undefined when there has never been one. */
+  observation: ObservationRow | undefined;
+  now: Date;
+  backoff?: BackoffState | undefined;
+  /** Set when a signal asked for this surface since the last read. Overrides the timer, not the budget. */
+  requested?: boolean;
+  /** Only meaningful for `steam-wallet`: false lets the quiet interval apply. */
+  hasOpenCommitment?: boolean;
+  /** An owned transfer is waiting on offers, or on both inventories after acceptance. */
+  transferIntervalMs?: number;
+  /** When a waiting action's need makes this scope due (`policy/proof.ts`). Never past the backoff. */
+  proofDueAtMs?: number | undefined;
+};
+
+export type DueVerdict =
+  | { due: true; because: 'never-observed' | 'requested' | 'proof' | 'stale' | 'incomplete' }
+  | { due: false; because: 'fresh' | 'backing-off' | 'event-driven-only'; nextDueAtMs: number };
+
+export function baseIntervalMs(surface: Surface, tier: Tier, hasOpenCommitment = true): number {
+  const rule = CADENCE[surface];
+  if (surface === 'steam-wallet' && !hasOpenCommitment) return WALLET_QUIET_MS;
+  return tier === 'ACTIVE' ? rule.activeMs : rule.backgroundMs;
+}
+
+/**
+ * Whether this surface should be read now.
+ *
+ * Note what is *not* here: nothing about actions, attempts or mutations. This decides when to
+ * look, never whether to act. Re-sending a mutation is repository rule 1's business and the
+ * scheduler that consumes this has no verb for it.
+ */
+export function isDue(input: DueInput): DueVerdict {
+  const nowMs = input.now.getTime();
+  const surface = input.ref.surface;
+  const rule = CADENCE[surface];
+
+  if (input.backoff && input.backoff.notBeforeMs > nowMs && !input.requested) {
+    return { due: false, because: 'backing-off', nextDueAtMs: input.backoff.notBeforeMs };
+  }
+  if (input.requested) return { due: true, because: 'requested' };
+  const proofAtMs = input.proofDueAtMs ?? Number.POSITIVE_INFINITY;
+  if (proofAtMs <= nowMs) return { due: true, because: 'proof' };
+  if (rule.eventDrivenOnly) {
+    return { due: false, because: 'event-driven-only', nextDueAtMs: proofAtMs };
+  }
+  if (!input.observation) return { due: true, because: 'never-observed' };
+
+  const grade = freshness(input.observation, surface, input.now);
+  if (grade === 'INCOMPLETE') {
+    // An incomplete walk proves nothing (rule 5), so it does not reset the clock. It is due
+    // again as soon as its backoff allows, which is the branch above.
+    const notBefore = input.backoff?.notBeforeMs ?? nowMs;
+    return notBefore <= nowMs
+      ? { due: true, because: 'incomplete' }
+      : { due: false, because: 'backing-off', nextDueAtMs: notBefore };
+  }
+
+  const interval = Math.min(baseIntervalMs(surface, input.tier, input.hasOpenCommitment ?? true),input.transferIntervalMs ?? Infinity);
+  const startedMs = Date.parse(input.observation.started_at);
+  if (!Number.isFinite(startedMs)) return { due: true, because: 'incomplete' };
+  const staleAtMs = startedMs + interval;
+  return nowMs >= staleAtMs ? { due: true, because: 'stale' } : { due: false, because: 'fresh', nextDueAtMs: Math.min(staleAtMs, proofAtMs) };
+}
+
+/**
+ * True when this account holds something that could move its wallet without the user acting.
+ *
+ * Read from persisted observation, never inferred from an attempt: an open listing is one Steam
+ * showed us in a walk, and an open buy order is one the book still lists.
+ */
+export function hasOpenCommitment(database: EngineDatabase, accountId: string): boolean {
+  const row = database.raw().prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM market_listing WHERE account_id=? AND status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')) AS listings,
+      (SELECT COUNT(*) FROM buy_order WHERE account_id=? AND active=1) AS orders,
+      (SELECT COUNT(*) FROM venue_order WHERE account_id=? AND state NOT LIKE 'ENDED_%') AS open_orders
+  `).get(accountId, accountId, accountId) as { listings: number; orders: number; open_orders: number };
+  return row.listings > 0 || row.orders > 0 || row.open_orders > 0;
+}
+
+/** The latest observation for one scope, in the shape `isDue` wants. */
+export function latestFor(database: EngineDatabase, accountId: string, ref: SurfaceRef): ObservationRow | undefined {
+  return database.latestObservationForScope(
+    accountId,
+    FRESHNESS[ref.surface].scope,
+    ref.scope.id ?? null,
+    surfaceName(ref)
+  );
+}

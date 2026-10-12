@@ -1,0 +1,23 @@
+diff --git a/templates/nsis/include/installer.nsh b/templates/nsis/include/installer.nsh
+index 300ef3dd699d0f5a081b1934fcc22dbe12025bdb..592bc37bb2df8a57ed615e100f81e6bfd9e62d7a 100644
+--- a/templates/nsis/include/installer.nsh
++++ b/templates/nsis/include/installer.nsh
+@@ -71,6 +71,18 @@
+ 
+       !insertmacro downloadApplicationFiles
+ 
++      # cslytics: a downloaded package must be the one this signed installer was built with ($1 holds
++      # its SHA-512 on this path). Upstream extracts whatever the URL served.
++      ${if} $isPackageFileExplicitlySpecified == "false"
++        ${StdUtils.HashFile} $3 "SHA2-512" "$packageFile"
++        ${if} $3 != $1
++          Delete "$packageFile"
++          MessageBox MB_OK|MB_ICONSTOP "The downloaded application package does not match this installer, so nothing was installed.$\r$\n$\r$\nExpected $1$\r$\nReceived $3" /SD IDOK
++          SetErrorLevel 2
++          Quit
++        ${endIf}
++      ${endIf}
++
+       fun_extract:
+         !insertmacro extractUsing7za "$packageFile"
+ 

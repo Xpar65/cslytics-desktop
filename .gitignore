@@ -1,0 +1,8 @@
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+.vite/
+dist/
+node_modules/
+out/

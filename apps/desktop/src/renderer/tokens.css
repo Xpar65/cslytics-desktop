@@ -1,0 +1,50 @@
+/*
+ * Cslytics design tokens: everything but colour.
+ *
+ * Source: `cslytics-app-docs/style-guide.md`. Never write a colour literal in a component or in
+ * app.css. Colours belong to a theme: each is a palette in `shared/themes/`, one file per theme,
+ * one value per token in `PALETTE_TOKENS`, which `lib/appearance.ts` sets on <html> before the
+ * first render. A colour that is missing is a new token there, given a value in every theme.
+ *
+ * What stays here is what no theme changes: radii, type, motion and layout.
+ *
+ * Desktop additions to the guide, all declared here so they stay in one place: a motion scale
+ * (the guide's "colour only" rule was written for a panel mounted inside Steam's page; a
+ * desktop window is expected to move, and every transition honours `prefers-reduced-motion`),
+ * a popover shadow for menus and toasts, a muted identity ramp for account avatars, and a round
+ * glow behind item art on tiles and grouped rows. The guide says nothing glows; the glow was
+ * asked for in place of the boxed square a tile used to draw around every picture, and it is a
+ * shade rather than a hue, so it separates the skin from the well without adding a colour to the
+ * chrome.
+ */
+
+:root {
+  /* Radii */
+  --cs-radius-sm: 0.375rem;
+  --cs-radius: 0.5rem;
+  --cs-radius-lg: 0.75rem;
+  --cs-radius-xl: 1rem;
+  --cs-radius-full: 9999px;
+
+  /* Not a theme colour: a QR code needs a true-white quiet zone to stay scannable. */
+  --cs-qr-ground: #FFFFFF;
+
+  --cs-font: "Segoe UI Variable Text", "Segoe UI", ui-sans-serif, system-ui, -apple-system, Roboto, sans-serif;
+  --cs-font-display: "Segoe UI Variable Display", "Segoe UI", ui-sans-serif, system-ui, -apple-system, Roboto, sans-serif;
+  --cs-font-mono: "Cascadia Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Motion. One easing, three durations; nothing on screen moves for longer than --cs-dur-slow. */
+  --cs-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --cs-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --cs-dur-fast: 150ms;
+  --cs-dur: 220ms;
+  --cs-dur-slow: 360ms;
+
+  /* Layout */
+  /* The window's own title bar strip. main/index.ts sizes Windows' caption buttons to the same
+     height (TITLEBAR_HEIGHT), so change both or neither. */
+  --cs-titlebar: 32px;
+  --cs-sidebar: 232px;
+  --cs-sidebar-rail: 56px;
+  --cs-row: 64px;
+}

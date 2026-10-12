@@ -1,0 +1,25 @@
+<svg width="1024" height="1024" viewBox="150 150 724 724" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Amber bar chart icon with gradient background</title>
+  <desc>Five amber pill-shaped bars inside a rounded square with a bottom-to-top dark slate gradient.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#0B0F14"/>
+      <stop offset="100%" stop-color="#1e2d40"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background: bottom-to-top gradient -->
+  <rect x="156" y="176" width="712" height="672" rx="82" fill="url(#bg)"/>
+
+  <!-- Bars: fill and outline are intentionally the same colour -->
+  <rect x="216" y="650" width="64" height="104" rx="32" fill="#fbbf24" stroke="#fbbf24" stroke-width="10"/>
+
+  <rect x="304" y="335" width="68" height="419" rx="34" fill="#fbbf24" stroke="#fbbf24" stroke-width="10"/>
+
+  <rect x="398" y="555" width="136" height="199" rx="34" fill="#fbbf24" stroke="#fbbf24" stroke-width="10"/>
+
+  <rect x="568" y="240" width="68" height="514" rx="34" fill="#fbbf24" stroke="#fbbf24" stroke-width="10"/>
+
+  <rect x="662" y="682" width="184" height="72" rx="36" fill="#fbbf24" stroke="#fbbf24" stroke-width="10"/>
+</svg>

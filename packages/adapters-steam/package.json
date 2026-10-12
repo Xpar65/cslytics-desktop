@@ -1,0 +1,17 @@
+{
+  "name": "@cslytics/adapters-steam",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@cslytics/ports": "workspace:*",
+    "globaloffensive": "^3.2.0",
+    "long": "^5.3.2",
+    "lzma": "^2.3.2",
+    "protobufjs": "^7.6.6",
+    "steam-session": "^1.7.2",
+    "steam-user": "^5.2.3",
+    "steamcommunity": "^3.49.0"
+  }
+}

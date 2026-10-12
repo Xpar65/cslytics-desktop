@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      This window has no remote origin at all. Item art used to be loaded here, straight from
+      Steam's CDN, and `img-src` had to name each host that finally *served* the bytes — because
+      img-src is re-checked against a redirect target and a blocked redirect produces no error
+      anywhere except a missing picture. That is how every account avatar silently stayed as
+      initials while `steamcdn-a.akamaihd.net` was listed here, and it is one of several causes
+      that were indistinguishable from inside an <img> element.
+
+      So the fetch moved to the main process. The window now asks for a picture by reference over
+      `cs-image:`, and main answers from a store it owns, having done the network itself where a
+      failure can be logged, retried and kept — see `packages/catalogue/src/images.ts` and
+      `apps/desktop/src/main/images/cache.ts`. `scripts/check-assets.ts` holds this line to exactly
+      this shape, because `img-src https:` would work, pass every other test, and quietly undo the
+      reason SYS-03 exists.
+
+      Nothing widens. Every directive but `style-src` is now `'self'` or our own scheme: the
+      renderer has no programmable network access — no fetch, XHR, WebSocket or EventSource — and
+      no declarative reach past this process either.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data: cs-image:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+    <title>CSlytics Trading</title>
+  </head>
+  <body>
+    <!-- What the window is dragged by; outside React, so a page that fails to mount still moves and closes. -->
+    <div class="titlebar" aria-hidden="true"></div>
+    <div id="root"></div>
+    <script type="module" src="/main.tsx"></script>
+  </body>
+</html>
+

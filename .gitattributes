@@ -1,0 +1,3 @@
+# pnpm applies these to LF sources and hashes them into the lockfile; a CRLF checkout of either
+# would stop the patch applying or its hash matching.
+*.patch text eol=lf

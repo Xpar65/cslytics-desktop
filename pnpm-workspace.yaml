@@ -1,0 +1,11 @@
+packages:
+  - apps/*
+  - packages/*
+
+onlyBuiltDependencies:
+  - electron
+  - esbuild
+  - protobufjs
+
+patchedDependencies:
+  app-builder-lib@26.15.3: patches/app-builder-lib-web-package-hash.patch

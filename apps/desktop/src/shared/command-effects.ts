@@ -1,0 +1,137 @@
+import type { EngineCommand } from './api.js';
+
+/**
+ * What a window command can do to the outside world, for the stop switch (desktop release plan §5).
+ *
+ * - `venue` asks Steam, the Game Coordinator or CSFloat to change something, or records an intent
+ *   the engine will act on at a venue. A retired version refuses all of these.
+ * - `local` reads, observes, signs in, or changes a setting on this computer. A retired version
+ *   keeps these, so a person can still see what they own and what is in flight.
+ * - `always` is never refused by any rule: stopping unsent work, and the release commands a
+ *   person needs in order to get out of a retired version.
+ *
+ * The record is keyed by every command type, so adding a command to `api.ts` fails the typecheck
+ * until someone decides which of the three it is. A command left out would otherwise be one the
+ * stop switch could not stop.
+ */
+export type CommandEffect = 'venue' | 'local' | 'always';
+
+export type CommandType = EngineCommand['type'];
+
+export const COMMAND_EFFECTS = {
+  'csfloat.page': 'local',
+  'csfloat.overview': 'local',
+  'csfloat.refresh': 'local',
+  'csfloat.protection': 'local',
+  'csfloat.list': 'venue',
+  'csfloat.reprice': 'venue',
+  'csfloat.cancel': 'venue',
+  'csfloat.buyOrderEdit': 'venue',
+  'csfloat.buyOrderCancel': 'venue',
+  'csfloat.deliver': 'venue',
+  'csfloat.deliveryRefresh': 'local',
+  'csfloat.cannotDeliver': 'venue',
+  'store.sheet': 'local',
+  'store.refresh': 'local',
+  'store.purchases': 'local',
+  'store.buy': 'venue',
+  'store.cancel': 'venue',
+  'store.continue': 'venue',
+  'storage.contentsPage': 'local',
+  'inventory.detail': 'local',
+  'orders.detail': 'local',
+  'history.detail': 'local',
+  'trades.detail': 'local',
+  'ledger.detail': 'local',
+  'activity.detail': 'local',
+  'command.membersPage': 'local',
+  'selection.matching': 'local',
+  'auth.beginQr': 'local',
+  'auth.pollQr': 'local',
+  'auth.credentials': 'local',
+  'auth.guard': 'local',
+  'auth.cancel': 'local',
+  'auth.refresh': 'local',
+  'accounts.list': 'local',
+  // Both erase this computer's copy of one account and reach no venue: a retired version keeps them,
+  // so a person can still take an account off a machine.
+  'accounts.clearable': 'local',
+  'accounts.remove': 'local',
+  'accounts.reset': 'local',
+  'marketplace.connect': 'local',
+  'marketplace.disconnect': 'local',
+  'marketplace.status': 'local',
+  'marketplace.refresh': 'local',
+  'marketplace.stall': 'venue',
+  'inventory.sync': 'local',
+  'inventory.read': 'local',
+  'inventory.page': 'local',
+  'inventory.groups': 'local',
+  'catalogue.status': 'local',
+  'catalogue.suggest': 'local',
+  'catalogue.accessories': 'local',
+  'work.open': 'local',
+  'waiting.open': 'local',
+  'csfloat.eligibility': 'local',
+  'history.page': 'local',
+  'activity.page': 'local',
+  'storage.page': 'local',
+  'orders.page': 'local',
+  'trades.page': 'local',
+  'ledger.page': 'local',
+  'listings.page': 'local',
+  'listings.summary': 'local',
+  'trades.sync': 'local',
+  'trades.list': 'local',
+  'trades.summary': 'local',
+  'trades.entry': 'local',
+  'trades.items': 'local',
+  'transfer.plan': 'local',
+  'transfer.submit': 'venue',
+  'transfer.refresh': 'local',
+  'transfer.cancel': 'venue',
+  'transfers.page': 'local',
+  'selection.capture': 'local',
+  'selection.read': 'local',
+  'command.read': 'local',
+  'command.stop': 'always',
+  'storage.sync': 'local',
+  'storage.read': 'local',
+  'storage.store': 'venue',
+  'storage.retrieve': 'venue',
+  'storage.rename': 'venue',
+  'market.sync': 'local',
+  'market.read': 'local',
+  'plan.read': 'local',
+  'goals.preview': 'local',
+  'conflicts.read': 'local',
+  // `resume` renews the app's authority to act on a suspended goal, which is a venue change by the
+  // time it lands; `adopt` accepts the world as observed. One command carries both, so it is the
+  // stricter of the two.
+  'conflicts.resolve': 'venue',
+  'market.history': 'local',
+  'orders.read': 'local',
+  'wallet.sync': 'local',
+  'listing.create': 'venue',
+  'command.submit': 'venue',
+  'listing.remove': 'venue',
+  'buyOrder.create': 'venue',
+  'buyOrder.cancel': 'venue',
+  'buyOrders.read': 'local',
+  'buyOrders.refresh': 'local',
+  'timeline.read': 'local',
+  'portfolio.read': 'local',
+  'session.status': 'local',
+  'session.connect': 'local',
+  'session.signOut': 'local',
+  'refresh.now': 'local',
+  'refresh.resume': 'local',
+  'refresh.status': 'local',
+  'refresh.scope': 'local',
+  'release.status': 'always',
+  'release.check': 'always',
+  'release.install': 'always',
+  'settings.read': 'local',
+  'settings.write': 'local',
+  'settings.launch': 'local'
+} as const satisfies Record<CommandType, CommandEffect>;

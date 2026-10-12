@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # The installer this commit would ship, unsigned, and the proof that it starts: the packaged app
+  # opens a trading record and resolves every runtime dependency from inside app.asar. Signing never
+  # happens here; the key is on a hardware token and official builds are signed by hand.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm package:desktop
+      - run: pnpm smoke:packaged
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cslytics-unsigned-${{ github.sha }}
+          path: |
+            apps/desktop/dist/*.exe
+            apps/desktop/dist/nsis-web/*
+            apps/desktop/dist/*.blockmap
+            apps/desktop/dist/latest.yml
+          retention-days: 14
