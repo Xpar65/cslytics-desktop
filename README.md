@@ -1,43 +1,59 @@
 # CSlytics
 
-A free, open-source Windows desktop for CS2 traders. It manages every Steam account you own from one
-window: inventory and storage units, Steam Community Market listings and buy orders, trades, the
-in-game store, and CSFloat listings, buy orders and deliveries.
+A free, open-source Windows app for CS2 traders. Every Steam account you own in one window:
+inventory and storage units, Steam Market listings and buy orders, trades, the in-game store, and
+CSFloat listings, buy orders and deliveries.
 
-**Download:** [cslytics.com](https://cslytics.com) or this repository's
-[Releases](https://github.com/Xpar65/cslytics-desktop/releases). Both carry the same signed files.
+**[Download for Windows](https://cslytics.com/download)** ·
+[Releases](https://github.com/Xpar65/cslytics-desktop/releases) ·
+[Road map](https://cslytics.com/#roadmap) ·
+[Discord](https://discord.gg/cHFQakqDRF)
+
+**It never asks for your Steam Guard secrets.** No `shared_secret`, no `identity_secret`, no
+`.maFile`. You sign in with a QR code from the Steam mobile app, or your password and a Steam Guard
+code, the same way you do on the Steam website. Trade and listing confirmations stay on your phone.
 
 ## Why you can trust it with your accounts
 
-This is the code the installer is built from. Read it, or have someone you trust read it.
+This is the code the installer is built from. Read it, or ask someone you trust to read it.
 
-- **It never asks for your Steam Guard secrets.** No `shared_secret`, no `identity_secret`, no
-  `.maFile`. You sign in with a QR code from the Steam mobile app, or a password and a Steam Guard
-  code, exactly as on the Steam website. Trade and listing confirmations stay on your phone.
-- **Your logins stay on your machine.** Steam sign-in tokens and a CSFloat API key, if you add one,
+- **Your logins stay on your machine.** Steam sign-in tokens, and a CSFloat API key if you add one,
   are encrypted by Windows for your user account (`credentials.enc.json`, through Electron's
-  `safeStorage`). They are sent only to Steam and CSFloat.
-- **Your trading record stays on your machine.** Everything the app observes and everything you ask
-  it to do is kept in `%APPDATA%\CSlytics\trading.sqlite`.
+  `safeStorage`). They are only ever sent to Steam and CSFloat.
+- **Your trading record stays on your machine.** Everything the app sees and everything you ask it
+  to do is kept in `%APPDATA%\CSlytics\trading.sqlite`.
 - **It talks to exactly these hosts:** Steam, its image servers and the CS2 Game Coordinator;
   `csfloat.com`, for its public list of the items it trades (fetched at start-up with no key and no
   account) and for your CSFloat account only once you connect it; `api.cslytics.com` for item
   names, which receives item identifiers and nothing about you or your accounts; and
-  `downloads.cslytics.com` for updates. Requests to CSlytics hosts say which version is asking and
+  `downloads.cslytics.com` for updates. Requests to my servers say which version is asking and
   nothing else.
-- **Updates are signed.** An installed copy refuses an update that is not signed by the publisher
-  `Liam Cunneen`.
+- **Every build is signed by me.** The publisher on the signing certificate is **Liam Cunneen**.
+  It's an individual certificate in my name, not a company's, so that's the name Windows shows. An
+  installed copy refuses any update that isn't signed by it.
 
-### Check your download
+### Installing, and checking your download
 
-Every release lists the SHA-256 of each file. In PowerShell:
+The installer is signed, but it's new, so Windows SmartScreen and Chrome may still warn that it's
+an "unrecognized app" until it builds up download history. The
+[download page](https://cslytics.com/download) shows what that warning looks like and how to get
+past it.
+
+Every release lists the SHA-256 of each file. To check yours, in PowerShell:
 
 ```powershell
 Get-FileHash .\CSlytics-Setup-<version>.exe
 ```
 
-The hash must match the release notes, and the file's *Digital Signatures* tab must name
-`Liam Cunneen`. Builds from anywhere else are not official.
+The hash should match the release notes, and the file's *Digital Signatures* tab should name
+`Liam Cunneen`. The only official builds are the ones on cslytics.com and this repository's
+Releases.
+
+## Ideas, bugs and the road map
+
+What I'm working on next is on the [road map](https://cslytics.com/#roadmap). The best place for an
+idea is `#feature-requests` on the [Discord](https://discord.gg/cHFQakqDRF). Bugs can go in
+`#bugs-and-feedback` there, or in an issue here.
 
 ## Build it yourself
 
@@ -54,32 +70,34 @@ pnpm smoke:packaged    # start the packaged app once and check it opens its reco
 
 | Path | Is |
 |---|---|
-| `apps/desktop` | the Electron app: main process, the window, the update and release policy |
+| `apps/desktop` | the Electron app: main process, the window, updates and the release policy |
 | `packages/engine` | desired state, observation and convergence; the only writer of the trading record |
 | `packages/ports` | the contract vocabulary between the engine and the outside world |
 | `packages/adapters-steam` | Steam: sign-in, the Game Coordinator, inventory, market, trades |
 | `packages/adapters-csfloat` | CSFloat |
 | `packages/catalogue` | item names and images, outside the engine |
-| `scripts` | packaging, the packaged smoke test and the release script |
+| `scripts` | packaging, the packaged smoke test and the release scripts |
 
-The engine never reads a request's reply as proof that something happened. A listing exists when a
-later read of the account shows it; a timeout means *unknown*, and the engine waits for the next
-complete read before it acts again.
+The engine never takes a reply as proof that something happened. A listing exists when a later
+read of the account shows it; a timeout means *unknown*, and the engine waits for the next complete
+read before it acts again.
 
-The test suite, the simulated Steam and CSFloat it runs against, and the research behind them are
-kept in a private development repository. Comments in this code cite those documents by path; the
-paths will not resolve here.
+The tests aren't here. They replay recorded Steam and CSFloat traffic from my own accounts, which I
+can't publish, and run the engine against simulated versions of both that misbehave on purpose.
+They live in a private repository with my research notes. Comments in this code cite those files by
+path, so those paths won't resolve here.
 
 ## Licence
 
-[GNU Affero General Public License v3.0](LICENSE). You may use, study, change and share this code.
-If you distribute a changed version, or run one as a service for others, you must publish its
-source under the same licence.
+[GNU Affero General Public License v3.0](LICENSE). You can use, study, change and share this code.
+If you distribute a changed version, or run one as a service for other people, you have to publish
+its source under the same licence.
 
-The licence covers the code, not the name. "CSlytics" and its logo identify official builds; a fork
-must use its own name and icon.
+The licence covers the code, not the name. "CSlytics" and its logo mark official builds, so a fork
+needs its own name and icon.
 
 ## Contributing and security
 
-Bug reports and ideas are welcome as issues. Pull requests are not merged; see
-[CONTRIBUTING.md](CONTRIBUTING.md). To report a vulnerability, see [SECURITY.md](SECURITY.md).
+Pull requests aren't merged here, for the reason in [CONTRIBUTING.md](CONTRIBUTING.md). If you have
+an idea, `#feature-requests` on the [Discord](https://discord.gg/cHFQakqDRF) is the friendlier
+place for it. To report a vulnerability, see [SECURITY.md](SECURITY.md).

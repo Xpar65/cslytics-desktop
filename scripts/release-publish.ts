@@ -15,19 +15,19 @@
  *
  * Order matters because installed copies act on `latest.yml` the moment it changes:
  *   1. the GitHub Release is created as a draft with every file, the manifest and the release notes
- *      (the SHA-256 of each file), downloaded back and checked;
+ *      (the SHA-256 of each file), and checked by the SHA-256 GitHub computes of each asset; a draft
+ *      left by an interrupted run is given only the files it lacks;
  *   2. every file but the feed is copied to the release host and checked there by `sha512sum`;
  *   3. the GitHub Release is published;
  *   4. the feed is copied under a temporary name, moved into place in one step, and checked;
- *   5. every file is fetched from the public feed URL, through Cloudflare, and checked. Where this
- *      network refuses that URL, the release host fetches it instead, the way a user would.
+ *   5. the release host fetches every file from the public feed URL, through Cloudflare, the way a
+ *      user would, and checks it. Nothing is downloaded back over this machine's connection.
  * A failure in steps 1 to 3 stops the run before the feed changes. Every step is safe to run again;
  * `--verify` repeats every check and uploads nothing.
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { UPDATE_FEED_URL } from '../apps/desktop/src/main/release/identity.js';
@@ -69,6 +69,18 @@ export function digestProblems(expected: readonly ReleaseArtefact[], found: Read
     const digest = found.get(entry.file);
     if (digest === undefined) return [`${where} does not have ${entry.file}`];
     return digest === entry.sha512 ? [] : [`${where} has different bytes for ${entry.file}`];
+  });
+}
+
+/**
+ * What differs between local files and the GitHub Release, by the SHA-256 GitHub computes of each
+ * asset (`sha256:<hex>`). An asset GitHub has not finished digesting counts as different.
+ */
+export function assetProblems(files: readonly string[], localSha256: ReadonlyMap<string, string>, digests: ReadonlyMap<string, string>): string[] {
+  return files.flatMap((file) => {
+    const digest = digests.get(file);
+    if (digest === undefined) return [`GitHub does not have ${file}`];
+    return digest === `sha256:${localSha256.get(file)}` ? [] : [`GitHub has different bytes for ${file}`];
   });
 }
 
@@ -154,57 +166,54 @@ async function main(): Promise<void> {
   let target: ReturnType<typeof parseTarget>;
   try { target = parseTarget(targetText); } catch (error) { return refuse((error as Error).message); }
 
-  const stop = (where: string, problems: string[]): void => {
+  const stop = (where: string, problems: string[], count: number): void => {
     if (problems.length) refuse(`${where}:\n  - ${problems.join('\n  - ')}`);
-    console.log(`  ${where}: ${manifest.artefacts.length} files match the manifest`);
+    console.log(`  ${where}: ${count === 1 ? 'the file matches' : `${count} files match`} the manifest`);
   };
-  const releaseState = (): 'none' | 'draft' | 'published' => {
-    try {
-      const view = JSON.parse(run('gh', ['release', 'view', tag, '--repo', repository, '--json', 'isDraft'])) as { isDraft: boolean };
-      return view.isDraft ? 'draft' : 'published';
-    } catch {
-      return 'none';
-    }
+  // GitHub computes a SHA-256 of every asset it stores, so the release is checked against those
+  // rather than downloaded back. Drafts are listed only to an authenticated caller, as here.
+  const githubRelease = (): { state: 'none' | 'draft' | 'published'; digests: Map<string, string> } => {
+    const releases = JSON.parse(run('gh', ['api', `repos/${repository}/releases?per_page=100`])) as Array<{
+      tag_name: string; draft: boolean; assets: Array<{ name: string; digest: string | null }>;
+    }>;
+    const release = releases.find((entry) => entry.tag_name === tag);
+    if (!release) return { state: 'none', digests: new Map() };
+    return { state: release.draft ? 'draft' : 'published', digests: new Map(release.assets.map((asset) => [asset.name, asset.digest ?? ''])) };
   };
-  const githubDigests = (): Map<string, string> => {
-    const scratch = mkdtempSync(join(tmpdir(), 'cslytics-release-'));
-    try {
-      run('gh', ['release', 'download', tag, '--repo', repository, '--dir', scratch, '--clobber']);
-      return new Map(manifest.artefacts
-        .filter((entry) => existsSync(join(scratch, entry.file)))
-        .map((entry): [string, string] => [entry.file, hash('sha512', readFileSync(join(scratch, entry.file)))]));
-    } finally {
-      rmSync(scratch, { recursive: true, force: true });
-    }
-  };
+  const megabytes = (paths: readonly string[]): string => `${(paths.reduce((sum, path) => sum + statSync(path).size, 0) / 1024 / 1024).toFixed(0)} MB`;
   const hostDigests = (files: readonly ReleaseArtefact[]): Map<string, string> => {
     const listing = run('ssh', [target.host, `cd '${target.folder}' && sha512sum -- ${files.map((entry) => `'${entry.file}'`).join(' ')}`]);
     return new Map(listing.split(/\r?\n/).map((line) => /^([0-9a-f]{128})\s+\*?(.+)$/.exec(line.trim())).filter((match) => match !== null)
       .map((match) => [match[2]!, Buffer.from(match[1]!, 'hex').toString('base64')]));
   };
   const copy = (entry: ReleaseArtefact, remoteName = entry.file): void => {
+    console.log(`  copying ${entry.file} (${megabytes([localPath(entry)])}) to ${target.host}`);
     // Relative to the file's own folder: scp reads `C:\...` as a host called `C`.
     run('scp', ['-q', basename(entry.local), `${target.host}:${target.folder}/${remoteName}`], { cwd: dirname(localPath(entry)) });
   };
 
   console.log(`Publishing CSlytics ${version} from ${manifest.commit.slice(0, 12)} to ${repository} and ${target.host}`);
-  let state = releaseState();
-  if (!verifyOnly) {
-    if (state === 'none') {
-      run('gh', ['release', 'create', tag, '--repo', repository, '--draft', '--verify-tag', '--title', `CSlytics ${version}`, '--notes-file', notesPath, ...githubFiles]);
-      state = 'draft';
-    } else if (state === 'draft') {
-      run('gh', ['release', 'upload', tag, '--repo', repository, '--clobber', ...githubFiles]);
+  const localSha256 = new Map([...sha256, [basename(manifestPath), hash('sha256', readFileSync(manifestPath))]]);
+  let github = githubRelease();
+  if (!verifyOnly && github.state !== 'published') {
+    // A draft left by an interrupted run keeps the files it already holds intact.
+    const missing = githubFiles.filter((path) => assetProblems([basename(path)], localSha256, github.digests).length > 0);
+    if (missing.length) console.log(`  uploading ${missing.length} files (${megabytes(missing)}) to GitHub; this prints nothing until it finishes`);
+    if (github.state === 'none') {
+      run('gh', ['release', 'create', tag, '--repo', repository, '--draft', '--verify-tag', '--title', `CSlytics ${version}`, '--notes-file', notesPath, ...missing]);
+    } else {
+      if (missing.length) run('gh', ['release', 'upload', tag, '--repo', repository, '--clobber', ...missing]);
       run('gh', ['release', 'edit', tag, '--repo', repository, '--notes-file', notesPath]);
     }
+    github = githubRelease();
   }
-  if (state === 'none') refuse(`there is no GitHub Release ${tag} to check`);
-  stop(`GitHub Release ${tag}`, digestProblems(manifest.artefacts, githubDigests(), 'GitHub'));
+  if (github.state === 'none') refuse(`there is no GitHub Release ${tag} to check`);
+  stop(`GitHub Release ${tag}`, assetProblems(githubFiles.map((path) => basename(path)), localSha256, github.digests), githubFiles.length);
 
   if (!verifyOnly) for (const entry of order.files) copy(entry);
-  stop(`release host ${target.host}`, digestProblems(order.files, hostDigests(order.files), 'the release host'));
+  stop(`release host ${target.host}`, digestProblems(order.files, hostDigests(order.files), 'the release host'), order.files.length);
 
-  if (!verifyOnly && state === 'draft') {
+  if (!verifyOnly && github.state === 'draft') {
     run('gh', ['release', 'edit', tag, '--repo', repository, '--draft=false', '--latest']);
     console.log(`  GitHub Release ${tag} published`);
   }
@@ -212,31 +221,22 @@ async function main(): Promise<void> {
     copy(order.feed, 'latest.yml.tmp');
     run('ssh', [target.host, `cd '${target.folder}' && mv -f latest.yml.tmp latest.yml`]);
   }
-  stop('release host feed', digestProblems([order.feed], hostDigests([order.feed]), 'the release host'));
+  stop('release host feed', digestProblems([order.feed], hostDigests([order.feed]), 'the release host'), 1);
 
-  // What the public URL serves, through Cloudflare. A network that re-signs the host refuses it here,
-  // so such a file is fetched by the release host instead, which reaches the URL the way a user does.
+  // What the public URL serves, through Cloudflare, fetched by the release host the way a user's
+  // machine would: from any network, and without downloading the release again over this one.
+  console.log(`  checking what ${UPDATE_FEED_URL} serves, through Cloudflare, from the release host`);
   const served = new Map<string, string>();
-  const viaHost: string[] = [];
   for (const entry of manifest.artefacts) {
-    const url = `${UPDATE_FEED_URL}/${entry.file}`;
     try {
-      const response = await fetch(url);
-      served.set(entry.file, response.ok ? hash('sha512', Buffer.from(await response.arrayBuffer())) : `HTTP ${response.status}`);
-      continue;
-    } catch {
-      viaHost.push(entry.file);
-    }
-    try {
-      const line = run('ssh', [target.host, `f=$(mktemp) && curl -fsS -o "$f" '${url}' && sha512sum "$f"; s=$?; rm -f "$f"; exit $s`]);
+      const line = run('ssh', [target.host, `f=$(mktemp) && curl -fsS -o "$f" '${UPDATE_FEED_URL}/${entry.file}' && sha512sum "$f"; s=$?; rm -f "$f"; exit $s`]);
       const hex = /^([0-9a-f]{128})\s/.exec(line)?.[1];
       if (hex) served.set(entry.file, Buffer.from(hex, 'hex').toString('base64'));
     } catch {
       // Left out of `served`, so it is reported as missing below.
     }
   }
-  if (viaHost.length) console.log(`  ${viaHost.length} of ${manifest.artefacts.length} files were fetched from ${UPDATE_FEED_URL} by the release host; this network refuses it`);
-  stop(UPDATE_FEED_URL, digestProblems(manifest.artefacts, served, UPDATE_FEED_URL));
+  stop(UPDATE_FEED_URL, digestProblems(manifest.artefacts, served, UPDATE_FEED_URL), manifest.artefacts.length);
 
   console.log(`\nCSlytics ${version} is published. SHA-256, as in the release notes (${notesPath}):`);
   for (const entry of manifest.artefacts) console.log(`  ${sha256.get(entry.file)}  ${entry.file}`);
