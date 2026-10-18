@@ -13,8 +13,10 @@ import type { SettingsPage } from '../../lib/sections.js';
 import { accountAttention, type AttentionAction } from './attention.js';
 import { AboutPanel } from './AboutPanel.js';
 import { AppearancePanel } from './AppearancePanel.js';
+import { CurrencyPanel } from './CurrencyPanel.js';
 import { AccountOverview } from './AccountOverview.js';
 import { CsfloatAccountPage } from './CsfloatAccountPage.js';
+import { CslyticsAccountPage } from './CslyticsAccountPage.js';
 import { SteamAccountPage } from './SteamAccountPage.js';
 
 /**
@@ -33,7 +35,8 @@ import { SteamAccountPage } from './SteamAccountPage.js';
 export type { SettingsPage };
 
 const DESKTOP_PAGES: ReadonlyArray<{ id: SettingsPage; label: string; icon: IconName }> = [
-  { id: 'general', label: 'General', icon: 'sliders' }
+  { id: 'general', label: 'General', icon: 'sliders' },
+  { id: 'cslytics', label: 'CSlytics account', icon: 'user' }
 ];
 const ACCOUNT_PAGES: ReadonlyArray<{ id: SettingsPage; label: string; icon?: IconName; venue?: VenueId }> = [
   { id: 'overview', label: 'Overview', icon: 'user' },
@@ -188,6 +191,7 @@ export function SettingsView({
         {page === 'general' ? (
           <>
             <AppearancePanel />
+            <CurrencyPanel />
             <Panel>
               <div className="panel-body stack">
                 <Switch
@@ -202,6 +206,8 @@ export function SettingsView({
             <AboutPanel />
           </>
         ) : null}
+
+        {page === 'cslytics' ? <CslyticsAccountPage /> : null}
 
         {isAccountPage(page) && account === null ? (
           <Panel>

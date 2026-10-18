@@ -54,6 +54,15 @@ export type WakeDrivers = (accountId: AccountId, surfaces: ReadonlySet<string>) 
  * in one turn settles once (INV-06); an observation that lands while a settle runs earns exactly
  * one more, so the last item of a burst is never missed.
  *
+ * **An item event settles its item.** A pushed item is proof about that item and nothing else, so a
+ * settle that only item events earned judges only the casket moves about those items; any walk earns
+ * a full settle. Judged in full on every event, a store of 968 re-judged each waiting store at every
+ * answer, its cost grew with the batch, and by the 300th send the engine read answers seconds after
+ * the GC sent them, until the breaker stopped the batch (2026-10-18, BULK-15). A casket move's answer
+ * earns a settle of its item too: the GC's event that answers it is applied a few milliseconds before
+ * the attempt is recorded as returned, while the move is still `RUNNING` and cannot be judged, so the
+ * event's own settle finds nothing to decide (live, 2026-10-18: every retrieve; BULK-06).
+ *
  * **A settle decides and nothing else.** It never reads, never sends and never plans; the drivers
  * it wakes do that on their own turn. Anything that needs the verdict awaits `settled`, or — when
  * it is deciding on a read it just made itself — calls `settleNow` first.
@@ -61,6 +70,8 @@ export type WakeDrivers = (accountId: AccountId, surfaces: ReadonlySet<string>) 
 export class SettleService implements Settling {
   /** Surfaces observed since the account last settled. Present means a settle is owed. */
   private readonly owed = new Map<AccountId, Set<string>>();
+  /** The items whose events alone earned the owed settle, or `all` once anything else did. */
+  private readonly items = new Map<AccountId, Set<string> | 'all'>();
   private readonly queued = new Set<AccountId>();
   private readonly running = new Set<AccountId>();
   private readonly holds = new Map<AccountId, number>();
@@ -85,7 +96,7 @@ export class SettleService implements Settling {
   settleNow(accountId: AccountId): void {
     const surfaces = this.owed.get(accountId) ?? new Set<string>();
     this.owed.delete(accountId);
-    this.settleOnce(accountId, surfaces);
+    this.settleOnce(accountId, surfaces, this.takeItems(accountId));
     if (!this.owed.has(accountId)) this.release(accountId);
   }
 
@@ -115,10 +126,14 @@ export class SettleService implements Settling {
     }
   }
 
-  /** Every reconciler, in an order where each sees what the one before it settled. */
-  protected run(accountId: AccountId): void {
+  /**
+   * Every reconciler, in an order where each sees what the one before it settled. `about` is the
+   * items whose events alone earned this settle; the storage reconciler judges only their moves.
+   * Absent, it judges every waiting one.
+   */
+  protected run(accountId: AccountId, about?: ReadonlySet<string>): void {
     const { database } = this.context;
-    this.step(accountId, 'storage', () => this.services.storage.reconcile(accountId));
+    this.step(accountId, 'storage', () => this.services.storage.reconcile(accountId, about));
     // Rule 5: an incomplete walk proves nothing, so the market-based decisions wait for a
     // complete one rather than deciding against whatever the latest row happens to be.
     const market = database.latestObservation(accountId, 'steam-market');
@@ -141,13 +156,35 @@ export class SettleService implements Settling {
   }
 
   private onSignal(signal: EngineSignal): void {
-    if (signal.kind !== 'observed' || this.stopped || !this.owes(signal)) return;
-    const surfaces = this.owed.get(signal.accountId) ?? new Set<string>();
-    surfaces.add(signal.surface);
-    this.owed.set(signal.accountId, surfaces);
+    if (this.stopped) return;
+    if (signal.kind === 'mutation-settled') {
+      if (this.answers(signal) && signal.targetId) this.owe(signal.accountId, 'gc-event', signal.targetId);
+      return;
+    }
+    if (signal.kind !== 'observed' || !this.owes(signal)) return;
+    this.owe(signal.accountId, signal.surface, signal.surface === 'gc-event' ? signal.scopeId : undefined);
+  }
+
+  /**
+   * Whether a mutation's answer earns a settle of its target: a casket move's, whose item event has
+   * already been applied by the time the attempt is recorded as returned. Isolated so a saboteur can
+   * settle on observations alone.
+   */
+  protected answers(signal: Extract<EngineSignal, { kind: 'mutation-settled' }>): boolean {
+    return signal.actionKind === 'STORE_IN_CASKET' || signal.actionKind === 'RETRIEVE_FROM_CASKET';
+  }
+
+  /** Marks a settle owed for a surface, and, for an item's own event, the item it is about. */
+  private owe(accountId: AccountId, surface: string, item?: string): void {
+    const surfaces = this.owed.get(accountId) ?? new Set<string>();
+    surfaces.add(surface);
+    this.owed.set(accountId, surfaces);
+    const items = this.items.get(accountId);
+    if (surface === 'gc-event' && item && items !== 'all') this.items.set(accountId, (items ?? new Set<string>()).add(item));
+    else this.items.set(accountId, 'all');
     // A settle in progress picks this up in its trailing run; a held account settles on release.
-    if (this.running.has(signal.accountId) || this.holds.has(signal.accountId)) return;
-    this.queue(signal.accountId);
+    if (this.running.has(accountId) || this.holds.has(accountId)) return;
+    this.queue(accountId);
   }
 
   private queue(accountId: AccountId): void {
@@ -165,15 +202,22 @@ export class SettleService implements Settling {
     while (this.owed.has(accountId)) {
       const surfaces = this.owed.get(accountId)!;
       this.owed.delete(accountId);
-      this.settleOnce(accountId, surfaces);
+      this.settleOnce(accountId, surfaces, this.takeItems(accountId));
     }
     this.release(accountId);
   }
 
-  private settleOnce(accountId: AccountId, surfaces: ReadonlySet<string>): void {
+  /** The items the owed settle is about, taken with it: none when anything but an item event earned it. */
+  private takeItems(accountId: AccountId): ReadonlySet<string> | undefined {
+    const items = this.items.get(accountId);
+    this.items.delete(accountId);
+    return items instanceof Set ? items : undefined;
+  }
+
+  private settleOnce(accountId: AccountId, surfaces: ReadonlySet<string>, about?: ReadonlySet<string>): void {
     this.running.add(accountId);
     try {
-      this.context.database.transaction(() => this.run(accountId));
+      this.context.database.transaction(() => this.run(accountId, about));
     } finally {
       this.running.delete(accountId);
     }

@@ -4,16 +4,18 @@ import type { BuyOrderFilter } from '../../kernel/buy-order-filters.js';
 import { constraintsAsProperties, csfloatBuyOrderFilters, describeBuyOrderConstraints, preservableConstraints, sameBuyOrderConstraints } from '../../kernel/csfloat-buy-orders.js';
 import type { CsfloatBuyOrderConstraints } from '@cslytics/ports';
 import { CSFLOAT_CURRENCY } from './listings.js';
+import { OPEN_STEP_STATES_SQL } from '../../db/work.js';
 import { assertAccountScope, bounded } from './paging.js';
 
 /**
  * Every buy order a venue is showing as open, across a scope and both venues, in one answer.
  *
- * Two books, one list. Steam's is `buy_order`, written by the market walk: `mylistings` returns
- * every open order on its first page, and a *complete* walk marks an order it no longer shows
- * `active=0`. CSFloat's is `csfloat_buy_order`, written by the own-book walk, which deletes a row
- * only when a complete walk no longer shows it. So this read is "active, or still in the book" and
- * nothing else — it never decides an order is open or gone on its own.
+ * Two books, one list. Steam's is the `BUY` side of `venue_order`, written by the market walk:
+ * `mylistings` returns every open order on its first page, and a *complete* walk ends an order it
+ * no longer shows. CSFloat's is the `BUY` side of the same table on its venue, written by the
+ * own-book walk, which marks a row gone only when a complete walk no longer shows it. So this read
+ * is "open, or still in the book" and nothing else — it never decides an order is open or gone on
+ * its own.
  *
  * Three refusals, each because the alternative is a plausible lie:
  *
@@ -129,45 +131,46 @@ export function readBuyOrders(database: EngineDatabase, request: { accountIds: r
   const raw = database.raw();
 
   const steam = raw.prepare(`
-    SELECT b.account_id AS accountId, b.buy_order_id AS buyOrderId, b.hash_name AS hashName,
-      b.price_cents AS priceCents, b.quantity AS quantity, b.quantity_remaining AS quantityRemaining,
-      b.purchased AS purchased, b.price_cents * b.quantity_remaining AS openCents,
+    SELECT b.account_id AS accountId, b.venue_order_id AS buyOrderId, b.hash_name AS hashName,
+      b.price_cents AS priceCents, b.quantity AS quantity, b.quantity - b.filled AS quantityRemaining,
+      b.filled AS purchased, b.price_cents * (b.quantity - b.filled) AS openCents,
       (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=b.account_id ORDER BY w.id DESC LIMIT 1) AS currency,
       (SELECT MIN(a.created_at) FROM action a
-        WHERE a.account_id=b.account_id AND a.kind='CANCEL_BUY_ORDER' AND a.target_id=b.buy_order_id
+        WHERE a.account_id=b.account_id AND a.kind='CANCEL_BUY_ORDER' AND a.target_id=b.venue_order_id
           AND (a.state IN ('RUNNING','AWAITING_OBSERVATION') OR (a.state='READY' AND a.resolution='OBSERVED_NOT_APPLIED'))) AS cancelSentAt,
       (SELECT CASE WHEN a.state='FAILED' THEN IFNULL(a.error, 'refused') END FROM action a
-        WHERE a.account_id=b.account_id AND a.kind='CANCEL_BUY_ORDER' AND a.target_id=b.buy_order_id
+        WHERE a.account_id=b.account_id AND a.kind='CANCEL_BUY_ORDER' AND a.target_id=b.venue_order_id
           AND a.state<>'READY'
         ORDER BY a.updated_at DESC, a.id DESC LIMIT 1) AS cancelFailure,
       f.finished_at AS firstSeenAt, o.finished_at AS observedAt, IFNULL(o.complete, 0) AS observationComplete
-    FROM buy_order b
+    FROM venue_order b
     LEFT JOIN observation f ON f.id=b.first_seen_obs
     LEFT JOIN observation o ON o.id=b.last_seen_obs
-    WHERE b.account_id IN (${marks}) AND b.active=1`).all(...accounts) as SteamRaw[];
+    WHERE b.account_id IN (${marks}) AND b.venue='steam' AND b.side='BUY' AND b.first_seen_obs IS NOT NULL AND b.state NOT LIKE 'ENDED_%'`).all(...accounts) as SteamRaw[];
 
   const csfloat = raw.prepare(`
-    SELECT b.account_id AS accountId, b.order_id AS buyOrderId, b.hash_name AS hashName,
-      b.price_cents AS priceCents, b.quantity AS quantity, b.bought AS purchased, b.properties_json AS propertiesJson,
-      (SELECT MIN(p.created_at) FROM csfloat_operation p
-        WHERE p.account_id=b.account_id AND p.order_id=b.order_id AND p.kind='BUY_ORDER_CANCEL'
-          AND p.state IN ('QUEUED','AWAITING_OBSERVATION')) AS cancelSentAt,
-      (SELECT CASE WHEN p.state='FAILED' THEN IFNULL(p.error, 'refused') END FROM csfloat_operation p
-        WHERE p.account_id=b.account_id AND p.order_id=b.order_id AND p.kind='BUY_ORDER_CANCEL'
+    SELECT b.account_id AS accountId, b.venue_order_id AS buyOrderId, b.hash_name AS hashName,
+      b.price_cents AS priceCents, b.quantity AS quantity, b.filled AS purchased, s.properties_json AS propertiesJson,
+      (SELECT MIN(p.created_at) FROM work_step p
+        WHERE p.account_id=b.account_id AND p.kind='CSFLOAT_BUY_ORDER_CANCEL' AND p.target_id=b.venue_order_id
+          AND p.state IN ${OPEN_STEP_STATES_SQL}) AS cancelSentAt,
+      (SELECT CASE WHEN p.state='FAILED' THEN IFNULL(p.reason, 'refused') END FROM work_step p
+        WHERE p.account_id=b.account_id AND p.kind='CSFLOAT_BUY_ORDER_CANCEL' AND p.target_id=b.venue_order_id
         ORDER BY p.updated_at DESC, p.id DESC LIMIT 1) AS cancelFailure,
-      e.created_at AS editSentAt, e.price_cents AS editPriceCents, e.quantity AS editQuantity,
+      e.created_at AS editSentAt, json_extract(e.params_json,'$.maxPriceCents') AS editPriceCents, json_extract(e.params_json,'$.quantity') AS editQuantity,
       (SELECT a.params_json FROM action a WHERE a.id=e.action_id) AS editParams,
-      (SELECT CASE WHEN p.state='FAILED' THEN IFNULL(p.error, 'refused') END FROM csfloat_operation p
-        WHERE p.account_id=b.account_id AND p.order_id=b.order_id AND p.kind='BUY_ORDER_EDIT'
+      (SELECT CASE WHEN p.state='FAILED' THEN IFNULL(p.reason, 'refused') END FROM work_step p
+        WHERE p.account_id=b.account_id AND p.kind='CSFLOAT_BUY_ORDER_EDIT' AND p.target_id=b.venue_order_id
         ORDER BY p.updated_at DESC, p.id DESC LIMIT 1) AS editFailure,
       f.finished_at AS firstSeenAt, o.finished_at AS observedAt, IFNULL(o.complete, 0) AS observationComplete
-    FROM csfloat_buy_order b
-    LEFT JOIN csfloat_operation e ON e.id=(SELECT p.id FROM csfloat_operation p
-      WHERE p.account_id=b.account_id AND p.order_id=b.order_id AND p.kind='BUY_ORDER_EDIT'
-        AND p.state IN ('QUEUED','AWAITING_OBSERVATION') ORDER BY p.created_at, p.id LIMIT 1)
+    FROM venue_order b
+    JOIN csfloat_order s ON s.account_id=b.account_id AND s.order_id=b.order_id
+    LEFT JOIN work_step e ON e.id=(SELECT p.id FROM work_step p
+      WHERE p.account_id=b.account_id AND p.kind='CSFLOAT_BUY_ORDER_EDIT' AND p.target_id=b.venue_order_id
+        AND p.state IN ${OPEN_STEP_STATES_SQL} ORDER BY p.created_at, p.id LIMIT 1)
     LEFT JOIN observation f ON f.id=b.first_seen_obs
     LEFT JOIN observation o ON o.id=b.last_seen_obs
-    WHERE b.account_id IN (${marks})`).all(...accounts) as CsfloatRaw[];
+    WHERE b.account_id IN (${marks}) AND b.venue='csfloat' AND b.side='BUY' AND b.first_seen_obs IS NOT NULL AND b.gone_obs IS NULL`).all(...accounts) as CsfloatRaw[];
 
   const rows = [...steam.map(fromSteam), ...csfloat.map(fromCsfloat)]
     .sort((left, right) => left.hashName.localeCompare(right.hashName) || left.accountId.localeCompare(right.accountId)
@@ -198,9 +201,8 @@ export function readBuyOrders(database: EngineDatabase, request: { accountIds: r
     if (book || connection) {
       coverage.push({ accountId, venue: 'CSFLOAT', observedAt: book?.finished_at ?? null, complete: book?.complete === 1 ? 1 : 0 });
       // A status from an earlier generation says nothing about this connection (CSF-04).
-      const status = marketplace.status(accountId);
-      const current = status !== undefined && connection !== undefined && status.generation === connection.generation;
-      balances.push({ accountId, venue: 'CSFLOAT', availableCents: current ? status.available_cents : null, observedAt: current ? status.observed_at : null });
+      const status = marketplace.currentStatus(accountId);
+      balances.push({ accountId, venue: 'CSFLOAT', availableCents: status?.available_cents ?? null, observedAt: status?.observed_at ?? null });
     }
   }
   return bounded({ kind: 'book' as const, rows: rows.slice(0, BUY_ORDER_BOOK_LIMIT), total: rows.length, money, coverage, balances });

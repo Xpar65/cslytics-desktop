@@ -7,10 +7,7 @@ import type { EngineContext } from '../kernel/context.js';
 export const CSFLOAT_TRADE_STATES = ['queued','pending','verified','failed','cancelled'] as const;
 export class CsfloatTradeService {
   constructor(protected readonly context: EngineContext) {}
-  sync(accountId: AccountId): Promise<number> {
-    return this.context.reads.run(`${accountId}:csfloat-trades`, () => this.walk(accountId));
-  }
-  private async walk(accountId: AccountId): Promise<number> {
+  async sync(accountId: AccountId): Promise<number> {
     const { database: db, ports } = this.context, connectionStore = new MarketplaceStore(db), store = new CsfloatStore(db);
     const before = connectionStore.connection(accountId,'csfloat'), startedAt = this.context.now();
     const rows = new Map<string,CsfloatTrade>();
@@ -42,9 +39,16 @@ export class CsfloatTradeService {
     this.context.signals.emit({ kind: 'observed', accountId, surface: 'csfloat-trades', complete: !error, observationId: id });
     return id;
   }
+  /**
+   * One trade by id, for the delivery that moves it on. The delivery reads the venue's answer
+   * verbatim (the buyer's trade token, the deadline, the listing's item), which the row does not
+   * keep, so this is the one read the broker does not make; it takes the venue's transport budget
+   * here instead (read broker plan D12).
+   */
   async syncTrade(accountId: AccountId, tradeId: string): Promise<CsfloatTrade | null> {
     const { database: db, ports } = this.context, connections = new MarketplaceStore(db), before = connections.connection(accountId,'csfloat');
     if (!before?.credential_ref || before.status === 'DISCONNECTED' || !ports.csfloat) return null;
+    await this.context.governors.admitRead(accountId, 'csfloat', `csfloat-trade:${tradeId}`);
     const startedAt = this.context.now();
     const result = await ports.csfloat.trades.getTrade(accountId,before.credential_ref,tradeId);
     if (connections.connection(accountId,'csfloat')?.generation !== before.generation) return null;

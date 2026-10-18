@@ -9,9 +9,6 @@ import type {
   MutationOutcome,
   MyListingsPage,
   MyHistoryPage,
-  NotModified,
-  OrderBook,
-  OrderBookLevel,
   SteamAuthPort,
   SteamMarketPort,
   TaxRate,
@@ -45,7 +42,9 @@ export class SteamMarketAdapter implements SteamMarketPort {
           listingId: event.listingid, ...(purchaseId ? { purchaseId } : {}), eventType: event.event_type,
           occurredAt: new Date(event.time_event * 1000 + Math.floor(Number(event.time_event_fraction ?? 0) / 1_000_000)).toISOString(),
           raw: { event, listing: raw.listings?.[event.listingid] ?? null,
-            purchase: purchaseId ? raw.purchases?.[`${event.listingid}_${purchaseId}`] ?? null : null }
+            purchase: purchaseId ? raw.purchases?.[`${event.listingid}_${purchaseId}`] ?? null : null,
+            // The asset's description, from the `assets` map beside the events, when the body carries one.
+            asset: assetDescription(raw, raw.listings?.[event.listingid]?.asset) }
         };
       })
     };
@@ -252,37 +251,6 @@ export class SteamMarketAdapter implements SteamMarketPort {
     };
   }
 
-  async getOrderBook(accountId: AccountId, hashName: string, etag?: string): Promise<OrderBook | NotModified> {
-    const session = await this.auth.getWebSession(accountId);
-    const qp = encodeURIComponent(JSON.stringify([730, hashName]));
-    const headers: Record<string, string> = {
-      'x-valve-request-type': 'queryAction',
-      Referer: `${MARKET_BASE}/orderbook`
-    };
-    if (etag) headers['If-None-Match'] = etag;
-    const response = await this.requestWithSession(session.cookies, `${MARKET_BASE}/orderbook?q=Load&qp=${qp}`, { headers });
-    if (response.status === 304) return etag ? { kind: 'not-modified', etag } : { kind: 'not-modified' };
-    const raw = await parseJson(response);
-    // The levels sit under `data.data`, beside `data.success` (live 2026-10-11,
-    // fixtures/steam/contracts/orderbook.json). Reading them one level up produced NaN levels
-    // without an error, so a book that does not parse to finite numbers is refused, not returned.
-    const data = raw?.data?.data;
-    if (!response.ok || raw?.data?.success !== true || !data) throw new Error(`orderbook failed: HTTP ${response.status}`);
-    const responseEtag = response.headers.get('etag') ?? undefined;
-    const result: OrderBook = {
-      kind: 'order-book',
-      currency: Number(data.eCurrency),
-      highestBuyCents: Number(data.amtMaxBuyOrder ?? 0),
-      lowestSellCents: Number(data.amtMinSellOrder ?? 0),
-      buy: cumulativeLevels(data.rgCompactBuyOrders),
-      sell: cumulativeLevels(data.rgCompactSellOrders)
-    };
-    if (![result.currency, result.highestBuyCents, result.lowestSellCents].every(Number.isFinite)) {
-      throw new Error('orderbook answered without finite currency or prices');
-    }
-    if (responseEtag) result.etag = responseEtag;
-    return result;
-  }
 
   private async request(accountId: string, url: string, init: RequestInit): Promise<Response> {
     const session = await this.auth.getWebSession(accountId);
@@ -355,6 +323,12 @@ function normalizeListing(listing: any, assets: any): MarketListing {
   return result;
 }
 
+/** The description of a listing's asset in a response's `assets` map, keyed by app, context and id; null when the body has none. */
+function assetDescription(raw: any, asset: any): any {
+  if (!asset || typeof asset !== 'object') return null;
+  return raw?.assets?.[String(asset.appid)]?.[String(asset.contextid)]?.[String(asset.id)] ?? null;
+}
+
 function findAsset(assets: any, listing: any): any {
   const appId = String(listing.asset?.appid ?? 730);
   const contextId = String(listing.asset?.contextid ?? 2);
@@ -374,13 +348,6 @@ function normalizeBuyOrder(order: any): MarketBuyOrder {
   };
 }
 
-function cumulativeLevels(raw: unknown): OrderBookLevel[] {
-  if (!Array.isArray(raw)) return [];
-  // Steam sends the book flat, price then quantity; a trailing price with no quantity is dropped.
-  const pairs = Array.from({ length: Math.floor(raw.length / 2) }, (_, level) => [Number(raw[2 * level]), Number(raw[2 * level + 1])] as const);
-  let total = 0;
-  return pairs.map(([priceCents, quantity]) => ({ priceCents, cumulativeQuantity: (total += quantity) }));
-}
 
 function marketPostHeaders(hashName: string): Record<string, string> {
   return {

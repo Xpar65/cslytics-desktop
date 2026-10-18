@@ -29,14 +29,40 @@ const defaultIo: VaultIo = {
   readFile: fs.readFile
 };
 
+/**
+ * Every operation is a read of the whole file followed, for a write, by a rename over it. Two
+ * writers at once — the Engine Runtime storing a Steam token while main rotates the CSlytics one —
+ * would each read the old file and the second rename would drop the first one's key. One queue
+ * per vault makes each operation see the one before it complete.
+ */
 export class ElectronCredentialVault implements CredentialVault {
+  private queue: Promise<unknown> = Promise.resolve();
+
   constructor(
     private readonly path: string,
     private readonly storage: SafeStorage = defaultSafeStorage(),
     private readonly io: VaultIo = defaultIo
   ) {}
 
-  async get(key: string): Promise<string | null> {
+  get(key: string): Promise<string | null> {
+    return this.serial(() => this.getNow(key));
+  }
+
+  set(key: string, value: string): Promise<void> {
+    return this.serial(() => this.setNow(key, value));
+  }
+
+  delete(key: string): Promise<void> {
+    return this.serial(() => this.deleteNow(key));
+  }
+
+  private serial<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(work, work);
+    this.queue = result.catch(() => undefined);
+    return result;
+  }
+
+  private async getNow(key: string): Promise<string | null> {
     const values = await this.read();
     const encrypted = values[key];
     if (!encrypted) return null;
@@ -44,14 +70,14 @@ export class ElectronCredentialVault implements CredentialVault {
     return this.storage.decryptString(Buffer.from(encrypted, 'base64'));
   }
 
-  async set(key: string, value: string): Promise<void> {
+  private async setNow(key: string, value: string): Promise<void> {
     if (!this.storage.isEncryptionAvailable()) throw new Error('OS credential encryption is unavailable');
     const values = await this.read();
     values[key] = this.storage.encryptString(value).toString('base64');
     await this.write(values);
   }
 
-  async delete(key: string): Promise<void> {
+  private async deleteNow(key: string): Promise<void> {
     const values = await this.read();
     delete values[key];
     await this.write(values);

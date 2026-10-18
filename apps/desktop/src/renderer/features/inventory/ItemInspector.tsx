@@ -16,6 +16,7 @@ import { ItemMoreDetails } from './ItemMoreDetails.js';
 import { isStorageUnit, itemName, unitOfItem } from './storage-unit.js';
 import { DISPLAY_ONLY_CAPTION, isDisplayOnly } from './display-only.js';
 import { TransferDetail, askSteamForTransfer, type TransferAsked, type TransferMemberInput } from './TransferDetail.js';
+import { StoreDetail } from './StoreDetail.js';
 import {
   ACTION_ORDER,
   GROUP_KINDS,
@@ -77,8 +78,10 @@ const GROUP_META: Readonly<Record<ActionGroup, { label: string; icon: IconName; 
  * multi-selection offers only the intersection**, because the engine rejects a batch atomically:
  * a button that would fail the whole batch over one item is a trap, so the action is withheld,
  * each roster card says what its own item could do on its own, and can drop it from the selection.
+ * Store is the one exception (`PARTIAL_GROUPS`): it is offered when some of the selection can be
+ * stored, and its panel ([StoreDetail](./StoreDetail.tsx)) sends only those and says what it leaves out.
  */
-export function ItemInspector({ accountIds, accounts, units, selection, subject, busyKeys, onMessage, destinations, onDestinations, price, onPrice, onSubmitted, onStage, onDeselect, onUnitRenamed }: {
+export function ItemInspector({ accountIds, accounts, units, selection, subject, busyKeys, onMessage, destinations, onDestinations, price, onPrice, onSubmitted, onStage, onDeselect, onUnitRenamed, onOpenItem }: {
   accountIds: readonly string[];
   accounts: ReadonlyArray<{ id: string; name: string; steamId64?: string | null | undefined }>;
   units: readonly StoragePageRow[];
@@ -95,6 +98,8 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   onStage: (staged: readonly StagedItem[]) => void;
   /** Drop one handle from a multi-selection without clearing the rest. */
   onDeselect?: ((key: string) => void) | undefined;
+  /** Opens the item page for the selected item's market name. */
+  onOpenItem?: ((name: string) => void) | undefined;
   /** A rename of the selected storage unit has settled, so `units` should be read again. */
   onUnitRenamed?: (() => void) | undefined;
 }): React.JSX.Element {
@@ -404,7 +409,33 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
       );
     }
 
-    if (active === 'STORE' || active === 'DELIST_TO_STORE') {
+    if (active === 'STORE') {
+      return (
+        <StoreDetail
+          selection={selection}
+          verdicts={verdicts}
+          destinations={destinations}
+          unitPickers={unitPickers()}
+          unitMissing={unitMissing}
+          accountName={accountName}
+          busy={busy}
+          onSent={(stored) => {
+            // Work appears out of nothing here, and a command raises no observation notice.
+            refreshWork();
+            onMessage({
+              tone: 'success',
+              title: `Storing ${plural(stored, 'item')}`,
+              detail: 'Submitted. Each item is confirmed by a later observation, and progress is shown in the work panel.'
+            });
+            setGroup(null);
+            onSubmitted?.();
+          }}
+          onFailed={(reason) => onMessage({ tone: 'error', title: 'The command was not accepted', detail: reason })}
+        />
+      );
+    }
+
+    if (active === 'DELIST_TO_STORE') {
       return <>
         {unitPickers()}
         {chainCaption(active)}
@@ -465,6 +496,13 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
         selection listed underneath, an answer you have to scroll to find is not an answer. The
         intersection rule is unchanged: the engine accepts or refuses a batch atomically, so an
         action one item blocks is withheld for all of them. */}
+    {single && single.marketHashName && onOpenItem ? (
+      <div className="inspector-actions">
+        <Button size="sm" variant="ghost" icon="trending-up" data-testid="open-item-page" onClick={() => onOpenItem(single.marketHashName!)}>
+          Item page
+        </Button>
+      </div>
+    ) : null}
     <div className="inspector-actions">
       {groups.allowed.length === 0 ? (
         <Caption icon="info">

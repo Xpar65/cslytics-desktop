@@ -39,7 +39,7 @@ export function settleNotApplied(
   if (plan.kind === 'exhausted' && database.action(action.id)?.state === 'READY') {
     const reason = options.exhaustedReason ?? (attempts > 1 ? `${what} after ${attempts} attempts` : what);
     database.setActionState(action.id, 'FAILED', now, reason);
-    if (policy.resend === 'owner') database.suspendGoal(action.account_id, action.desired_id, reason, now);
+    if (policy.resend === 'owner' && action.desired_id) database.suspendGoal(action.account_id, action.desired_id, reason, now);
   }
   database.addEvent(action.account_id, 'mutation-not-applied', {
     actionId: action.id, actionKind: action.kind, what, plan: plan.kind, attempt: plan.attempt, limit: plan.limit,

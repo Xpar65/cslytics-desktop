@@ -35,6 +35,12 @@
       ],
       "@cslytics/catalogue": [
         "packages/catalogue/src/index.ts"
+      ],
+      "@cslytics/market-data": [
+        "packages/market-data/src/index.ts"
+      ],
+      "@cslytics/cslytics-account": [
+        "packages/cslytics-account/src/index.ts"
       ]
     }
   },

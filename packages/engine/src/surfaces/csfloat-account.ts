@@ -191,6 +191,8 @@ export class CsfloatAccountService {
   async refreshStanding(accountId: AccountId): Promise<void> {
     const before = this.store.connection(accountId, CSFLOAT_VENUE);
     if (!before?.credential_ref || before.status !== 'CONNECTED') return;
+    // Beside the status read the broker made, under the same venue's budget (read broker plan D12).
+    await this.context.governors.admitRead(accountId, 'csfloat', CSFLOAT_STANDING_SURFACE);
     const startedAt = this.context.now();
     let result: CsfloatReadResult<CsfloatStanding>;
     try {
@@ -212,7 +214,7 @@ export class CsfloatAccountService {
     // Replaced while in flight: true of a connection that no longer exists (CSF-04).
     if (this.store.connection(accountId, CSFLOAT_VENUE)?.generation !== before.generation) return;
     this.store.publishStanding({
-      account_id: accountId, observation_id: observationId, observed_at: this.context.now(), generation: before.generation,
+      account_id: accountId, observation_id: observationId, observed_at: this.context.now(),
       standing: result.value.standing, penalty_progress: result.value.penaltyProgress,
       restrictions_json: JSON.stringify(result.value.recentRestrictions)
     });
@@ -221,9 +223,9 @@ export class CsfloatAccountService {
   status(accountId: AccountId): MarketplaceStatus {
     const connection = this.store.connection(accountId, CSFLOAT_VENUE);
     const status = this.store.status(accountId);
-    const stale = status && connection && status.generation !== connection.generation;
+    const stale = status && connection && this.context.database.observation(accountId, status.observation_id)?.generation !== connection.generation;
     const standingRow = this.store.standing(accountId);
-    const standing: CsfloatStandingView | null = standingRow && connection && standingRow.generation === connection.generation
+    const standing: CsfloatStandingView | null = standingRow && connection && this.context.database.observation(accountId, standingRow.observation_id)?.generation === connection.generation
       ? {
           standing: standingRow.standing, penaltyProgress: standingRow.penalty_progress,
           recentRestrictions: parseRestrictions(standingRow.restrictions_json), observedAt: standingRow.observed_at
@@ -305,14 +307,14 @@ export class CsfloatAccountService {
       // event also says whether the stall is still away, because CSFloat sets that during a
       // suspension and never clears it — the one thing the user has to be told to undo.
       const previous = this.store.status(accountId);
-      const before = previous && previous.generation === generation
+      const before = previous && this.context.database.observation(accountId, previous.observation_id)?.generation === generation
         ? csfloatRestriction(parseFlags(previous.flags_json), previous.observed_at, previous.observed_at)
         : null;
       const after = csfloatRestriction(result.me.flags, now, now);
       const wasSuspended = before !== null && before.state !== 'ended';
       const isSuspended = after !== null && after.state !== 'ended';
       this.store.publishStatus({
-        account_id: accountId, observation_id: observationId, observed_at: now, generation,
+        account_id: accountId, observation_id: observationId, observed_at: now,
         remote_steam_id: result.me.steamId64, available_cents: result.me.availableCents,
         pending_cents: result.me.pendingCents, flags_json: JSON.stringify(result.me.flags)
       });

@@ -39,7 +39,7 @@ const filterChip = z.object({
   value: z.number().min(0).max(1).optional()
 }).strict();
 const inventoryFilter = z.object({ search: z.string().max(200).optional(), location: z.enum(['MAIN','CASKET','MISSING']).optional(),
-  // Listed is not a place: a listed item is in main inventory (engine `db/steam-listing.ts`).
+  // Listed is not a place: a listed item is in main inventory (engine `db/commitment.ts`).
   listed: z.boolean().optional(),
   casketId: z.string().optional(), category: z.string().optional(), tradableOnly: z.boolean().optional(),
   matchKeys: z.array(z.string().max(64)).max(20000).readonly().optional(),
@@ -124,16 +124,41 @@ export const accountLaunchSchema = z.object({
   signIn: z.boolean(),
   cs2: z.boolean()
 }).strict();
+/**
+ * Which currency figures are shown in (portfolio and pricing plan §5.2). `base` is the ISO code
+ * every cross-account figure is converted to; `null` until it is pinned from the first account's
+ * wallet or chosen. `baseSource` says which, so the settings page can say where the default came
+ * from and a later change of the first account never silently moves it. The toggle converts an
+ * account's own pages too; a typed price is in the account's own currency whatever it says.
+ */
+export const currencySettingsSchema = z.object({
+  base: z.string().regex(/^[A-Z]{3}$/).nullable(),
+  baseSource: z.enum(['first-account', 'chosen']),
+  showAccountPagesInBase: z.boolean()
+}).strict();
+/** The duplicate-protection switch (consolidation plan D13): a preference of this desktop, passed to the engine, which persists nothing. */
+export const csfloatSettingsSchema = z.object({ protection: z.boolean() }).strict();
 export const settingsSchema = z.object({
   version: z.literal(1),
   appearance: appearanceSettingsSchema,
-  accounts: z.record(z.string().min(1), accountLaunchSchema)
+  accounts: z.record(z.string().min(1), accountLaunchSchema),
+  currency: currencySettingsSchema,
+  csfloat: csfloatSettingsSchema
 }).strict();
 export type AppearanceSettings = z.infer<typeof appearanceSettingsSchema>;
 export type AccountLaunch = z.infer<typeof accountLaunchSchema>;
+export type CurrencySettings = z.infer<typeof currencySettingsSchema>;
+export type CsfloatSettings = z.infer<typeof csfloatSettingsSchema>;
 export type DesktopSettings = z.infer<typeof settingsSchema>;
 export const DEFAULT_LAUNCH: AccountLaunch = { signIn: true, cs2: true };
-export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {} };
+export const DEFAULT_CURRENCY: CurrencySettings = { base: null, baseSource: 'first-account', showAccountPagesInBase: false };
+export const DEFAULT_CSFLOAT: CsfloatSettings = { protection: true };
+export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT };
+
+/** The code figures are shown in: the pinned or chosen base, or USD until any wallet has been seen. */
+export function baseCurrencyOf(settings: DesktopSettings): string {
+  return settings.currency.base ?? 'USD';
+}
 
 /**
  * One account's launch preferences, defaulted. Own keys only: Steam allows an account named
@@ -186,6 +211,8 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('storage.contentsPage'), accountIds: accountScope, pageSize, cursor, casketId: z.string().min(1) }).strict(),
   z.object({ type: z.literal('inventory.detail'), accountId: z.string().min(1), id: z.string().min(1) }).strict(),
   z.object({ type: z.literal('orders.detail'), accountId: z.string().min(1), id: z.string().min(1) }).strict(),
+  // A person's exit from an unexplained order: closed as cancelled or sold, on their word, recorded as a correction beside what was observed.
+  z.object({ type: z.literal('orders.close'), accountId: z.string().min(1), orderId: z.string().min(1), as: z.enum(['cancelled', 'sold']) }).strict(),
   z.object({ type: z.literal('history.detail'), accountId: z.string().min(1), id: z.string().min(1) }).strict(),
   z.object({ type: z.literal('trades.detail'), accountId: z.string().min(1), id: z.string().min(1) }).strict(),
   z.object({ type: z.literal('ledger.detail'), accountId: z.string().min(1), id: z.string().min(1) }).strict(),
@@ -239,9 +266,15 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
     cursor: z.string().min(1).optional(),
     filter: inventoryFilter.optional()
   }).strict(),
+  // What a scope holds by market kind, one row per account, identity key and wear band, with no
+  // name (portfolio and pricing plan D6). Unpaged: a valuation needs the whole set or none of it.
+  // Main's `portfolio.valuation` is its caller; the window never computes money from it.
+  z.object({ type: z.literal('inventory.positions'), accountIds: accountScope, filter: inventoryFilter.optional() }).strict(),
   z.object({ type: z.literal('catalogue.status') }).strict(),
-  // Answered by the host from memory against its own index. No network, and no engine round trip.
-  z.object({ type: z.literal('catalogue.suggest'), text: z.string().max(200), limit: z.number().int().min(1).max(25).optional() }).strict(),
+  // Answered by the host from memory against its own index. No network. With `accountIds`, item
+  // names those accounts hold come first, counted from the engine's group summary, which main reads
+  // once per account set and keeps until one of them changes.
+  z.object({ type: z.literal('catalogue.suggest'), text: z.string().max(200), limit: z.number().int().min(1).max(25).optional(), accountIds: accountScope.optional() }).strict(),
   // Stickers or charms by name, with the definition id a buy-order filter names them by: the change
   // editor's pickers. Answered by main from the catalogue, like `catalogue.suggest`.
   z.object({ type: z.literal('catalogue.accessories'), family: z.enum(['sticker', 'patch', 'charm']), text: z.string().max(200), limit: z.number().int().min(1).max(25).optional() }).strict(),
@@ -336,6 +369,22 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
     }).strict()).min(1).max(1000)
   }).strict(),
   z.object({ type: z.literal('selection.read'), token: z.string().uuid() }).strict(),
+  // Drops members from a frozen selection, the way the store pre-check leaves them out (bulk storage plan D13).
+  z.object({
+    type: z.literal('selection.exclude'),
+    token: z.string().uuid(),
+    revision: z.number().int().positive(),
+    members: z.array(z.object({ accountId: z.string().min(1), localId: z.string().uuid() }).strict()).min(1).max(1000)
+  }).strict(),
+  // What a store would meet, read from the record alone (bulk storage plan §5.1).
+  z.object({
+    type: z.literal('store.precheck'),
+    members: z.array(z.object({ accountId: z.string().min(1), localId: z.string().uuid() }).strict()).max(1000).optional(),
+    manifestToken: z.string().uuid().optional(),
+    destinations: z.record(z.string(), z.string())
+  }).strict().refine((command) => Boolean((command.members && command.members.length > 0) || command.manifestToken), {
+    message: 'store.precheck needs members or a manifest token'
+  }),
   z.object({ type: z.literal('command.read'), commandId: z.string().uuid() }).strict(),
   z.object({ type: z.literal('command.stop'), commandId: z.string().uuid() }).strict(),
   z.object({ type: z.literal('storage.sync'), accountId: z.string().min(1) }).strict(),
@@ -369,7 +418,9 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
     manifestToken: z.string().uuid().optional(),
     manifestRevision: z.number().int().positive().optional(),
     destinations: z.record(z.string(), z.string()).optional(),
-    priceReceiveCents: z.number().int().positive().optional()
+    priceReceiveCents: z.number().int().positive().optional(),
+    // What the person agreed to store despite, when the pre-check named it (bulk storage plan D9).
+    consent: z.array(z.enum(['csfloat-listed', 'csfloat-owed', 'trade-pledged'])).max(3).optional()
   }).strict().refine((command) => Boolean((command.members && command.members.length > 0) || command.manifestToken), {
     message: 'command.submit needs members or a manifest token'
   }),
@@ -390,7 +441,6 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   // The page's refresh: the chosen venue's book read again now for the accounts in view, or both
   // venues' when none is chosen. Through the read budget, never past it.
   z.object({ type: z.literal('buyOrders.refresh'), accountIds: accountScope, venue: z.enum(['STEAM', 'CSFLOAT']).nullable() }).strict(),
-  z.object({ type: z.literal('timeline.read'), accountId: z.string().min(1) }).strict(),
   // The one cross-account read. It takes the ids rather than defaulting to "everything"
   // because nothing in this app has a current account to fall back on (CLAUDE.md rule 8) —
   // the window showing two signed-in accounts is the only thing that knows which two.
@@ -421,7 +471,29 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   // section and gets back what was stored, which is what the window then shows.
   z.object({ type: z.literal('settings.read') }).strict(),
   z.object({ type: z.literal('settings.write'), appearance: appearanceSettingsSchema }).strict(),
-  z.object({ type: z.literal('settings.launch'), accountId: z.string().min(1), launch: accountLaunchSchema }).strict()
+  z.object({ type: z.literal('settings.launch'), accountId: z.string().min(1), launch: accountLaunchSchema }).strict(),
+  // The optional CSlytics sign-in, answered by main (CSlytics account sign-in plan §6.4). No command
+  // carries a token, a code or a URL, in either direction: the window gets `CslyticsStatus` only.
+  z.object({ type: z.literal('cslytics.status') }).strict(),
+  z.object({ type: z.literal('cslytics.signIn') }).strict(),
+  z.object({ type: z.literal('cslytics.cancelSignIn') }).strict(),
+  z.object({ type: z.literal('cslytics.verify') }).strict(),
+  z.object({ type: z.literal('cslytics.signOut') }).strict(),
+  z.object({ type: z.literal('settings.currency'), currency: currencySettingsSchema }).strict(),
+  // Prices, answered by main from its own cache and the engine's reads (portfolio and pricing plan
+  // §3): the runtime never sees a price. `item.watch` is the open Items page's 5 s poll.
+  z.object({ type: z.literal('portfolio.valuation'), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
+  z.object({ type: z.literal('market.status') }).strict(),
+  // The newest FX snapshot main holds, for the read-only conversion hint beside a typed price.
+  z.object({ type: z.literal('market.fx') }).strict(),
+  z.object({ type: z.literal('portfolio.history'), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
+  z.object({ type: z.literal('item.page'), name: z.string().min(1).max(200), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
+  z.object({ type: z.literal('item.watch'), name: z.string().min(1).max(200) }).strict(),
+  // The Items page: the series and the curve on their own, because either may wait on the network
+  // and the book must not wait with them; and the market names one item is sold under.
+  z.object({ type: z.literal('item.history'), name: z.string().min(1).max(200) }).strict(),
+  z.object({ type: z.literal('item.curve'), name: z.string().min(1).max(200), venue: z.enum(['steam', 'csfloat']).optional() }).strict(),
+  z.object({ type: z.literal('item.variants'), name: z.string().min(1).max(200), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict()
 ]);
 
 export type EngineCommand = z.infer<typeof engineCommandSchema>;

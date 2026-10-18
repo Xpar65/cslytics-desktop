@@ -1,6 +1,7 @@
 import type { EngineDatabase } from '../../db/database.js';
 import type { WearBand } from '../../db/inventory-query.js';
 import { MarketplaceStore } from '../../db/marketplace.js';
+import { CSFLOAT_CURRENCY } from '../../db/csfloat.js';
 import { assertAccountScope, queryPage, type PageEnvelope } from './paging.js';
 
 /**
@@ -129,12 +130,7 @@ export type ListingsSummary = {
   coverage: ListingCoverageRow[];
 };
 
-/**
- * CSFloat prices in US dollars (`DATA-INDEX.md`: `csfloat_listing.price_cents` is the buyer price
- * in USD cents). Expressed as Steam's `ECurrencyCode` so one currency vocabulary covers both
- * venues and the host needs one formatter rather than one per venue.
- */
-export const CSFLOAT_CURRENCY = 1;
+export { CSFLOAT_CURRENCY } from '../../db/csfloat.js';
 
 const STEAM_SURFACE = 'steam-market';
 const CSFLOAT_SURFACE = 'csfloat-stall';
@@ -142,7 +138,7 @@ const CSFLOAT_SURFACE = 'csfloat-stall';
 /**
  * Steam's identity expression, spelled for an aliased `item`.
  *
- * It must stay identical to `INDIVIDUAL_MATCH_SQL` in `db/inventory-query.ts` — the catalogue
+ * It must stay identical to `IDENTITY_MATCH_SQL` in `db/inventory-query.ts` — the catalogue
  * resolves a key or it does not, and two spellings of the same key resolve differently.
  */
 const ITEM_MATCH_SQL = "i.def_index || ':' || IFNULL(i.paint_index,'') || ':' || i.quality || ':' || IFNULL(i.kit,'')";
@@ -258,7 +254,10 @@ function union(accounts: readonly string[], filter: ListingFilter): Branch {
     params: branches.flatMap((branch) => branch.params)
   };
   const item = itemPredicate(filter);
-  return item.sql ? { sql: `SELECT * FROM (${inner.sql}) WHERE ${item.sql}`, params: [...inner.params, ...item.params] } : inner;
+  if (!item.sql) return inner;
+  // The CTEs come first in the text, so their parameters come first in the list.
+  const lists = item.lists.length ? `WITH ${item.lists.join(', ')} ` : '';
+  return { sql: `${lists}SELECT * FROM (${inner.sql}) WHERE ${item.sql}`, params: [...item.listParams, ...inner.params, ...item.params] };
 }
 
 /**
@@ -271,11 +270,14 @@ function union(accounts: readonly string[], filter: ListingFilter): Branch {
  * or float question rather than passing it: nothing is concluded about an item nobody identified.
  *
  * Each predicate is `InventoryFilter`'s, spelled over these columns; `inventoryQuery` in
- * `db/inventory-query.ts` is the one to keep this in step with.
+ * `db/inventory-query.ts` is the one to keep this in step with. Its key lists travel the same way,
+ * as one JSON value each read by a CTE, so a list's length never reaches SQLite's parameter limit.
  */
-function itemPredicate(filter: ListingFilter): Branch {
+function itemPredicate(filter: ListingFilter): Branch & { lists: string[]; listParams: Param[] } {
   const clauses: string[] = [];
   const params: Param[] = [];
+  const lists: string[] = [];
+  const listParams: Param[] = [];
   const terms = (filter.search ?? []).map((term) => term.trim()).filter(Boolean);
   if (terms.length) {
     clauses.push(`(${terms.map(() => `hashName LIKE ? ESCAPE '\\' OR listingId=?`).join(' OR ')})`);
@@ -283,7 +285,11 @@ function itemPredicate(filter: ListingFilter): Branch {
   }
   if (filter.matchKeys) {
     if (filter.matchKeys.length === 0) clauses.push('0');
-    else { clauses.push(`matchKey IN (${filter.matchKeys.map(() => '?').join(',')})`); params.push(...filter.matchKeys); }
+    else {
+      lists.push('named(key) AS MATERIALIZED (SELECT value FROM json_each(?))');
+      listParams.push(JSON.stringify(filter.matchKeys));
+      clauses.push('matchKey IN (SELECT key FROM named)');
+    }
   }
   if (filter.minWear !== undefined) { clauses.push('paintWear IS NOT NULL AND paintWear>=?'); params.push(filter.minWear); }
   if (filter.maxWear !== undefined) { clauses.push('paintWear IS NOT NULL AND paintWear<=?'); params.push(filter.maxWear); }
@@ -294,31 +300,35 @@ function itemPredicate(filter: ListingFilter): Branch {
     const bands = filter.wearBands.filter((band) => band.matchKeys.length > 0);
     if (bands.length === 0) clauses.push('0');
     else {
-      clauses.push(`(${bands.map((band) => `(matchKey IN (${band.matchKeys.map(() => '?').join(',')}) AND paintWear IS NOT NULL AND paintWear BETWEEN ? AND ?)`).join(' OR ')})`);
-      for (const band of bands) params.push(...band.matchKeys, band.minWear, band.maxWear);
+      lists.push(`band(key, low, high) AS MATERIALIZED (SELECT k.value, json_extract(b.value, '$.minWear'), json_extract(b.value, '$.maxWear')
+        FROM json_each(?) b, json_each(b.value, '$.matchKeys') k)`);
+      listParams.push(JSON.stringify(bands));
+      clauses.push('paintWear IS NOT NULL AND EXISTS (SELECT 1 FROM band b WHERE b.key=matchKey AND paintWear BETWEEN b.low AND b.high)');
     }
   }
-  return { sql: clauses.join(' AND '), params };
+  return { sql: clauses.join(' AND '), params, lists, listParams };
 }
 
+/** Steam's book: the listings the last complete walk showed, in Steam's own bucket words. */
 function steamBranch(accounts: readonly string[], filter: ListingFilter): Branch {
   const params: Param[] = [];
-  let where = `m.account_id IN (${accounts.map(() => '?').join(',')}) AND m.status<>'ABSENT'`;
+  let where = `m.account_id IN (${accounts.map(() => '?').join(',')}) AND m.venue='steam' AND m.side='SELL' AND m.first_seen_obs IS NOT NULL AND m.gone_obs IS NULL`;
   params.push(...accounts);
-  if (filter.state) { where += ' AND m.status=?'; params.push(filter.state); }
+  if (filter.state) { where += ' AND s.raw_bucket=?'; params.push(filter.state); }
   return {
-    sql: `SELECT m.account_id AS accountId, 'STEAM' AS venue, m.listing_id AS listingId,
-        m.hash_name AS hashName, m.status AS state,
-        m.buyer_price_cents AS buyerPriceCents, m.price_receive_cents AS receiveCents,
-        (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=m.account_id ORDER BY w.id DESC LIMIT 1) AS currency,
+    sql: `SELECT m.account_id AS accountId, 'STEAM' AS venue, m.venue_order_id AS listingId,
+        m.hash_name AS hashName, s.raw_bucket AS state,
+        s.buyer_price_cents AS buyerPriceCents, m.price_cents AS receiveCents,
+        COALESCE(m.currency, (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=m.account_id ORDER BY w.id DESC LIMIT 1)) AS currency,
         m.local_id AS localId, m.asset_id AS assetId,
         IFNULL(${ITEM_MATCH_SQL}, '') AS matchKey,
         i.def_index AS defIndex, i.paint_index AS paintIndex, i.quality AS quality,
         i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
-        m.hold_until AS holdUntil, m.awaiting_confirmation AS awaitingConfirmation,
+        m.transactable_after AS holdUntil, CASE WHEN s.raw_bucket='PENDING_CONFIRMATION' THEN 1 ELSE 0 END AS awaitingConfirmation,
         NULL AS createdAt, f.finished_at AS firstSeenAt,
         o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete
-      FROM market_listing m
+      FROM venue_order m
+      JOIN steam_order s ON s.account_id=m.account_id AND s.order_id=m.order_id
       LEFT JOIN item i ON i.local_id=m.local_id AND i.account_id=m.account_id
       LEFT JOIN observation f ON f.id=m.first_seen_obs
       LEFT JOIN observation o ON o.id=m.last_seen_obs
@@ -328,35 +338,37 @@ function steamBranch(accounts: readonly string[], filter: ListingFilter): Branch
 }
 
 /**
- * CSFloat's book, with identity taken from the local item where the association exists.
+ * CSFloat's book: the listings the last complete stall walk showed, with identity taken from the
+ * local item where the association exists.
  *
- * `csfloat_listing` carries the venue's own tuple but no `kit`, and a key spelled with an empty
- * kit is a different key from one spelled with the item's. So the contract row — which is where
+ * The venue's item body carries its own tuple but no `kit`, and a key spelled with an empty kit
+ * is a different key from one spelled with the item's. So the row's binding — which is where
  * `CsfloatStore.associate` recorded the identity association, by float tuple and never by asset
  * id alone (rule 3) — is joined through to the local item, and the venue's tuple is only the
  * fallback for a listing this app has not managed to associate.
  */
 function csfloatBranch(accounts: readonly string[], filter: ListingFilter): Branch {
   const params: Param[] = [];
-  let where = `c.account_id IN (${accounts.map(() => '?').join(',')})`;
+  let where = `c.account_id IN (${accounts.map(() => '?').join(',')}) AND c.venue='csfloat' AND c.side='SELL' AND c.first_seen_obs IS NOT NULL AND c.gone_obs IS NULL`;
   params.push(...accounts);
-  if (filter.state) { where += ' AND c.state=?'; params.push(filter.state); }
+  if (filter.state) { where += ' AND k.state_word=?'; params.push(filter.state); }
+  const venue = (field: string): string => `json_extract(k.item_json, '$.${field}')`;
   return {
-    sql: `SELECT c.account_id AS accountId, 'CSFLOAT' AS venue, c.listing_id AS listingId,
-        c.hash_name AS hashName, c.state AS state,
+    sql: `SELECT c.account_id AS accountId, 'CSFLOAT' AS venue, c.venue_order_id AS listingId,
+        c.hash_name AS hashName, k.state_word AS state,
         c.price_cents AS buyerPriceCents, NULL AS receiveCents,
         ${CSFLOAT_CURRENCY} AS currency,
-        k.local_id AS localId, c.asset_id AS assetId,
+        c.local_id AS localId, c.asset_id AS assetId,
         IFNULL(${ITEM_MATCH_SQL},
-          c.def_index || ':' || IFNULL(c.paint_index,'') || ':' || IFNULL(c.quality,'') || ':') AS matchKey,
-        c.def_index AS defIndex, c.paint_index AS paintIndex, c.quality AS quality,
-        c.paint_wear AS paintWear, c.paint_seed AS paintSeed,
+          ${venue('defIndex')} || ':' || IFNULL(${venue('paintIndex')},'') || ':' || IFNULL(${venue('quality')},'') || ':') AS matchKey,
+        IFNULL(i.def_index, ${venue('defIndex')}) AS defIndex, IFNULL(i.paint_index, ${venue('paintIndex')}) AS paintIndex, IFNULL(i.quality, ${venue('quality')}) AS quality,
+        IFNULL(i.paint_wear, ${venue('floatValue')}) AS paintWear, IFNULL(i.paint_seed, ${venue('paintSeed')}) AS paintSeed,
         NULL AS holdUntil, 0 AS awaitingConfirmation,
-        c.created_at AS createdAt, f.finished_at AS firstSeenAt,
+        k.created_at AS createdAt, f.finished_at AS firstSeenAt,
         o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete
-      FROM csfloat_listing c
-      LEFT JOIN csfloat_contract k ON k.account_id=c.account_id AND k.listing_id=c.listing_id
-      LEFT JOIN item i ON i.local_id=k.local_id AND i.account_id=c.account_id
+      FROM venue_order c
+      JOIN csfloat_order k ON k.account_id=c.account_id AND k.order_id=c.order_id
+      LEFT JOIN item i ON i.local_id=c.local_id AND i.account_id=c.account_id
       LEFT JOIN observation f ON f.id=c.first_seen_obs
       LEFT JOIN observation o ON o.id=c.last_seen_obs
       WHERE ${where}`,

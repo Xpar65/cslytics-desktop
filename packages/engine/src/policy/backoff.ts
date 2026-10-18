@@ -76,6 +76,11 @@ export class BackoffLedger {
     });
   }
 
+  /** Lifts one scope's hold, failures and all: what a person asking for that scope does. */
+  clear(accountId: string, surface: string): void {
+    this.states.delete(this.key(accountId, surface));
+  }
+
   forget(accountId: string): void {
     for (const key of [...this.states.keys()]) {
       if (key.startsWith(`${accountId}:`)) this.states.delete(key);

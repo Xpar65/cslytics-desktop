@@ -4,7 +4,7 @@ import { Icon } from '../../components/Icon.js';
 import { VenueMark } from '../../components/VenueMark.js';
 import { Avatar } from '../../components/Avatar.js';
 import { engine } from '../../lib/engine.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { currencyCode, formatDateTime, formatRelative, plural, shortId, surfaceLabel } from '../../lib/labels.js';
 import { isOverdue, type WaitingRow, type WaitingState } from './use-waiting.js';
 
@@ -181,7 +181,7 @@ function WaitingLine({ row }: { row: WaitingRow }): React.JSX.Element {
           {/* "Waiting since" rather than "created": what is known is when a walk first saw it. */}
           <span>{row.waitingSince ? `waiting ${formatRelative(row.waitingSince)}` : 'waiting since a walk that did not date it'}</span>
           {listing && row.receiveCents !== null ? (
-            <><span className="sep">·</span><span>you receive {formatCents(row.receiveCents, row.currency)} {currencyCode(row.currency)}</span></>
+            <><span className="sep">·</span><span>you receive {formatAmount(row.receiveCents, row.currency)} {currencyCode(row.currency)}</span></>
           ) : null}
           {row.expiresAt ? (
             <><span className="sep">·</span><span><Icon name="clock" size={11} /> expires {formatDateTime(row.expiresAt)}</span></>

@@ -1,7 +1,10 @@
 import type { AccountId, MutationOutcome, StoreApprovalOutcome, StorePurchaseFinalizeRaw, StorePurchaseInitRaw } from '@cslytics/ports';
-import { randomUUID } from 'node:crypto';
 import type { ActionRow, ObservationRow } from '../db/database.js';
-import { InGameStoreStore, parseItemIds, type StorePurchaseLineRow, type StorePurchaseRow, type StorePurchaseState } from '../db/in-game-store.js';
+import {
+  InGameStoreStore, STORE_PURCHASE, parseItemIds, storeHopId,
+  type StoreHop, type StorePurchaseLineRow, type StorePurchaseParams, type StorePurchaseRow, type StorePurchaseState
+} from '../db/in-game-store.js';
+import { WorkStore, isSettled, type WorkStepRow } from '../db/work.js';
 import { executeMutation, type EngineContext } from '../kernel/context.js';
 import { postAttempt, surfaceEvidence, type SurfaceRef } from '../kernel/evidence.js';
 import { errorMessage } from '../kernel/support.js';
@@ -10,13 +13,15 @@ import { LedgerStore } from '../db/ledger.js';
 
 /**
  * The CS2 in-game store as a vertical slice: the price sheet observation, one purchase's
- * admission and its three GC hops, and the reconciliation that lets inventory and wallet
- * evidence — never a response — decide what happened.
+ * admission and its GC hops, and the reconciliation that lets inventory and wallet evidence —
+ * never a response — decide what happened.
  *
- * The shape follows the buy-order surface for money and the CSFloat operations for state: a
- * purchase is its own row with a command id for idempotency, a wallet reservation taken at
- * admission, and one `action` per GC hop so the crash matrix and `executeMutation` treat each
- * hop exactly like every other mutation in the engine. Rationale and evidence:
+ * A purchase is a command with a hop per GC step (consolidation plan D2): the init, the person's
+ * approval at the checkout, the finalize, and a cancel when asked for. Its lines sit beside the
+ * init hop (`store_line`), its wallet reservation is taken at admission under the command's id,
+ * and each hop's action goes through `executeMutation` like every other mutation in the engine,
+ * so the crash matrix treats it like one. Where the purchase is, in its own words, is read from
+ * the hops (`InGameStoreStore.purchase`). Rationale and evidence:
  * `cslytics-app-docs/steam/in-game-store.md`.
  */
 
@@ -54,31 +59,28 @@ export const STORE_CURRENCY_LABEL: Readonly<Record<number, string>> = {
 export type StorePurchaseLineRequest = { entryKey: string; defIndex: number; quantity: number; unitPriceCents: number };
 export type StorePurchaseRequest = { commandId: string; accountId: AccountId; lines: StorePurchaseLineRequest[] };
 
-type HopKind = 'STORE_PURCHASE_INIT' | 'STORE_PURCHASE_FINALIZE' | 'STORE_PURCHASE_CANCEL';
-const HOP_COLUMN: Record<HopKind, 'init_action_id' | 'finalize_action_id' | 'cancel_action_id'> = {
-  STORE_PURCHASE_INIT: 'init_action_id',
-  STORE_PURCHASE_FINALIZE: 'finalize_action_id',
-  STORE_PURCHASE_CANCEL: 'cancel_action_id'
+/** The action kind each hop sends, and the hop's place in the chain. */
+const HOP_ACTION: Record<StoreHop, string> = {
+  STORE_INIT: 'STORE_PURCHASE_INIT', STORE_APPROVE: 'STORE_PURCHASE_APPROVE', STORE_FINALIZE: 'STORE_PURCHASE_FINALIZE', STORE_CANCEL: 'STORE_PURCHASE_CANCEL'
 };
+const HOP_ORDINAL: Record<StoreHop, number> = { STORE_INIT: 0, STORE_APPROVE: 1, STORE_FINALIZE: 2, STORE_CANCEL: 3 };
 
 const INIT_UNANSWERED = 'Steam did not answer the purchase request. The reserved funds stay reserved until later inventory and wallet observations explain it';
 const FINALIZE_UNANSWERED = 'Steam did not answer the finalize. Waiting for inventory and wallet evidence; the reserved funds stay reserved';
 
 export class InGameStoreService {
   protected readonly store: InGameStoreStore;
+  protected readonly work: WorkStore;
   private readonly advancing = new Set<string>();
 
   constructor(protected readonly context: EngineContext) {
     this.store = new InGameStoreStore(context.database);
+    this.work = this.store.work;
   }
 
   // ---------------------------------------------------------------- the price sheet
 
-  syncPriceSheet(accountId: AccountId): Promise<number> {
-    return this.context.reads.run(`${accountId}:${STORE_SHEET_SURFACE}`, () => this.readSheet(accountId));
-  }
-
-  private async readSheet(accountId: AccountId): Promise<number> {
+  async syncPriceSheet(accountId: AccountId): Promise<number> {
     const { database } = this.context;
     const startedAt = this.context.now();
     const known = this.store.sheet(accountId);
@@ -134,15 +136,15 @@ export class InGameStoreService {
 
   /**
    * Admits one purchase and takes its wallet reservation. Idempotent by command id: the same
-   * click, retried, finds its row; the same id with different terms is refused (STORE-03).
+   * click, retried, finds its row; the same id with different terms is refused (STORE-03). The
+   * command's id is the purchase's.
    */
   queue(request: StorePurchaseRequest): StorePurchaseRow {
     const { database } = this.context;
     const now = this.context.now();
     return database.transaction(() => {
-      const existing = this.store.purchasesByCommand(request.commandId);
-      if (existing.length) {
-        const found = existing[0]!;
+      const found = this.store.purchase(request.commandId);
+      if (found) {
         const lines = this.store.lines(found.id);
         const same = found.account_id === request.accountId && lines.length === request.lines.length
           && request.lines.every((line, index) => {
@@ -152,6 +154,7 @@ export class InGameStoreService {
         if (!same) throw new Error('Command id was already used for different terms');
         return found;
       }
+      if (database.command(request.commandId)) throw new Error('Command id was already used for different terms');
       if (!database.account(request.accountId)) throw new Error(`Unknown account ${request.accountId}`);
       const { sheet, total } = this.validateLines(request);
       requireFreshMoneyEvidence(this.context, request.accountId, 'Store purchase admission');
@@ -160,14 +163,13 @@ export class InGameStoreService {
       const gc = this.context.ports.gc.connectionStatus(request.accountId);
       if (gc.state !== 'CONNECTED') throw new Error(gc.detail ?? 'The CS2 Game Coordinator is not connected for this account');
 
-      const id = randomUUID();
-      this.store.insertPurchase({
-        id, command_id: request.commandId, account_id: request.accountId, state: 'ADMITTED', currency: sheet.currency,
-        requested_total_cents: total, sheet_version: sheet.version, txn_id: null, init_action_id: null, finalize_action_id: null,
-        cancel_action_id: null, item_ids_json: '[]', resolved_by_obs: null, created_at: now, error: null
-      });
-      request.lines.forEach((line, index) => this.store.insertLine({
-        purchase_id: id, account_id: request.accountId, line_index: index, entry_key: line.entryKey, def_index: line.defIndex,
+      const id = request.commandId;
+      const params: StorePurchaseParams = { purchaseId: id, currency: sheet.currency, requestedTotalCents: total, sheetVersion: sheet.version,
+        hashName: request.lines.map((line) => line.quantity > 1 ? `${line.entryKey} × ${line.quantity}` : line.entryKey).join(', ') };
+      this.work.adoptCommand(id, STORE_PURCHASE, now);
+      const init = this.work.insert({ id: storeHopId(id, 'STORE_INIT'), commandId: id, accountId: request.accountId, ordinal: HOP_ORDINAL.STORE_INIT, kind: 'STORE_INIT', params, now });
+      request.lines.forEach((line, index) => this.work.insertStoreLine({
+        step_id: init.id, account_id: request.accountId, line_index: index, entry_key: line.entryKey, def_index: line.defIndex,
         quantity: line.quantity, unit_price_cents: line.unitPriceCents,
         baseline_quantity: this.store.mainQuantityOfDef(request.accountId, line.defIndex), observed_quantity: 0
       }));
@@ -178,16 +180,16 @@ export class InGameStoreService {
     });
   }
 
-  /**
-   * The terms a purchase freezes must be the terms the last parsed sheet shows, and that sheet
-   * must be a fresh complete observation for *this* account. A remembered price, another
-   * account's price, or an unparseable sheet admits nothing (STORE-01, STORE-02).
-   */
   /** What this wallet can still commit, in its own currency: balance less our reservations and others' orders. */
   protected availableCents(accountId: AccountId, currency: number): number {
     return walletAvailability(this.context.database, accountId, currency).availableCents;
   }
 
+  /**
+   * The terms a purchase freezes must be the terms the last parsed sheet shows, and that sheet
+   * must be a fresh complete observation for *this* account. A remembered price, another
+   * account's price, or an unparseable sheet admits nothing (STORE-01, STORE-02).
+   */
   protected validateLines(request: StorePurchaseRequest): { sheet: { currency: number; version: number }; total: number } {
     if (!request.lines.length || request.lines.length > STORE_LINES_MAX) throw new Error(`Select between 1 and ${STORE_LINES_MAX} store entries`);
     const sheet = this.store.sheet(request.accountId);
@@ -212,13 +214,13 @@ export class InGameStoreService {
     return { sheet: { currency: sheet.currency, version: sheet.version }, total };
   }
 
-  // ---------------------------------------------------------------- the three hops
+  // ---------------------------------------------------------------- the hops
 
   /**
    * Drives one purchase as far as it can go right now: init under the account lock, the
    * approval wait *outside* it (a person at a checkout must not block every other operation on
-   * the account for ten minutes), then finalize under the lock again. Anything thrown becomes
-   * the purchase's error rather than the caller's: the row is the record.
+   * the account for ten minutes), then finalize under the lock again. Anything thrown lands on
+   * the hop it stopped at rather than on the caller: the hops are the record.
    */
   async advance(id: string): Promise<void> {
     if (this.advancing.has(id)) return;
@@ -240,10 +242,16 @@ export class InGameStoreService {
         else proceed = false;
       }
     } catch (error) {
-      this.store.update(id, { state: 'UNRESOLVED', error: errorMessage(error) }, this.context.now());
+      this.unresolved(id, errorMessage(error));
     } finally {
       this.advancing.delete(id);
     }
+  }
+
+  /** The purchase cannot go on by itself: the hop it stopped at fails with the reason, for the person to cancel or continue. */
+  private unresolved(id: string, reason: string): void {
+    const open = [...this.hops(id)].reverse().find((hop) => !isSettled(hop));
+    if (open) this.work.failHop(open, reason, this.context.now());
   }
 
   /** The user's cancel: the recorded transaction, or nothing at all when nothing was sent. */
@@ -256,7 +264,7 @@ export class InGameStoreService {
         if (purchase.state === 'ADMITTED') { this.reject(purchase, 'Cancelled before anything was sent to Steam'); return; }
         throw new Error('Steam has not named a transaction to cancel; wait for the next inventory and wallet observation');
       }
-      this.store.update(id, { state: 'CANCELLING' }, this.context.now());
+      this.hop(purchase, 'STORE_CANCEL');
       await this.cancelStep(id);
     });
   }
@@ -269,11 +277,12 @@ export class InGameStoreService {
 
   protected async initStep(id: string): Promise<boolean> {
     const purchase = this.store.purchase(id)!;
-    if (purchase.state !== 'ADMITTED') return purchase.state === 'AWAITING_APPROVAL' || purchase.state === 'FINALISING';
-    const action = this.hop(purchase, 'STORE_PURCHASE_INIT');
+    if (purchase.state !== 'ADMITTED' && purchase.state !== 'INITIALISING') return purchase.state === 'AWAITING_APPROVAL' || purchase.state === 'FINALISING';
+    const init = this.hop(purchase, 'STORE_INIT');
+    const action = this.hopAction(purchase, init);
     if (action.state !== 'READY') {
       // A dead RUNNING init recovered as AWAITING_OBSERVATION: never re-sent (STORE-04, STORE-10).
-      this.store.update(id, { state: 'AWAITING_OBSERVATION', error: INIT_UNANSWERED }, this.context.now());
+      this.work.setState(init.id, 'AWAITING_OBSERVATION', this.context.now(), INIT_UNANSWERED);
       return false;
     }
     const lines = this.store.lines(id);
@@ -286,7 +295,7 @@ export class InGameStoreService {
         throw admission.rejected;
       }
     };
-    this.store.update(id, { state: 'INITIALISING' }, this.context.now());
+    this.work.setState(init.id, 'SENT', this.context.now());
     let outcome: MutationOutcome;
     try {
       outcome = await executeMutation(this.context, action, () => this.context.ports.inGameStore.initPurchase(purchase.account_id, {
@@ -299,20 +308,26 @@ export class InGameStoreService {
         this.context.database.setActionState(action.id, 'FAILED', this.context.now(), admission.rejected.message);
         this.reject(purchase, admission.rejected.message);
       } else {
-        this.store.update(id, { state: 'UNRESOLVED', error: errorMessage(error) }, this.context.now());
+        this.work.failHop(init, errorMessage(error), this.context.now());
       }
       return false;
     }
     if (outcome.kind === 'SUBMITTED') {
       const raw = outcome.raw as StorePurchaseInitRaw;
-      this.store.update(id, { state: 'AWAITING_APPROVAL', txn_id: String(raw.txnId), error: null }, this.context.now());
+      // The transaction Steam named is the init hop's object; the hop stays open until the
+      // purchase is proved, because a response is an attempt and not a delivery.
+      const now = this.context.now();
+      this.context.database.transaction(() => {
+        this.work.update(init.id, { state: 'AWAITING_OBSERVATION', target_id: String(raw.txnId), reason: null }, now);
+        this.openHop(purchase, 'STORE_APPROVE', String(raw.txnId), 'AWAITING_OBSERVATION');
+      });
       return true;
     }
     if (outcome.kind === 'DEFINITIVELY_REJECTED') {
       this.reject(purchase, `Steam refused the purchase (${outcome.reason})`);
       return false;
     }
-    this.store.update(id, { state: 'AWAITING_OBSERVATION', error: INIT_UNANSWERED }, this.context.now());
+    this.work.setState(init.id, 'AWAITING_OBSERVATION', this.context.now(), INIT_UNANSWERED);
     return false;
   }
 
@@ -332,47 +347,69 @@ export class InGameStoreService {
     if (available < purchase.requested_total_cents) throw new Error(`Insufficient unreserved wallet balance: ${available}`);
   }
 
+  /**
+   * The person at the checkout. The approval hop has no action of its own: its outcome is what
+   * the checkout port reports, and the hop records it. Approved is the hop done and the finalize
+   * opened; declined or closed is the hop failed and a cancel opened; a timeout leaves the hop
+   * queued with the reason, for the person to continue or cancel.
+   */
   protected async approvalStep(purchase: StorePurchaseRow): Promise<boolean> {
+    const approve = this.hop(purchase, 'STORE_APPROVE');
     let outcome: StoreApprovalOutcome;
     try {
       outcome = await this.context.ports.inGameStore.awaitApproval(purchase.account_id, purchase.txn_id!, STORE_APPROVAL_TIMEOUT_MS);
     } catch (error) {
-      this.store.update(purchase.id, { state: 'UNRESOLVED', error: errorMessage(error) }, this.context.now());
+      this.work.failHop(approve, errorMessage(error), this.context.now());
       return false;
     }
     const now = this.context.now();
     this.context.database.addEvent(purchase.account_id, 'store-checkout', { purchaseId: purchase.id, txnId: purchase.txn_id, outcome: outcome.kind }, now);
     switch (outcome.kind) {
       case 'approved':
-        this.store.update(purchase.id, { state: 'FINALISING', error: null }, now);
+        this.approved(purchase);
         return true;
       case 'timeout':
-        this.store.update(purchase.id, { error: 'No approval within 10 minutes. Open the Store to continue the checkout, or cancel the purchase' }, now);
+        this.work.update(approve.id, { state: 'QUEUED', reason: 'No approval within 10 minutes. Open the Store to continue the checkout, or cancel the purchase' }, now);
         return false;
       default:
-        this.store.update(purchase.id, { state: 'CANCELLING', error: outcome.kind === 'declined' ? 'The checkout was declined' : 'The checkout was closed before approval' }, now);
+        this.context.database.transaction(() => {
+          this.work.failHop(approve, outcome.kind === 'declined' ? 'The checkout was declined' : 'The checkout was closed before approval', now);
+          this.hop(purchase, 'STORE_CANCEL');
+        });
         return true;
     }
+  }
+
+  /** The person approved: the approval hop is done, and the finalize is the next hop. */
+  protected approved(purchase: StorePurchaseRow): void {
+    const now = this.context.now();
+    this.context.database.transaction(() => {
+      const approve = this.hop(purchase, 'STORE_APPROVE');
+      if (!isSettled(approve)) this.work.settle(approve.id, 'DONE', null, now);
+      this.hop(purchase, 'STORE_FINALIZE');
+    });
   }
 
   protected async finalizeStep(id: string): Promise<boolean> {
     const purchase = this.store.purchase(id)!;
     if (purchase.state !== 'FINALISING') return false;
-    const action = this.hop(purchase, 'STORE_PURCHASE_FINALIZE');
+    const finalize = this.hop(purchase, 'STORE_FINALIZE');
+    const action = this.hopAction(purchase, finalize);
     if (action.state !== 'READY') {
-      this.store.update(id, { state: 'AWAITING_OBSERVATION', error: FINALIZE_UNANSWERED }, this.context.now());
+      this.work.setState(finalize.id, 'AWAITING_OBSERVATION', this.context.now(), FINALIZE_UNANSWERED);
       return false;
     }
+    this.work.setState(finalize.id, 'SENT', this.context.now());
     const outcome = await executeMutation(this.context, action, () => this.context.ports.inGameStore.finalizePurchase(purchase.account_id, purchase.txn_id!));
     const now = this.context.now();
     if (outcome.kind === 'SUBMITTED') {
       const raw = outcome.raw as StorePurchaseFinalizeRaw;
-      this.store.update(id, { state: 'AWAITING_OBSERVATION', item_ids_json: JSON.stringify((raw.itemIds ?? []).map(String)), error: null }, now);
+      this.work.update(finalize.id, { state: 'AWAITING_OBSERVATION', reason: null, params_json: JSON.stringify({ itemIds: (raw.itemIds ?? []).map(String) }) }, now);
       this.reconcile(purchase.account_id);
     } else if (outcome.kind === 'DEFINITIVELY_REJECTED') {
-      this.store.update(id, { state: 'UNRESOLVED', error: `Steam refused to finalise (${outcome.reason}). The approved transaction may still be charged: cancel it, or refresh once the inventory and wallet have been observed` }, now);
+      this.work.failHop(finalize, `Steam refused to finalise (${outcome.reason}). The approved transaction may still be charged: cancel it, or refresh once the inventory and wallet have been observed`, now);
     } else {
-      this.store.update(id, { state: 'AWAITING_OBSERVATION', error: FINALIZE_UNANSWERED }, now);
+      this.work.setState(finalize.id, 'AWAITING_OBSERVATION', now, FINALIZE_UNANSWERED);
     }
     return false;
   }
@@ -380,42 +417,70 @@ export class InGameStoreService {
   protected async cancelStep(id: string): Promise<boolean> {
     const purchase = this.store.purchase(id)!;
     if (!purchase.txn_id) return false;
-    const action = this.hop(purchase, 'STORE_PURCHASE_CANCEL');
+    const cancel = this.hop(purchase, 'STORE_CANCEL');
+    const action = this.hopAction(purchase, cancel);
     if (action.state !== 'READY') return false;
+    this.work.setState(cancel.id, 'SENT', this.context.now());
     const outcome = await executeMutation(this.context, action, () => this.context.ports.inGameStore.cancelPurchase(purchase.account_id, purchase.txn_id!));
     const now = this.context.now();
     if (outcome.kind === 'SUBMITTED') {
-      this.store.update(id, { state: 'CANCELLING', error: 'Cancel accepted; the reserved funds return once the wallet and inventory have been observed' }, now);
+      this.work.setState(cancel.id, 'AWAITING_OBSERVATION', now, 'Cancel accepted; the reserved funds return once the wallet and inventory have been observed');
     } else if (outcome.kind === 'DEFINITIVELY_REJECTED') {
       // The GC refuses to cancel a finalised transaction: that refusal is the strongest hint
-      // that money and items moved, and the inventory is what proves it.
-      this.store.update(id, { state: 'AWAITING_OBSERVATION', error: `Steam refused the cancel (${outcome.reason}); waiting for inventory evidence of what was delivered` }, now);
+      // that money and items moved, and the inventory is what proves it. The cancel hop stops
+      // there; the finalize or the init goes on waiting for that evidence.
+      this.work.settle(cancel.id, 'STOPPED', null, now, `Steam refused the cancel (${outcome.reason}); waiting for inventory evidence of what was delivered`);
+      const waiting = this.hop(purchase, 'STORE_FINALIZE', false) ?? this.hop(purchase, 'STORE_INIT');
+      if (!isSettled(waiting)) this.work.setState(waiting.id, 'AWAITING_OBSERVATION', now, `Steam refused the cancel (${outcome.reason}); waiting for inventory evidence of what was delivered`);
     } else {
-      this.store.update(id, { state: 'CANCELLING', error: 'Steam did not answer the cancel; waiting for wallet and inventory evidence' }, now);
+      this.work.setState(cancel.id, 'AWAITING_OBSERVATION', now, 'Steam did not answer the cancel; waiting for wallet and inventory evidence');
     }
     return false;
   }
 
-  protected hop(purchase: StorePurchaseRow, kind: HopKind): ActionRow {
+  /** The purchase's hops, in order. */
+  protected hops(id: string): WorkStepRow[] {
+    return this.work.steps(id).filter((hop) => hop.command_id === id);
+  }
+
+  /** A hop of the purchase, opened in its place when the purchase first reaches it. */
+  protected hop(purchase: StorePurchaseRow, kind: StoreHop): WorkStepRow;
+  protected hop(purchase: StorePurchaseRow, kind: StoreHop, open: false): WorkStepRow | undefined;
+  protected hop(purchase: StorePurchaseRow, kind: StoreHop, open = true): WorkStepRow | undefined {
+    const existing = this.store.hop(purchase.id, kind);
+    if (existing || !open) return existing;
+    return this.openHop(purchase, kind, purchase.txn_id, 'QUEUED');
+  }
+
+  private openHop(purchase: StorePurchaseRow, kind: StoreHop, txnId: string | null, state: 'QUEUED' | 'AWAITING_OBSERVATION'): WorkStepRow {
+    const init = this.store.hop(purchase.id, 'STORE_INIT');
+    const params = init ? this.work.params<StorePurchaseParams>(init) : null;
+    const hop = this.work.insert({ id: storeHopId(purchase.id, kind), commandId: purchase.id, accountId: purchase.account_id, ordinal: HOP_ORDINAL[kind], kind,
+      targetId: txnId, params: params ? { purchaseId: purchase.id, txnId, hashName: params.hashName } : { purchaseId: purchase.id, txnId }, now: this.context.now() });
+    if (state !== 'QUEUED') this.work.setState(hop.id, state, this.context.now());
+    return this.work.step(hop.id)!;
+  }
+
+  /** The action that carries a hop, made the first time the hop is sent. */
+  protected hopAction(purchase: StorePurchaseRow, hop: WorkStepRow): ActionRow {
     const db = this.context.database;
-    const column = HOP_COLUMN[kind];
-    const existingId = purchase[column];
-    const existing = existingId ? db.action(existingId) : undefined;
+    const existing = hop.action_id ? db.action(hop.action_id) : undefined;
     if (existing) return existing;
     return db.transaction(() => {
       const now = this.context.now();
-      const desired = db.upsertDesired({ accountId: purchase.account_id, targetKind: 'store-purchase', targetId: `${purchase.id}:${kind}`, intent: kind,
-        params: { purchaseId: purchase.id, txnId: purchase.txn_id }, basis: 'manual', now });
-      const action = db.enqueueAction({ accountId: purchase.account_id, desiredId: desired.id, desiredVersion: desired.version, actionKind: kind,
+      const kind = HOP_ACTION[hop.kind as StoreHop];
+      const action = db.enqueueAction({ accountId: purchase.account_id, stepId: hop.id, actionKind: kind,
         targetId: purchase.id, resourceKey: `store-purchase:${purchase.id}:${kind}`, params: { purchaseId: purchase.id, txnId: purchase.txn_id }, now });
-      this.store.update(purchase.id, { [column]: action.id }, now);
+      this.work.attachAction(hop.id, action.id, now);
       return action;
     });
   }
 
+  /** Refused, before or by Steam: the init hop fails with the reason and the money comes back. */
   protected reject(purchase: StorePurchaseRow, reason: string): void {
     this.context.database.transaction(() => {
-      this.store.update(purchase.id, { state: 'REJECTED', error: reason }, this.context.now());
+      const init = this.hop(purchase, 'STORE_INIT');
+      this.work.failHop(init, reason, this.context.now());
       this.store.setReservation(purchase.account_id, purchase.id, 'RELEASED');
       this.context.database.addEvent(purchase.account_id, 'store-purchase-rejected', { purchaseId: purchase.id, reason }, this.context.now());
     });
@@ -456,7 +521,12 @@ export class InGameStoreService {
           if (cancel.state === 'AWAITING_OBSERVATION') db.resolveAction(cancel, completeInventory.id, true, now);
           if (init?.state === 'AWAITING_OBSERVATION') db.resolveAction(init, completeInventory.id, false, now);
           this.store.setReservation(accountId, purchase.id, 'RELEASED');
-          this.store.update(purchase.id, { state: 'CANCELLED', resolved_by_obs: completeInventory.id, error: null }, now);
+          const cancelHop = this.store.hop(purchase.id, 'STORE_CANCEL')!;
+          this.work.settle(cancelHop.id, 'DONE', completeInventory.id, now);
+          for (const kind of ['STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE'] as const) {
+            const hop = this.store.hop(purchase.id, kind);
+            if (hop && !isSettled(hop)) this.work.settle(hop.id, 'STOPPED', completeInventory.id, now, 'Transaction cancelled');
+          }
           db.addEvent(accountId, 'store-purchase-cancelled', { purchaseId: purchase.id, txnId: purchase.txn_id }, now);
         });
         continue;
@@ -469,8 +539,8 @@ export class InGameStoreService {
           const now = this.context.now();
           if (init.state === 'AWAITING_OBSERVATION') db.resolveAction(init, completeInventory.id, false, now);
           this.store.setReservation(accountId, purchase.id, 'RELEASED');
-          this.store.update(purchase.id, { state: 'REJECTED', resolved_by_obs: completeInventory.id,
-            error: 'Steam never answered the purchase request, and the inventory and wallet observed afterwards show nothing bought' }, now);
+          const initHop = this.store.hop(purchase.id, 'STORE_INIT')!;
+          this.work.failHop(initHop, 'Steam never answered the purchase request, and the inventory and wallet observed afterwards show nothing bought', now, completeInventory.id);
         });
       }
     }
@@ -499,7 +569,7 @@ export class InGameStoreService {
       if (observed < line.quantity) return false;
       latest = Math.max(latest, bucket!.latestObs);
     }
-    this.complete(purchase, lines, latest, (line) => seenByDef.get(line.def_index)?.ids.slice(0, line.quantity) ?? []);
+    this.complete(purchase, lines, latest);
     return true;
   }
 
@@ -511,7 +581,7 @@ export class InGameStoreService {
       if (observed !== line.observed_quantity) this.store.setObservedQuantity(purchase.id, line.line_index, observed);
       if (gained < line.quantity) return false;
     }
-    this.complete(purchase, lines, observation.id, () => []);
+    this.complete(purchase, lines, observation.id);
     return true;
   }
 
@@ -520,25 +590,25 @@ export class InGameStoreService {
     return `store:${txn}:${lineIndex}`;
   }
 
-  /** One ledger posting and one lot per line, keyed by transaction so a replay is a no-op (STORE-08). */
-  protected complete(purchase: StorePurchaseRow, lines: StorePurchaseLineRow[], observationId: number, idsFor: (line: StorePurchaseLineRow) => string[]): void {
+  /**
+   * One ledger posting and one lot per line, keyed by transaction so a replay is a no-op
+   * (STORE-08); then every hop the purchase made is done on the observation that proved it, and
+   * a cancel that was on its way is over.
+   */
+  protected complete(purchase: StorePurchaseRow, lines: StorePurchaseLineRow[], observationId: number): void {
     const db = this.context.database;
     db.transaction(() => {
       const now = this.context.now();
       const txn = purchase.txn_id ?? purchase.id;
       for (const line of lines) {
-        const ids = idsFor(line);
         const amount = line.unit_price_cents * line.quantity;
         const sourceKey = this.ledgerKey(txn, line.line_index, observationId);
+        // The posting names the purchase and no holding (D12): the items it brought are in the
+        // record as holdings, and the line's observed quantity is the proof that they arrived.
         new LedgerStore(db).postEconomicEvent({
           accountId: purchase.account_id, sourceKey, kind: 'STORE_PURCHASE', occurredAt: now,
-          quantity: line.quantity, observationId, amountCents: amount, feeCents: null, currency: purchase.currency,
-          candidates: ids, orderId: txn, localId: null
+          quantity: line.quantity, observationId, amountCents: amount, feeCents: null, currency: purchase.currency, orderId: txn
         }, now);
-        db.raw().prepare(`INSERT INTO acquisition(id, account_id, buy_order_id, quantity, price_cents, attribution, candidates_json, acquired_at, actual_amount_cents, amount_basis)
-          VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
-          .run(sourceKey, purchase.account_id, line.quantity, line.unit_price_cents, ids.length ? 'ATTRIBUTED' : 'UNATTRIBUTED',
-            JSON.stringify(ids), now, amount, STORE_AMOUNT_BASIS);
         this.store.setObservedQuantity(purchase.id, line.line_index, line.quantity);
       }
       for (const actionId of [purchase.finalize_action_id, purchase.init_action_id]) {
@@ -546,7 +616,16 @@ export class InGameStoreService {
         if (action && action.state === 'AWAITING_OBSERVATION') db.resolveAction(action, observationId, true, now);
       }
       this.store.setReservation(purchase.account_id, purchase.id, 'CONSUMED');
-      this.store.update(purchase.id, { state: 'COMPLETED', resolved_by_obs: observationId, error: null }, now);
+      // The finalize is the hop the delivery proves; without one (a purchase completed by
+      // quantity before any finalize was sent) it is opened here, done, so the reading is one.
+      const finalize = this.store.hop(purchase.id, 'STORE_FINALIZE') ?? this.openHop(purchase, 'STORE_FINALIZE', purchase.txn_id, 'QUEUED');
+      for (const kind of ['STORE_INIT', 'STORE_APPROVE'] as const) {
+        const hop = this.store.hop(purchase.id, kind);
+        if (hop && !isSettled(hop)) this.work.settle(hop.id, 'DONE', observationId, now);
+      }
+      this.work.settle(finalize.id, 'DONE', observationId, now);
+      const cancel = this.store.hop(purchase.id, 'STORE_CANCEL');
+      if (cancel && !isSettled(cancel)) this.work.settle(cancel.id, 'STOPPED', observationId, now, 'The items arrived: the purchase went through');
       db.addEvent(purchase.account_id, 'store-purchase-completed', { purchaseId: purchase.id, txnId: purchase.txn_id, observationId }, now);
     });
   }

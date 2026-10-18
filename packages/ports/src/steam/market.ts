@@ -90,17 +90,6 @@ export type BuyOrderStatus = {
 
 export type TaxRate = { addTax: boolean; rate: number };
 export type Wallet = { balanceCents: number; delayedBalanceCents: number; currency: number; observedAt: string };
-export type OrderBookLevel = { priceCents: number; cumulativeQuantity: number };
-export type OrderBook = {
-  kind: 'order-book';
-  currency: number;
-  highestBuyCents: number;
-  lowestSellCents: number;
-  buy: OrderBookLevel[];
-  sell: OrderBookLevel[];
-  etag?: string;
-};
-export type NotModified = { kind: 'not-modified'; etag?: string };
 
 export interface SteamMarketPort {
   getMyHistoryPage(accountId: AccountId, start: number, count: number): Promise<MyHistoryPage>;
@@ -112,5 +101,4 @@ export interface SteamMarketPort {
   getBuyOrderStatus(accountId: AccountId, buyOrderId: BuyOrderId): Promise<BuyOrderStatus>;
   getTradeFeeTaxRate(accountId: AccountId, billing: BillingAddress): Promise<TaxRate>;
   getWallet(accountId: AccountId): Promise<Wallet>;
-  getOrderBook(accountId: AccountId, hashName: string, etag?: string): Promise<OrderBook | NotModified>;
 }

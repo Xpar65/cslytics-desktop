@@ -4,6 +4,7 @@ import type { EngineContext } from '../kernel/context.js';
 import { attemptsMade } from '../kernel/not-applied.js';
 import { errorMessage } from '../kernel/support.js';
 import { RETRY_POLICY, retryPlan } from '../kernel/retry-policy.js';
+import { WorkStore } from '../db/work.js';
 
 /** Sends one action again, through the same executor its first send used. */
 export type RetrySender = (actionId: string) => Promise<MutationOutcome>;
@@ -14,7 +15,7 @@ type Waiting = { action: ActionRow; retryAtMs: number };
 type LoopControl = { stop: boolean; wake?: (() => void) | undefined };
 
 /** The longest a loop rests between looks: a floor under the wake path, not the cadence. */
-const IDLE_MS = 60_000;
+export const IDLE_MS = 60_000;
 
 /**
  * The one resender: sends again what a walk proved did not land, when its schedule says.
@@ -135,6 +136,8 @@ export class RetryService {
         if (database.action(action.id)?.state === 'READY') database.setActionState(action.id, 'FAILED', this.context.now(), reason);
         database.addEvent(accountId, 'retry-refused', { actionId: action.id, kind: action.kind, reason }, this.context.now());
       }
+      // The hop the action carries, if any, follows the action: a resend went out, or was refused.
+      new WorkStore(database).mirror(action.id, this.context.now());
     });
   }
 }

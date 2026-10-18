@@ -8,7 +8,7 @@ import { Button, ConfirmDialog, IconButton, Panel, PanelHeader, StatusBadge } fr
 import { VenueMark } from '../../components/VenueMark.js';
 import { describeConnection, type ConnectionTone } from '../../lib/connection.js';
 import { engine } from '../../lib/engine.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { formatDate, formatUsd, plural, type Tone } from '../../lib/labels.js';
 import { freshness, heldCounts } from '../../lib/portfolio.js';
 import type { AccountConnection, AccountHoldings } from '../../lib/types.js';
@@ -136,7 +136,7 @@ export function AccountOverview({ account, connection, connecting, venue, holdin
           </span>
           <span className="venue-card-row" data-tone={age.tone}>
             <Icon name="wallet" size={13} />
-            <span className="num">{formatCents(holding?.wallet?.balanceCents ?? null, holding?.currency ?? 21)}</span>
+            <span className="num">{formatAmount(holding?.wallet?.balanceCents ?? null, holding?.currency ?? null)}</span>
             {holding?.wallet ? <span className="quiet">{age.label}</span> : null}
           </span>
           <span className="venue-card-row">

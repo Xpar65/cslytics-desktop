@@ -6,6 +6,8 @@ import { required } from '../kernel/support.js';
 import { settleNotApplied } from '../kernel/not-applied.js';
 import { requireFreshMoneyEvidence, walletAvailability } from '../policy/wallet-admission.js';
 import { LedgerStore } from '../db/ledger.js';
+import { WorkStore } from '../db/work.js';
+import { OrderStore } from '../db/orders.js';
 
 /** Provenance for a fill posting, deliberately outside `FRESHNESS` — see `syncStatuses`. */
 export const BUY_ORDER_STATUS_SURFACE = 'steam-buy-order-status';
@@ -24,7 +26,7 @@ export class BuyOrderService {
    * observation is incomplete — an order placed on a half-known wallet can overcommit real
    * money (rollout-v3 §4.3 invariant 4).
    */
-  async create(accountId: AccountId, request: BuyOrderRequest, basis = 'manual'): Promise<ActionRow> {
+  async create(accountId: AccountId, request: BuyOrderRequest): Promise<ActionRow> {
     return this.context.locks.run(accountId, async () => {
       const { database } = this.context;
       this.requireCompleteAdmission(accountId);
@@ -36,16 +38,19 @@ export class BuyOrderService {
 
       await this.context.ports.market.getTradeFeeTaxRate(accountId, request.billing);
 
-      const action = database.createDesiredAction({
-        accountId,
-        targetKind: 'buy-order',
-        targetId: request.marketHashName,
-        intent: 'ACTIVE',
-        params: { request, reservationCents: request.priceTotalCents } satisfies BuyOrderParams,
-        basis,
-        actionKind: 'CREATE_BUY_ORDER',
-        resourceKey: `wallet:${accountId}`,
-        now: this.context.now()
+      // A command of one hop, admitted with its own id; the action is the hop's (D3). One order
+      // per name at a time: a second create for a name whose first is still in flight is refused.
+      // The order itself is a `SUBMITTED` row of the one order table until a walk shows it (D4).
+      const now = this.context.now();
+      const work = new WorkStore(database);
+      const action = database.transaction(() => {
+        const hop = work.lone('BUY_ORDER_CREATE', { accountId, kind: 'BUY_ORDER_CREATE', targetId: request.marketHashName,
+          params: { request, reservationCents: request.priceTotalCents, hashName: request.marketHashName }, now });
+        const queued = database.enqueueAction({ accountId, stepId: hop.id, actionKind: 'CREATE_BUY_ORDER', targetId: request.marketHashName,
+          resourceKey: `buy-order:${request.marketHashName}`, params: { request, reservationCents: request.priceTotalCents } satisfies BuyOrderParams, now });
+        work.attachAction(hop.id, queued.id, now);
+        new OrderStore(database).openBuy(queued, request, now);
+        return queued;
       });
       database.raw().prepare(`
         INSERT INTO reservation(account_id, ref_kind, ref_id, amount_cents, state)
@@ -61,8 +66,8 @@ export class BuyOrderService {
     const { database } = this.context;
     const action = required(database.action(actionId), `Unknown action ${actionId}`);
     const params = database.desiredParams(action) as BuyOrderParams;
-    const outcome = await executeMutation(this.context, action, () =>
-      this.context.ports.market.createBuyOrder(action.account_id, params.request));
+    const outcome = await new WorkStore(database).send(action.id, () => executeMutation(this.context, action, () =>
+      this.context.ports.market.createBuyOrder(action.account_id, params.request)), () => this.context.now());
     if (outcome.kind === 'DEFINITIVELY_REJECTED') {
       database.raw().prepare(`UPDATE reservation SET state='RELEASED' WHERE account_id=? AND ref_id=?`)
         .run(action.account_id, action.id);
@@ -70,17 +75,19 @@ export class BuyOrderService {
     return outcome;
   }
 
-  queueCancel(accountId: AccountId, buyOrderId: string, basis = 'manual'): ActionRow {
-    return this.context.database.createDesiredAction({
-      accountId,
-      targetKind: 'buy-order',
-      targetId: buyOrderId,
-      intent: 'CANCELLED',
-      params: { buyOrderId } satisfies CancelBuyParams,
-      basis,
-      actionKind: 'CANCEL_BUY_ORDER',
-      resourceKey: `wallet:${accountId}`,
-      now: this.context.now()
+  /** A cancel is a command of one hop (`BUY_ORDER_CANCEL`) named by the order, whose action is the hop's (D3). */
+  queueCancel(accountId: AccountId, buyOrderId: string): ActionRow {
+    const { database } = this.context;
+    const now = this.context.now();
+    const work = new WorkStore(database);
+    const order = new OrderStore(database).steamBuyOrder(accountId, buyOrderId);
+    return database.transaction(() => {
+      const hop = work.lone('BUY_ORDER_CANCEL', { accountId, kind: 'BUY_ORDER_CANCEL', targetId: buyOrderId,
+        params: { buyOrderId, ...(order ? { hashName: order.hash_name } : {}) }, now });
+      const action = database.enqueueAction({ accountId, stepId: hop.id, actionKind: 'CANCEL_BUY_ORDER', targetId: buyOrderId,
+        resourceKey: `buy-order-cancel:${buyOrderId}`, params: { buyOrderId } satisfies CancelBuyParams, now });
+      work.attachAction(hop.id, action.id, now);
+      return action;
     });
   }
 
@@ -88,8 +95,8 @@ export class BuyOrderService {
     const { database } = this.context;
     const action = required(database.action(actionId), `Unknown action ${actionId}`);
     const params = database.desiredParams(action) as CancelBuyParams;
-    return executeMutation(this.context, action, () =>
-      this.context.ports.market.cancelBuyOrder(action.account_id, params.buyOrderId));
+    return new WorkStore(database).send(action.id, () => executeMutation(this.context, action, () =>
+      this.context.ports.market.cancelBuyOrder(action.account_id, params.buyOrderId)), () => this.context.now());
   }
 
   /**
@@ -106,33 +113,29 @@ export class BuyOrderService {
    */
   async syncStatuses(accountId: AccountId): Promise<void> {
     const { database } = this.context;
-    const rows = database.raw().prepare(`SELECT * FROM buy_order WHERE account_id=?`).all(accountId) as Array<{
-      buy_order_id: string; purchased: number; price_cents: number; quantity: number
-    }>;
-    for (const row of rows) {
+    const store = new OrderStore(database);
+    for (const row of store.steamBuyOrders(accountId)) {
+      const buyOrderId = row.venue_order_id!;
+      // One HTTP request per order, under the venue's budget: a scope the broker has no need for,
+      // since the poll is provenance for a posting and not evidence (read broker plan D12).
+      await this.context.governors.admitRead(accountId, 'steam-web', BUY_ORDER_STATUS_SURFACE);
       const startedAt = this.context.now();
-      const status = await this.context.ports.market.getBuyOrderStatus(accountId, row.buy_order_id);
-      const delta = status.purchased - row.purchased;
+      const status = await this.context.ports.market.getBuyOrderStatus(accountId, buyOrderId);
+      const delta = status.purchased - row.filled;
       database.transaction(() => {
         const observationId = database.insertObservation({
           accountId, surface: BUY_ORDER_STATUS_SURFACE, startedAt, finishedAt: this.context.now(),
-          complete: true, totalExpected: 1, scopeKind: 'listing', scopeId: row.buy_order_id
+          complete: true, totalExpected: 1, scopeKind: 'listing', scopeId: buyOrderId
         });
-        database.raw().prepare(`
-          UPDATE buy_order SET purchased=?, quantity_remaining=?, active=? WHERE account_id=? AND buy_order_id=?
-        `).run(status.purchased, status.quantityRemaining, status.active ? 1 : 0, accountId, row.buy_order_id);
+        store.recordSteamBuyOrderStatus(accountId, row, status, observationId, this.context.now());
         if (delta > 0) {
-          // Lineage is not invented. The lot records every candidate and stays UNATTRIBUTED
-          // until something else can pin it down.
-          const candidates = database.items(accountId)
-            .filter((item) => item.location === 'MAIN')
-            .map((item) => item.local_id);
+          // Lineage is not invented: the posting names the order and no holding (consolidation plan D12).
           new LedgerStore(database).recordBuyOrderFill({
-            accountId, buyOrderId: row.buy_order_id, purchasedTotal: status.purchased, delta,
-            unitPriceCents: row.price_cents, candidates, observationId, now: this.context.now()
+            accountId, buyOrderId, purchasedTotal: status.purchased, delta,
+            unitPriceCents: row.price_cents ?? 0, observationId, now: this.context.now()
           });
         }
-        if (!status.active) this.settleReservation(accountId, row.buy_order_id);
+        if (!status.active) this.settleReservation(accountId, buyOrderId);
       });
     }
   }
@@ -158,8 +161,7 @@ export class BuyOrderService {
   /** Resolves buy-order actions against one complete market observation. */
   reconcile(accountId: AccountId, observationId: number): void {
     const { database } = this.context;
-    for (const action of database.actions(accountId, 'AWAITING_OBSERVATION')) {
-      if (!['CREATE_BUY_ORDER', 'CANCEL_BUY_ORDER'].includes(action.kind)) continue;
+    for (const action of database.awaitingActionsOfKinds(accountId, ['CREATE_BUY_ORDER', 'CANCEL_BUY_ORDER'])) {
       // A superseded attempt is still *sent*. Refusing to look at it is how a real order, and the
       // wallet money behind it, becomes invisible the moment the user changes their mind
       // (OP-06, N-BUY-07). Nothing below re-sends; it only reads evidence and settles rows.
@@ -170,18 +172,23 @@ export class BuyOrderService {
       if (action.kind === 'CREATE_BUY_ORDER') {
         const params = database.desiredParams(action) as BuyOrderParams;
         const unitPrice = Math.floor(params.request.priceTotalCents / params.request.quantity);
-        const matches = database.raw().prepare(`
-          SELECT buy_order_id FROM buy_order
-          WHERE account_id=? AND active=1 AND hash_name=? AND price_cents=? AND quantity=?
+        // The walk binds a request to the one order on the book with its terms and no owner yet
+        // (`OrderStore.observeSteamBuyOrders`). Still unbound after a complete walk, the request
+        // either matched nothing or matched more than it could tell apart.
+        const own = new OrderStore(database).byAction(accountId, action.id);
+        const matches = own?.venue_order_id ? [] : database.raw().prepare(`
+          SELECT venue_order_id AS buy_order_id FROM venue_order
+          WHERE account_id=? AND venue='steam' AND side='BUY' AND first_seen_obs IS NOT NULL AND state NOT LIKE 'ENDED_%'
+            AND action_id IS NULL AND hash_name=? AND price_cents=? AND quantity=?
         `).all(accountId, params.request.marketHashName, unitPrice, params.request.quantity) as Array<{ buy_order_id: string }>;
 
-        if (matches.length === 1) {
+        if (own?.venue_order_id) {
           database.setActionState(action.id, superseded ? 'FAILED' : 'DONE', this.context.now(),
             superseded ? 'superseded-after-the-order-was-created' : undefined);
           database.raw().prepare(`
             UPDATE reservation SET ref_kind='BUY_ORDER', ref_id=?, state='ACTIVE'
             WHERE account_id=? AND ref_kind='BUY_ORDER_ACTION' AND ref_id=?
-          `).run(matches[0]!.buy_order_id, accountId, action.id);
+          `).run(own.venue_order_id, accountId, action.id);
         } else if (matches.length === 0) {
           // Absence from the active-order book is exactly as compatible with "created, then
           // filled before anyone looked" as it is with "never created" (BUY-05, N-BUY-02). Only
@@ -217,10 +224,8 @@ export class BuyOrderService {
         }
       } else {
         const params = database.desiredParams(action) as CancelBuyParams;
-        const row = database.raw()
-          .prepare(`SELECT active, purchased, quantity FROM buy_order WHERE account_id=? AND buy_order_id=?`)
-          .get(accountId, params.buyOrderId) as { active: number; purchased: number; quantity: number } | undefined;
-        if (row?.active) {
+        const row = new OrderStore(database).steamBuyOrder(accountId, params.buyOrderId);
+        if (row && !row.state.startsWith('ENDED_')) {
           // Still open on a complete walk that began after the attempt finished. That is the later
           // authoritative observation rule 1 asks for, and it says the cancel did not take: a
           // timeout that never reached Steam, or no session to send it with. Left awaiting, it
@@ -232,7 +237,7 @@ export class BuyOrderService {
           }
           continue;
         }
-        if (row && row.purchased >= row.quantity) {
+        if (row && row.filled >= row.quantity) {
           database.setActionState(action.id, 'FAILED', this.context.now(), 'order-filled-before-cancel-observed');
           this.settleReservation(accountId, params.buyOrderId);
         } else {

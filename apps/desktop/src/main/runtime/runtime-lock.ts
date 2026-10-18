@@ -50,6 +50,21 @@ export function releaseRuntimeLock(fd: number, path: string): void {
  *
  * A live owner is left alone: that is another runtime, not a leak.
  */
+/**
+ * Reaps once the owner is gone, for a main that has just killed the runtime or watched it exit. On
+ * Windows a process that has exited still answers `kill(pid, 0)` for a moment while a handle to
+ * it is open, so one reap at the exit event raced the death and left the lock behind for the next
+ * launch to find (a live close on 2026-10-16). Polls briefly; resolves with the lock gone, or with
+ * the owner still genuinely alive after the attempts.
+ */
+export async function reapRuntimeLockWhenGone(path: string, { attempts = 30, delayMs = 100 }: { attempts?: number; delayMs?: number } = {}): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    reapRuntimeLock(path);
+    if (!existsSync(path)) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
 export function reapRuntimeLock(path: string): void {
   if (!existsSync(path)) return;
   let owner = NaN;

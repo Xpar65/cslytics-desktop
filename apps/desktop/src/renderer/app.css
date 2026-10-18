@@ -14,9 +14,17 @@
 
 * { box-sizing: border-box; }
 
+/*
+ * The document is exactly the window, the titlebar's strip included, so it has nothing to scroll:
+ * every scroll happens in a container of the shell. The offset under the titlebar is the body's
+ * padding, not a margin on the shell, which collapsed through `#root` and the body and made the
+ * document a titlebar taller than the window; `overflow: hidden` stops the wheel but not
+ * `scrollIntoView`, which scrolled it and slid the account strip under the titlebar.
+ */
 body {
   margin: 0;
-  min-height: 100vh;
+  height: 100vh;
+  padding-top: var(--cs-titlebar);
   background: var(--cs-backdrop);
   color: var(--cs-text);
   font-family: var(--cs-font);
@@ -94,8 +102,9 @@ a { color: var(--cs-accent-text); }
 /*
  * The window has no native title bar (main/index.ts). This strip, in index.html, is what it is
  * dragged by, and Windows draws minimise, maximise and close over its right-hand end in the same
- * colours, so nothing of ours sits there. Everything else starts below it, including whatever is
- * fixed to the window: the drawer, the sign-in overlay, the toasts and the floating listing pill.
+ * colours, so nothing of ours sits there. Everything else starts below it: the shell by the body's
+ * padding, and whatever is fixed to the window (the drawer, the sign-in overlay, the toasts and the
+ * floating listing pill) by its own top.
  */
 .titlebar {
   position: fixed;
@@ -109,7 +118,6 @@ a { color: var(--cs-accent-text); }
 .shell {
   display: grid;
   grid-template-columns: var(--cs-sidebar) 1fr;
-  margin-top: var(--cs-titlebar);
   height: calc(100vh - var(--cs-titlebar));
   border-top: 1px solid var(--cs-border-faint);
   transition: grid-template-columns var(--cs-dur) var(--cs-ease);
@@ -752,10 +760,18 @@ a { color: var(--cs-accent-text); }
 .metric-value { flex: none; white-space: nowrap; font-family: var(--cs-font-display); font-size: 15px; font-weight: 600; color: var(--cs-text-strong); }
 .metric-note { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--cs-text-muted); }
 
-/* The portfolio's cards keep the stacked layout: there the figure has a breakdown under it. */
-.metric.value-card { display: block; padding: 14px 16px; border-radius: var(--cs-radius-lg); }
-.value-card .metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.value-card .metric-value { margin-top: 8px; font-size: 22px; letter-spacing: -0.01em; }
+/* The portfolio's cards keep the stacked layout: there the figure has a breakdown under it. A
+   money figure carries its code ("A$1,234.56 AUD"), so the cards are wider than a count's, and the
+   figure may wrap rather than run out of the card: the one-line metric's `nowrap` is for a count. */
+.metrics.value-cards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+.metric.value-card { display: block; min-width: 0; padding: 14px 16px; border-radius: var(--cs-radius-lg); }
+/* The icon, the title, and the title's tip beside it: what the card counts is one hover away. */
+.value-card .metric-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.value-card .metric-label { flex: 0 1 auto; }
+.value-card .metric-value { margin-top: 10px; min-width: 0; font-size: 22px; line-height: 1.2; letter-spacing: -0.01em; white-space: normal; overflow-wrap: anywhere; }
+.value-card .value-skeleton { margin-top: 10px; }
+/* Several currencies: one figure per line, each smaller, none joined into a string. */
+.value-card .metric-value[data-count]:not([data-count='1']) { font-size: 17px; }
 .value-card .metric-note { margin-top: 3px; font-size: 12px; white-space: normal; }
 
 /* ---------- tables and rows ---------- */
@@ -1174,39 +1190,139 @@ a { color: var(--cs-accent-text); }
 [data-tone='aging'] { color: var(--cs-text); }
 [data-tone='stale'] { color: var(--cs-negative); }
 
+/* ---------- tips ---------- */
+
+/*
+ * An explanation on the thing it explains (`components/Tip.tsx`). The trigger is a small ⓘ beside
+ * a title, or a dotted underline under a figure; the bubble is drawn on `document.body`, fixed to
+ * the viewport, so no panel's overflow cuts it. A popover may cast a shadow; a card may not.
+ */
+.tip-icon {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 18px; height: 18px; padding: 0; border: 0; border-radius: var(--cs-radius-full);
+  background: transparent; color: var(--cs-text-faint); cursor: help;
+  transition: color var(--cs-dur-fast), background-color var(--cs-dur-fast);
+}
+.tip-icon:hover, .tip-icon:focus-visible { color: var(--cs-text); background: var(--cs-hover); }
+.tip-icon:focus-visible, .tip-target:focus-visible { outline: 2px solid var(--cs-accent); outline-offset: 2px; }
+.tip-target { cursor: help; border-radius: 2px; text-decoration: underline dotted var(--cs-border-strong); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.tip-bubble {
+  position: fixed; z-index: 60; max-width: 280px; padding: 8px 11px;
+  border: 1px solid var(--cs-border); border-radius: var(--cs-radius);
+  background: var(--cs-surface-raised); box-shadow: var(--cs-shadow-pop);
+  color: var(--cs-text); font-size: 12.5px; font-weight: 400; line-height: 1.45; letter-spacing: normal; text-transform: none; text-align: left; white-space: normal;
+  pointer-events: none; animation: cs-fade-in var(--cs-dur-fast) var(--cs-ease) both;
+}
+.tip-bubble[data-wide] { max-width: 380px; }
+.tip-line { display: block; }
+.tip-line + .tip-line { margin-top: 4px; }
+
 /* ---------- portfolio ---------- */
 
-.holdings-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.portfolio-page { display: contents; }
+.holdings-hero { padding: 20px 22px 18px; }
+.holdings-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 16px 28px; margin-bottom: 18px; }
+.holdings-main { min-width: 0; }
 .holdings-label { margin-bottom: 8px; font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--cs-text-faint); }
-.holdings-total { font-family: var(--cs-font-display); font-size: 38px; font-weight: 600; letter-spacing: -0.03em; color: var(--cs-text-strong); line-height: 1.05; }
+.holdings-main > .holdings-label { display: flex; align-items: center; gap: 4px; margin-bottom: 6px; }
+.holdings-total { font-family: var(--cs-font-display); font-size: 40px; font-weight: 600; letter-spacing: -0.03em; color: var(--cs-text-strong); line-height: 1.05; }
 .holdings-total[data-settled='false'] { color: var(--cs-text); }
-.holdings-caption { margin-top: 6px; font-size: 12.5px; color: var(--cs-text-faint); max-width: 62ch; display: flex; align-items: center; gap: 6px; }
-.holdings-caption[data-tone='warn'] { color: var(--cs-negative); }
+.holdings-caption { margin-top: 8px; font-size: 12.5px; color: var(--cs-text-faint); display: flex; align-items: center; gap: 6px; }
 
-.holdings-evidence { display: flex; gap: 8px; margin: 0; }
-.holdings-evidence div { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius); background: var(--cs-wash); min-width: 110px; }
+/* What changes how far the figure can be trusted: a short chip each, its sentence in a tip. */
+.holdings-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.holdings-chip {
+  display: inline-flex; align-items: center; padding: 3px 10px;
+  border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius-full); background: var(--cs-wash);
+  font-size: 12px; color: var(--cs-text-muted);
+}
+.holdings-chip .tip-target { display: inline-flex; align-items: center; gap: 5px; text-decoration: none; }
+.holdings-chip[data-tone='warn'] { border-color: var(--cs-negative-border); background: var(--cs-negative-wash); color: var(--cs-negative); }
+
+.holdings-evidence { display: grid; grid-template-columns: repeat(2, minmax(112px, auto)); gap: 6px; margin: 0; }
+.holdings-evidence div { display: flex; flex-direction: column; gap: 2px; padding: 7px 11px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius); background: var(--cs-wash); }
 .holdings-evidence dt { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--cs-text-faint); }
 .holdings-evidence dd { margin: 0; font-size: 12.5px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.holdings-evidence .tip-target { text-decoration: none; }
 
-.allocation { display: flex; gap: 2px; height: 12px; border-radius: var(--cs-radius-full); overflow: hidden; background: var(--cs-wash); }
+.allocation { display: flex; gap: 2px; height: 14px; border-radius: var(--cs-radius-full); overflow: hidden; background: var(--cs-wash); }
 .allocation-segment { min-width: 3px; border-radius: 2px; transform-origin: left; animation: cs-grow var(--cs-dur-slow) var(--cs-ease-out) both; transition: flex-basis var(--cs-dur-slow) var(--cs-ease); }
 .allocation-segment[data-pending='true'] { background-image: repeating-linear-gradient(45deg, var(--cs-hold-hatch) 0 3px, transparent 3px 6px); }
 .allocation-empty { flex: 1; background: var(--cs-border-faint); border-radius: var(--cs-radius-full); }
 
-.holdings-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; font-size: 12px; color: var(--cs-text-muted); }
+.holdings-legend { display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 12px; font-size: 12px; color: var(--cs-text-muted); }
 .holdings-legend-item { display: inline-flex; align-items: center; gap: 6px; }
 .holdings-legend-item .num { color: var(--cs-text); font-weight: 500; }
 .allocation-dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
 .allocation-dot[data-pending='true'] { background-image: repeating-linear-gradient(45deg, var(--cs-hold-hatch) 0 2px, transparent 2px 4px); }
 
+/*
+ * The wallets, one card per venue: spendable and pending side by side, the card's top edge and its
+ * meter in the venue's holdings hue, the pending part hatched as it is in the bar above.
+ */
+.portfolio-observed { display: flex; flex-direction: column; gap: 10px; }
+.wallet-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+.wallet-card {
+  min-width: 0; padding: 16px 18px;
+  border: 1px solid var(--cs-border); border-top: 2px solid var(--wallet-hue); border-radius: var(--cs-radius-lg);
+  background: var(--cs-surface);
+  transition: border-color var(--cs-dur-fast);
+}
+.wallet-card:hover { border-color: var(--cs-border-strong); border-top-color: var(--wallet-hue); }
+.wallet-card[data-venue='steam'] { --wallet-hue: var(--cs-hold-wallet); }
+.wallet-card[data-venue='csfloat'] { --wallet-hue: var(--cs-hold-csfloat); }
+.wallet-card[data-known='false'], .wallet-card[data-known='false']:hover { border-top-color: var(--cs-border); }
+.wallet-dot { background-color: var(--wallet-hue); }
+.wallet-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.wallet-title { font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--cs-text-faint); white-space: nowrap; }
+.wallet-age { font-size: 11.5px; white-space: nowrap; }
+.wallet-figures { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 18px; margin-top: 12px; align-items: start; }
+.wallet-figure { min-width: 0; }
+.wallet-figure-label { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 12px; color: var(--cs-text-faint); }
+.wallet-figure .metric-value { font-family: var(--cs-font-display); font-size: 26px; font-weight: 600; line-height: 1.15; letter-spacing: -0.015em; color: var(--cs-text-strong); overflow-wrap: anywhere; }
+.wallet-figure .metric-value[data-count]:not([data-count='1']) { font-size: 19px; }
+.wallet-pending-value { padding-top: 5px; font-family: var(--cs-font-display); font-size: 19px; font-weight: 600; line-height: 1.15; color: var(--cs-text); overflow-wrap: anywhere; }
+.wallet-meter { display: flex; gap: 2px; height: 4px; margin-top: 14px; border-radius: var(--cs-radius-full); overflow: hidden; background: var(--cs-wash); }
+.wallet-meter span { min-width: 2px; background: var(--wallet-hue); }
+.wallet-meter span[data-pending='true'] { background-image: repeating-linear-gradient(45deg, var(--cs-hold-hatch) 0 2px, transparent 2px 4px); }
+.wallet-unknown { margin-top: 14px; font-size: 13px; color: var(--cs-text-faint); }
+.wallet-card .value-lines { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--cs-border-faint); }
+@media (max-width: 720px) { .wallet-figures { grid-template-columns: minmax(0, 1fr); gap: 10px; } }
+
 .value-card { border-top: 2px solid var(--cs-border); }
+.value-card[data-hue='wallet'] { border-top-color: var(--cs-hold-wallet); }
+.value-card[data-hue='listed'] { border-top-color: var(--cs-hold-listed); }
+.value-card[data-hue='unconfirmed'] { border-top-color: var(--cs-hold-unconfirmed); }
+.value-card[data-hue='inventory'] { border-top-color: var(--cs-hold-inventory); }
 .value-lines { display: flex; flex-direction: column; gap: 3px; margin: 10px 0 0; }
-.value-lines div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.value-lines dt { font-size: 12px; color: var(--cs-text-faint); }
-.value-lines dd { margin: 0; font-size: 12px; color: var(--cs-text); }
+.value-lines div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
+.value-lines dt { font-size: 12px; color: var(--cs-text-faint); flex: none; }
+.value-lines dd { margin: 0; min-width: 0; font-size: 12px; color: var(--cs-text); text-align: right; overflow-wrap: anywhere; }
+
+/*
+ * Observed money in more than one currency (portfolio and pricing plan §5.2, §5.4). Converted, a
+ * figure is one base amount with its natives in a quiet line under it (`.holdings-natives`,
+ * `.value-natives`). With no rate, the figures are never one string: each is a block of its own
+ * with its code, stacked in a card and separated by a dot on one line (`data-inline`) in the
+ * headline, the legend and a card's lines, so nothing reads as a sum.
+ */
+.money-figures { display: inline-flex; flex-direction: column; align-items: inherit; gap: 2px; min-width: 0; max-width: 100%; }
+.money-figure { display: block; min-width: 0; overflow-wrap: anywhere; }
+.money-figures[data-inline] { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: 0 6px; }
+.money-figures[data-inline] .money-figure + .money-figure::before { content: '·'; margin-right: 6px; color: var(--cs-border-strong); }
+.holdings-legend-item .money-figures { color: var(--cs-text); font-weight: 500; }
+.value-lines dd .money-figures { align-items: flex-end; }
+.value-lines dd .money-figures[data-inline] { justify-content: flex-end; }
+/* The headline at two or more currencies: still the biggest thing on the page, at a size the panel holds on one line. */
+.holdings-total .money-figures[data-inline] { gap: 0 12px; }
+.holdings-total .money-figures[data-count]:not([data-count='1']) .money-figure { font-size: 26px; line-height: 1.1; }
+.holdings-total .money-figures[data-inline] .money-figure + .money-figure::before { margin-right: 12px; }
+.holdings-natives { margin-top: 6px; font-size: 13px; color: var(--cs-text-muted); font-variant-numeric: tabular-nums; }
+.value-natives { margin-top: 2px; font-size: 12px; color: var(--cs-text-faint); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.holdings-natives [data-tone='warn'], .value-natives [data-tone='warn'] { color: var(--cs-negative); }
 
 .account-row {
-  grid-template-columns: minmax(180px, 1.6fr) repeat(4, minmax(88px, 1fr)) 100px;
+  grid-template-columns: minmax(180px, 1.6fr) repeat(5, minmax(88px, 1fr)) 84px;
   width: 100%;
   border: 0;
   border-bottom: 1px solid var(--cs-border-faint);
@@ -1222,6 +1338,8 @@ a { color: var(--cs-accent-text); }
 .account-row.row-head:hover { background: var(--cs-wash); }
 .account-row [data-settled='false'] { color: var(--cs-text-muted); }
 .account-row-name { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.account-row .account-holdings { font-weight: 600; color: var(--cs-text-strong); }
+.account-row .account-holdings[data-complete='false'] { color: var(--cs-text); }
 .holdings-age { font-size: 12px; }
 
 /* ---------- connection state ---------- */
@@ -1266,6 +1384,7 @@ a { color: var(--cs-accent-text); }
 .account-card-stat { padding: 8px 10px; border-radius: var(--cs-radius); background: var(--cs-wash); border: 1px solid var(--cs-border-faint); }
 .account-card-stat-label { font-size: 10.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--cs-text-faint); }
 .account-card-stat-value { font-size: 14px; font-weight: 600; color: var(--cs-text); font-variant-numeric: tabular-nums; margin-top: 2px; }
+.account-card-stat-sub { margin-top: 2px; font-size: 11.5px; color: var(--cs-text-muted); font-variant-numeric: tabular-nums; }
 .account-card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
 .account-card-actions .toolbar-spacer { flex: 1; }
 
@@ -1914,6 +2033,10 @@ a { color: var(--cs-accent-text); }
 .transfer-refusals li { display: flex; align-items: baseline; gap: 6px; font-size: 12px; line-height: 1.45; color: var(--cs-negative); overflow-wrap: anywhere; }
 .transfer-refusals li > .icon { flex: none; transform: translateY(2px); }
 
+/* What a store needs the person to decide (bulk storage plan D9): the claims, then the two choices. */
+.store-decision { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius); }
+.store-decision .btn { justify-content: center; }
+
 /* ---------- the listing workspace ---------- */
 
 /*
@@ -2243,6 +2366,7 @@ a { color: var(--cs-accent-text); }
 .work-command-head { display: flex; align-items: center; gap: 8px; }
 .work-command-title { display: block; font-size: 13px; font-weight: 600; color: var(--cs-text-strong); }
 .work-command-meta { display: block; font-size: 11px; }
+.work-command-reason { display: block; font-size: 11px; margin-top: 2px; }
 .work-row { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: var(--cs-radius); background: var(--cs-surface-inset); }
 .work-row-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .work-row-name { font-size: 12px; color: var(--cs-text); }
@@ -2269,6 +2393,8 @@ a { color: var(--cs-accent-text); }
 .filter-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 999px; background: var(--cs-accent-wash); color: var(--cs-accent-text); font-size: 11px; white-space: nowrap; }
 .filter-chip-remove { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; opacity: 0.7; }
 .filter-chip-remove:hover { opacity: 1; background: var(--cs-hover); }
+/* A chip in focus is the one Backspace removes, however it was reached, so it always shows. */
+.filter-chip:focus { outline: 2px solid var(--cs-accent-border); outline-offset: 1px; }
 .filter-input { flex: 1 1 90px; min-width: 90px; height: 24px; padding: 0; border: 0; background: transparent; box-shadow: none; }
 .filter-input:focus { border: 0; box-shadow: none; }
 
@@ -2280,7 +2406,10 @@ a { color: var(--cs-accent-text); }
 .filter-group + .filter-group { margin-top: 4px; border-top: 1px solid var(--cs-border-faint); padding-top: 4px; }
 .filter-group-name { padding: 4px 8px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--cs-text-faint); }
 .filter-suggestion { display: flex; justify-content: space-between; gap: 10px; width: 100%; padding: 5px 8px; border: 0; border-radius: calc(var(--cs-radius) - 2px); background: transparent; color: var(--cs-text); font-size: 12px; text-align: left; cursor: pointer; }
-.filter-suggestion:hover, .filter-suggestion[data-active] { background: var(--cs-accent-wash); color: var(--cs-accent-text); }
+/* One highlight: hovering moves it, so the mouse and the arrow keys never show two. */
+.filter-suggestion[data-active] { background: var(--cs-accent-wash); color: var(--cs-accent-text); }
+/* Room for the group's name when the keys scroll up to its first row. */
+.filter-group-name + .filter-suggestion { scroll-margin-top: 30px; }
 
 /* ---------- notifications: the bell, the toasts, the centre ---------- */
 
@@ -2624,3 +2753,165 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .trade-groups .group-block { height: auto; }
 .trades-page .inspector { padding-top: 34px; }
 .inspector-close { position: absolute; top: 6px; right: 6px; z-index: 1; }
+
+/* Settings › Currency: a setting, its control and the info toggle that opens its explanation. */
+.currency-setting { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.currency-setting-label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--cs-text); }
+.currency-info { flex: 0 0 auto; }
+.currency-info[aria-expanded="true"] { color: var(--cs-accent); }
+
+/*
+ * Portfolio › Inventory value: the category ring and its legend. The legend is the readable form;
+ * pointing at either lights both and dims the rest. Slices are parted by a stroke in the panel's
+ * own colour, so the ring needs no gaps computed.
+ */
+.category-breakdown { margin-top: 14px; }
+.category-pie { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px 24px; }
+.category-ring { flex: none; overflow: visible; }
+.category-slice { stroke: var(--cs-surface); stroke-width: 2; transition: opacity var(--cs-dur) var(--cs-ease); cursor: default; }
+.category-slice[data-dim] { opacity: 0.35; }
+.category-centre-value { font-family: var(--cs-font-display); font-size: 17px; font-weight: 600; fill: var(--cs-text-strong); }
+.category-centre-label { font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; fill: var(--cs-text-faint); }
+.category-legend { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.category-row { display: grid; grid-template-columns: auto minmax(90px, 1fr) auto auto; align-items: center; gap: 10px; padding: 3px 6px; margin: 0 -6px; border-radius: var(--cs-radius-sm); font-size: 13px; transition: opacity var(--cs-dur) var(--cs-ease), background var(--cs-dur) var(--cs-ease); }
+.category-row:hover { background: var(--cs-hover); }
+.category-row[data-dim] { opacity: 0.45; }
+.category-row .category-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cs-text); }
+.category-row .num { color: var(--cs-text-strong); }
+@media (max-width: 720px) { .category-pie { grid-template-columns: 1fr; justify-items: center; } }
+
+/* Portfolio › Total holdings: the key beside the evidence, and the states before a total is shown. */
+.holdings-aside { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.holdings-key { display: flex; gap: 14px; font-size: 11.5px; color: var(--cs-text-faint); }
+.holdings-key > span { display: inline-flex; align-items: center; gap: 6px; }
+.holdings-pricing { display: inline-flex; align-items: center; min-height: 40px; }
+.allocation-segment.skeleton { border-radius: 2px; animation: cs-shimmer 1.4s linear infinite; }
+.allocation-dot.skeleton { border-radius: 2px; }
+.holdings-legend-item .quiet { color: var(--cs-text-faint); }
+.value-pricing { display: grid; gap: 12px; }
+
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* ---------- items ---------- */
+
+/*
+ * The Items page: a search bar with Back beside it, the item's header with its quote, then the
+ * price history beside the order book, and the float curve across the foot.
+ */
+.items-view { display: grid; gap: 14px; min-width: 0; }
+.items-bar { display: flex; align-items: flex-start; gap: 10px; }
+.items-bar > .btn { flex: none; margin-top: 3px; }
+.items-search { flex: 1; min-width: 0; position: relative; }
+.items-search-missing { margin-top: 6px; font-size: 12px; color: var(--cs-text-faint); }
+.items-detail { display: grid; gap: 14px; min-width: 0; scroll-margin-top: 12px; }
+
+.items-head-body { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.items-head-text { display: grid; gap: 8px; flex: 1; min-width: 260px; justify-items: start; }
+.items-title { margin: 0; font-family: var(--cs-font-display); font-size: 22px; font-weight: 600; letter-spacing: -0.015em; color: var(--cs-text-strong); line-height: 1.2; overflow-wrap: anywhere; }
+.items-kind { display: flex; flex-wrap: wrap; align-items: center; row-gap: 4px; font-size: 12.5px; color: var(--cs-text-muted); min-height: 16px; }
+.items-kind > * + *::before { content: '·'; margin: 0 8px; color: var(--cs-text-faint); font-weight: 400; }
+.items-rarity { font-weight: 600; }
+.items-holding { color: var(--cs-text); }
+.items-holding[data-held="false"] { color: var(--cs-text-faint); }
+
+/* The quote: ask and bid large, the mid smaller; each code smaller after its amount, never dropped. */
+.items-quote { display: flex; align-items: flex-end; gap: 28px; margin-left: auto; }
+.items-figure { display: grid; gap: 4px; }
+.items-figure .holdings-label { margin-bottom: 0; }
+.items-figure[data-tone="ask"] .holdings-label { color: var(--cs-negative); }
+.items-figure[data-tone="bid"] .holdings-label { color: var(--cs-positive); }
+.items-amount { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; color: var(--cs-text-strong); white-space: nowrap; line-height: 1.15; }
+.items-code { margin-left: 5px; font-size: 11px; font-weight: 500; letter-spacing: 0.02em; color: var(--cs-text-faint); }
+.items-figure[data-minor] .items-amount { font-size: 15px; font-weight: 500; color: var(--cs-text-muted); }
+
+/* The history beside the book, the curve across both; one column, in reading order, where two do not fit. */
+.items-grid {
+  display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(300px, 1fr); gap: 14px; align-items: stretch;
+  grid-template-areas: "history book" "curve curve";
+}
+.items-grid > .items-panel { min-width: 0; margin: 0; }
+.items-grid > .items-history { grid-area: history; }
+.items-grid > .items-book { grid-area: book; }
+.items-grid > .items-curve { grid-area: curve; }
+@media (max-width: 1100px) {
+  .items-grid { grid-template-columns: minmax(0, 1fr); grid-template-areas: "history" "book" "curve"; }
+  .items-quote { margin-left: 0; }
+}
+
+.items-actions { display: inline-flex; align-items: center; gap: 10px; }
+.items-span { display: inline-flex; gap: 2px; }
+.items-span .btn[aria-pressed="true"] { color: var(--cs-accent-text); background: var(--cs-accent-wash); }
+.items-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.items-side { display: grid; gap: 3px; align-content: start; min-width: 0; }
+.items-side-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+.items-side-head .holdings-label { margin-bottom: 0; }
+.items-level { display: grid; grid-template-columns: minmax(16px, 1fr) auto 3em; align-items: center; gap: 8px; font-size: 12px; padding: 2px 0; }
+.items-level > .cell-sub { text-align: right; }
+.items-level-bar { display: block; height: 6px; border-radius: 3px; background: var(--cs-surface-inset); overflow: hidden; }
+.items-level-bar > span { display: block; height: 100%; border-radius: 3px; }
+.items-side[data-tone="bid"] .items-level-bar > span { background: var(--cs-positive); }
+.items-side[data-tone="ask"] .items-level-bar > span { background: var(--cs-negative); }
+
+.items-recent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.items-recent-tile { display: flex; align-items: center; gap: 10px; padding: 8px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius-lg); background: var(--cs-surface); color: var(--cs-text); font: inherit; text-align: left; cursor: pointer; min-width: 0; }
+.items-recent-tile:hover { border-color: var(--cs-accent-border); background: var(--cs-accent-wash); }
+.items-recent-name { font-size: 12.5px; line-height: 1.3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+
+/* The interactive chart: drawn at its own pixel size; the tooltip is HTML over it. */
+.price-chart { position: relative; width: 100%; touch-action: pan-y; cursor: crosshair; border-radius: var(--cs-radius); outline: none; }
+.price-chart:focus-visible { box-shadow: 0 0 0 2px var(--cs-accent-border); }
+.price-chart svg { display: block; overflow: visible; }
+.price-chart-grid line { stroke: var(--cs-border-faint); stroke-width: 1; }
+.price-chart-grid text, .price-chart-tick { fill: var(--cs-text-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.price-chart-line { fill: none; stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }
+.price-chart-cursor line { stroke: var(--cs-text-muted); stroke-dasharray: 4 3; stroke-width: 1; }
+.price-chart-cursor circle { stroke: var(--cs-surface); stroke-width: 2; }
+.price-chart-tooltip {
+  position: absolute; top: 8px; z-index: 2; min-width: 150px; max-width: 260px; padding: 8px 10px;
+  border: 1px solid var(--cs-border); border-radius: var(--cs-radius); background: var(--cs-surface-raised);
+  box-shadow: var(--cs-shadow-pop); font-size: 12px; pointer-events: none;
+}
+.price-chart-tooltip-x { margin-bottom: 4px; font-weight: 600; color: var(--cs-text-strong); }
+.price-chart-tooltip-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 6px; }
+.price-chart-tooltip-label { color: var(--cs-text-muted); }
+.price-chart-tooltip-sub { margin-top: 4px; color: var(--cs-text-faint); }
+.price-chart-swatch { width: 8px; height: 8px; border-radius: 2px; }
+.price-chart-empty { padding: 24px; text-align: center; color: var(--cs-text-faint); font-size: 12px; }
+
+/* A chart's skeleton: the same height, gridlines and axis, a shimmer where the line will be. */
+.chart-skeleton { display: grid; gap: 8px; }
+.chart-skeleton-plot { position: relative; height: 220px; margin-right: 72px; border-radius: var(--cs-radius); overflow: hidden; }
+.chart-skeleton-grid { position: absolute; left: 0; right: 0; height: 1px; background: var(--cs-border-faint); }
+.chart-skeleton-fill { position: absolute; left: 0; right: 0; bottom: 0; height: 55%; opacity: 0.7; border-radius: var(--cs-radius) var(--cs-radius) 0 0; clip-path: polygon(0 70%, 12% 52%, 24% 60%, 38% 30%, 52% 42%, 66% 18%, 80% 34%, 100% 8%, 100% 100%, 0 100%); }
+.chart-skeleton-axis { display: flex; justify-content: space-between; margin-right: 72px; }
+
+/*
+ * The float curve: its layer toggles above it, its zoom buttons in the plot's corner. Each wear
+ * draws in its own colour; the page's own wear is the strong one and the rest sit back.
+ */
+.curve-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
+.curve-toolbar-gap { flex: 1; }
+.curve-key { display: inline-block; width: 14px; height: 0; margin-right: 6px; border-top: 2px solid currentColor; vertical-align: middle; }
+.curve-key[data-layer="ask"] { border-top-style: dashed; }
+.curve-key[data-layer="bid"] { border-top-style: dotted; }
+.curve-key[data-layer="listings"] { width: 6px; height: 6px; border: 0; border-radius: 50%; background: currentColor; }
+.curve-chart { position: relative; width: 100%; cursor: grab; border-radius: var(--cs-radius); outline: none; touch-action: none; user-select: none; }
+.curve-chart:active { cursor: grabbing; }
+.curve-chart:focus-visible { box-shadow: 0 0 0 2px var(--cs-accent-border); }
+.curve-chart svg { display: block; }
+.curve-band { opacity: 0.045; }
+.curve-band[data-current="true"] { opacity: 0.09; }
+.curve-band-label { font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; opacity: 0.65; }
+.curve-band-label[data-current="true"] { opacity: 1; }
+.curve-line { fill: none; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; opacity: 0.55; }
+.curve-line[data-current="true"] { stroke-width: 2.5; opacity: 1; }
+.curve-line[data-layer="ask"] { stroke-dasharray: 5 3; }
+.curve-line[data-layer="bid"] { stroke-dasharray: 2 3; }
+.curve-dot { opacity: 0.28; }
+.curve-dot[data-current="true"] { opacity: 0.6; }
+.curve-held line { stroke: var(--cs-accent); stroke-width: 1; stroke-dasharray: 3 3; }
+.curve-held circle { fill: var(--cs-accent); stroke: var(--cs-surface); stroke-width: 2; }
+.curve-hover { fill: none; stroke-width: 2; stroke: var(--cs-text-strong); }
+.curve-box { fill: var(--cs-accent-wash); stroke: var(--cs-accent-border); stroke-dasharray: 4 3; }
+.curve-zoom { position: absolute; top: 26px; right: 70px; display: flex; gap: 2px; padding: 2px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius); background: var(--cs-surface); }
+

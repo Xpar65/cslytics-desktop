@@ -1,4 +1,3 @@
-import { currencySymbol } from './labels.js';
 import type { ItemRow } from './types.js';
 
 /**
@@ -41,30 +40,8 @@ export function groupKey(item: ItemRow): string {
   return `${item.quality}:${item.def_index}:${item.paint_index ?? 'none'}:${wearTier(item.paint_wear)?.code ?? 'none'}`;
 }
 
-/**
- * Integer cents in the currency Steam named them in.
- *
- * `null` is a currency we have not observed, or several that disagree — the amount is still
- * printed, without a symbol, because inventing one would claim the figure is in a currency
- * nobody said it was.
- */
-export function formatCents(cents: number | null | undefined, currency: number | null = 21): string {
-  if (cents === null || cents === undefined) return '—';
-  return `${currencySymbol(currency)}${(cents / 100).toFixed(2)}`;
-}
-
-/**
- * Ledger money. `UNKNOWN` is a value of its own — printing `0` or `—` would invent a figure
- * DATA-04 forbids. Callers that only have cents and no basis must not use this.
- */
-export function formatObservedAmount(
-  amountCents: number | null | undefined,
-  amountBasis: 'EVIDENCED' | 'UNKNOWN' | undefined,
-  currency: number | null = 21
-): string {
-  if (amountBasis !== 'EVIDENCED' || amountCents === null || amountCents === undefined) return 'Amount unknown';
-  return formatCents(amountCents, currency);
-}
+// Money moved to `money.ts`: `formatCents` defaulted its currency to AUD, which is wrong for
+// anyone whose wallet is in another currency. `formatAmount` takes the currency or says it is unknown.
 
 export function isTradable(item: ItemRow, now = new Date()): boolean {
   if (!item.tradable_after) return true;

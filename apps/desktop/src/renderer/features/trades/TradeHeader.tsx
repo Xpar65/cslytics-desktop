@@ -103,7 +103,7 @@ function TradeDetails({ entry, account, peer }: { entry: NamedTradeEntry; accoun
     const n = entry.csfloat.length > 1 ? ` ${index + 1}` : '';
     origin.push({ label: `CSFloat trade${n}`, value: link.tradeId, mono: true });
     origin.push({ label: `CSFloat item${n}`, value: link.hashName ?? link.name, copy: false });
-    if (link.priceCents !== null) origin.push({ label: `CSFloat price${n}`, value: `${formatUsd(link.priceCents)} USD`, copy: false });
+    if (link.priceCents !== null) origin.push({ label: `CSFloat price${n}`, value: formatUsd(link.priceCents), copy: false });
     if (link.floatValue !== null) origin.push({ label: `CSFloat float${n}`, value: String(link.floatValue), mono: true });
     origin.push({ label: `CSFloat state${n}`, value: humanize(link.state), copy: false });
     origin.push({ label: `CSFloat listing${n}`, value: link.listingId, mono: true });

@@ -84,12 +84,13 @@ export function assetProblems(files: readonly string[], localSha256: ReadonlyMap
   });
 }
 
-/** The release notes: what was built, from which commit, signed by whom, and how to check a download. */
-export function releaseNotes(manifest: ReleaseManifest, sha256: ReadonlyMap<string, string>, repository: string): string {
+/** The notes of one release: what the version changed, when a file beside the app says so, then what each download is. */
+export function releaseNotes(manifest: ReleaseManifest, sha256: ReadonlyMap<string, string>, repository: string, preface = ''): string {
   const rows = manifest.artefacts
     .filter((entry) => entry.file !== 'latest.yml')
     .map((entry) => `| \`${entry.file}\` | ${(entry.bytes / 1024 / 1024).toFixed(1)} MB | \`${sha256.get(entry.file) ?? 'missing'}\` |`);
   return [
+    ...(preface.trim() ? [preface.trim(), ''] : []),
     `CSlytics ${manifest.version}, built from [\`${manifest.commit.slice(0, 12)}\`](https://github.com/${repository}/commit/${manifest.commit}) and signed by \`${manifest.publisher}\`.`,
     '',
     '`CSlytics-Setup` is the full installer; `CSlytics-Web-Setup` is the small one, which downloads the',
@@ -150,8 +151,12 @@ async function main(): Promise<void> {
   }
 
   const sha256 = new Map([...localBytes].map(([file, bytes]) => [file, hash('sha256', bytes)]));
+  // What this version changed, kept beside the app for the people who read it on GitHub
+  // (`apps/desktop/release-notes/<version>.md`); a version without one ships the table alone.
+  const prefacePath = join(root, 'apps', 'desktop', 'release-notes', `${version}.md`);
+  const preface = existsSync(prefacePath) ? readFileSync(prefacePath, 'utf8') : '';
   const notesPath = join(outputDir, `release-notes-${version}.md`);
-  writeFileSync(notesPath, releaseNotes(manifest, sha256, repository));
+  writeFileSync(notesPath, releaseNotes(manifest, sha256, repository, preface));
   const githubFiles = [...manifest.artefacts.map(localPath), manifestPath];
 
   const targetText = process.env.CSLYTICS_RELEASE_TARGET?.trim();

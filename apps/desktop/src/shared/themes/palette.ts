@@ -81,12 +81,26 @@ export const PALETTE_TOKENS = [
   '--wear-ww',
   '--wear-bs',
 
-  // Holdings segments, also data: one hue per bucket Steam names a figure for, and the hatch drawn
-  // over its not-yet-cleared part. Never `--cs-positive`: none of these figures is a profit.
+  // Holdings segments, also data: one hue per bucket a venue names a figure for, the CSFloat
+  // balance's apart from the Steam wallet's, one for the inventory's appraisal, and the hatch drawn
+  // over a not-yet-cleared part. Never `--cs-positive`: none of these figures is a profit.
   '--cs-hold-wallet',
+  '--cs-hold-csfloat',
+  '--cs-hold-inventory',
   '--cs-hold-listed',
   '--cs-hold-unconfirmed',
   '--cs-hold-hatch',
+
+  // Categorical series, for a chart that needs one hue per slice: eight, distinct at a glance
+  // against the theme's surfaces, in the theme's own register, and none of them the accent.
+  '--cs-series-1',
+  '--cs-series-2',
+  '--cs-series-3',
+  '--cs-series-4',
+  '--cs-series-5',
+  '--cs-series-6',
+  '--cs-series-7',
+  '--cs-series-8',
 
   // Account avatars. Each account's hue is chosen from its name (`--avatar-hue`, set by the
   // component); a theme sets only the saturation and lightness, as `S% L%`, which is what keeps

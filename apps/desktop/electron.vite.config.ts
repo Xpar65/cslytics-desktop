@@ -18,7 +18,9 @@ export default defineConfig({
           '@cslytics/adapters-csfloat',
           '@cslytics/adapters-steam',
           '@cslytics/catalogue',
+          '@cslytics/cslytics-account',
           '@cslytics/engine',
+          '@cslytics/market-data',
           '@cslytics/ports'
         ]
       })
@@ -61,7 +63,10 @@ export default defineConfig({
         // those pure modules. Aliasing here rather than at each import keeps the rule in one place:
         // whatever a component writes, the renderer gets the browser-safe half, and `check:deps`
         // refuses a name that half does not export before the build has to.
-        '@cslytics/catalogue': resolve('../../packages/catalogue/src/browser.ts')
+        '@cslytics/catalogue': resolve('../../packages/catalogue/src/browser.ts'),
+        // The same split for market data: the window formats figures with the currency table and
+        // never opens the cache or fetches a book, so it gets the pure half only.
+        '@cslytics/market-data': resolve('../../packages/market-data/src/browser.ts')
       }
     },
     plugins: [react()]

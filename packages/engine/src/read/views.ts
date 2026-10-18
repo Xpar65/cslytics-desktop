@@ -1,14 +1,17 @@
 import type { AccountId } from '@cslytics/ports';
 import type { EngineDatabase, ItemRow } from '../db/database.js';
-import { steamListedSql } from '../db/steam-listing.js';
+import { steamListedSql } from '../db/commitment.js';
 import { pageCsfloat, csfloatOverview, csfloatEligibility, csfloatGroupEligibility, type CsfloatBook, type CsfloatEligibility, type CsfloatGroupEligibility } from './queries/csfloat.js';
-import { pageListings as readListingsPage, summariseListings as readListingsSummary, type ListingPageRequest, type ListingPageRow, type ListingsSummary } from './queries/listings.js';
+import { CSFLOAT_CURRENCY, pageListings as readListingsPage, summariseListings as readListingsSummary, type ListingPageRequest, type ListingPageRow, type ListingsSummary } from './queries/listings.js';
 import { pageWaiting as readWaiting, type WaitingPage } from './queries/waiting.js';
 import { readBuyOrders as readBuyOrderBook, type BuyOrderBook } from './queries/buy-orders.js';
 import type { PageEnvelope, ScopedPageRequest } from './queries/paging.js';
 import {
   pageInventory as readInventoryPage,
   pageInventoryGroups as readInventoryGroupPage,
+  pageInventoryPositions as readInventoryPositions,
+  type InventoryPositionsRequest,
+  type PositionsEnvelope,
   pageStorage as readStoragePage,
   type InventoryPageRequest,
   type InventoryPageRow,
@@ -26,8 +29,8 @@ import {
 import { pageOpenWork as readOpenWork, type WorkPage } from './queries/work.js';
 import { pageTradeEntries as readTradeEntries, pageTradeItems as readTradeItems, readTradeEntry as readOneTradeEntry, summariseTrades as readTradeSummary, type TradeEntry, type TradeEntryRequest, type TradeItemRow, type TradeItemsRequest, type TradeListRequest, type TradeListRow, type TradeSummary, type TradeSummaryRequest } from './queries/trades.js';
 import { LedgerStore } from '../db/ledger.js';
+import { MarketplaceStore } from '../db/marketplace.js';
 
-export type TimelineEntry = { id: string; kind: string; payload: unknown; at: string };
 
 export type PlannedAction = {
   actionId: string;
@@ -48,6 +51,9 @@ export type GoalConflict = { id: string; targetId: string; reason: string; block
  */
 export type SurfaceEvidence = { observedAt: string | null; settled: boolean };
 
+/** A venue balance: what may be spent now and what the venue is still holding, in `currency`. */
+export type VenueWallet = { currency: number; availableCents: number; pendingCents: number; observedAt: string };
+
 /**
  * What one account is observed to be holding.
  *
@@ -66,9 +72,19 @@ export type AccountHoldings = {
   accountId: string;
   accountName: string;
   steamId64: string;
-  /** Steam currency code from the wallet snapshot — 21 is AUD. Null until a wallet is observed. */
+  /**
+   * The Steam wallet's currency code — 21 is AUD — and so the currency of every Steam figure below.
+   * Null until a wallet is observed. The CSFloat wallet carries its own.
+   */
   currency: number | null;
+  /** The Steam wallet: `balanceCents` is spendable, `delayedBalanceCents` is what Steam shows as pending. */
   wallet: { balanceCents: number; delayedBalanceCents: number; observedAt: string } | null;
+  /**
+   * The CSFloat balance as `/me` last named it, for the connection that exists now: spendable and
+   * pending, in CSFloat's currency (US dollars). Null when no key is connected or none has been
+   * read, and from the moment a disconnect replaces the generation it was read under (CSF-04).
+   */
+  csfloatWallet: VenueWallet | null;
   /** Wallet money already committed to buy orders this engine submitted (`cslytics-app-docs/steam/wallet.md`). */
   reservedCents: number;
   /**
@@ -103,7 +119,7 @@ export type AccountHoldings = {
     /**
      * Of `itemsMain` and `commodityMain`, the units an open Steam listing names. A share of main
      * inventory, never a third place: the Game Coordinator keeps a listed item there until it
-     * sells (`db/steam-listing.ts`), so adding these to the other two counts a listed unit twice.
+     * sells (`db/commitment.ts`), so adding these to the other two counts a listed unit twice.
      */
     commodityListed: number;
     fungibleUnits: number;
@@ -179,12 +195,17 @@ export class EngineViews {
   }
 
   async pageInventory(request: InventoryPageRequest): Promise<PageEnvelope<InventoryPageRow>> {
-    return readInventoryPage(this.database, request);
+    return readInventoryPage(this.database, request, this.now());
   }
 
   /** The default inventory view. Names are the host's job; this returns identity and counts. */
   async pageInventoryGroups(request: InventoryPageRequest): Promise<GroupEnvelope> {
-    return readInventoryGroupPage(this.database, request);
+    return readInventoryGroupPage(this.database, request, this.now());
+  }
+
+  /** Holdings by market kind, for a valuation the host computes. Identity and counts only. */
+  async pageInventoryPositions(request: InventoryPositionsRequest): Promise<PositionsEnvelope> {
+    return readInventoryPositions(this.database, request, this.now());
   }
 
   async pageHistory(request: HistoryPageRequest): Promise<PageEnvelope<HistoryPageRow>> {
@@ -266,13 +287,6 @@ export class EngineViews {
     return this.database.raw().prepare(`SELECT * FROM storage_unit WHERE account_id=? ORDER BY casket_id`).all(accountId);
   }
 
-  timeline(accountId: AccountId): TimelineEntry[] {
-    return this.database.events(accountId).map(({ payload_json: payloadJson, ...row }) => ({
-      ...row,
-      payload: JSON.parse(payloadJson) as unknown
-    }));
-  }
-
   /** Everything currently READY: the dry-run plan, before anything touches Steam. */
   dryRunPlan(accountId: AccountId): PlannedAction[] {
     return this.database.actions(accountId, 'READY').map((action) => ({
@@ -288,20 +302,23 @@ export class EngineViews {
   market(accountId: AccountId): MarketView {
     const raw = this.database.raw();
     return {
-      listings: raw.prepare(`SELECT * FROM market_listing WHERE account_id=? ORDER BY listing_id`).all(accountId),
-      buyOrders: raw.prepare(`SELECT * FROM buy_order WHERE account_id=? ORDER BY buy_order_id`).all(accountId),
+      // Steam's own view of its book: the walked rows of the order table in the walk's words, one per listing ever seen.
+      listings: raw.prepare(`SELECT v.venue_order_id AS listing_id, v.order_id, v.local_id, v.asset_id, v.hash_name,
+          v.price_cents AS price_receive_cents, s.buyer_price_cents, v.currency,
+          CASE WHEN v.gone_obs IS NULL THEN s.raw_bucket ELSE 'ABSENT' END AS status, v.state,
+          v.transactable_after AS hold_until, CASE WHEN v.gone_obs IS NULL AND s.raw_bucket='PENDING_CONFIRMATION' THEN 1 ELSE 0 END AS awaiting_confirmation,
+          v.first_seen_obs, v.last_seen_obs, v.gone_obs
+        FROM venue_order v JOIN steam_order s ON s.account_id=v.account_id AND s.order_id=v.order_id
+        WHERE v.account_id=? AND v.venue='steam' AND v.side='SELL' AND v.venue_order_id IS NOT NULL ORDER BY v.venue_order_id`).all(accountId),
+      buyOrders: raw.prepare(`SELECT v.venue_order_id AS buy_order_id, v.order_id, v.hash_name, v.price_cents, v.quantity, v.quantity - v.filled AS quantity_remaining,
+          v.filled AS purchased, CASE WHEN v.state NOT LIKE 'ENDED_%' THEN 1 ELSE 0 END AS active, v.state, v.first_seen_obs, v.last_seen_obs, v.gone_obs
+        FROM venue_order v WHERE v.account_id=? AND v.venue='steam' AND v.side='BUY' AND v.venue_order_id IS NOT NULL ORDER BY v.venue_order_id`).all(accountId),
       wallet: raw.prepare(`
         SELECT observed_at, balance_cents, delayed_balance_cents, currency
         FROM wallet_snapshot WHERE account_id=? ORDER BY id DESC LIMIT 1
       `).get(accountId) ?? null,
       latestObservation: this.database.latestObservation(accountId, 'steam-market')
     };
-  }
-
-  acquisitions(accountId: AccountId): unknown[] {
-    return this.database.raw()
-      .prepare(`SELECT * FROM acquisition WHERE account_id=? ORDER BY acquired_at DESC`)
-      .all(accountId);
   }
 
   conflicts(accountId: AccountId): GoalConflict[] {
@@ -335,41 +352,48 @@ export class EngineViews {
     // One pass per table rather than one per figure: these are all narrow, account-keyed
     // aggregates and a portfolio refresh reads them for every signed-in account.
     const listings = raw.prepare(`
-      SELECT status, COUNT(*) AS count, COALESCE(SUM(price_receive_cents), 0) AS receive
-      FROM market_listing WHERE account_id=? GROUP BY status
+      SELECT s.raw_bucket AS status, COUNT(*) AS count, COALESCE(SUM(v.price_cents), 0) AS receive
+      FROM venue_order v JOIN steam_order s ON s.account_id=v.account_id AND s.order_id=v.order_id
+      WHERE v.account_id=? AND v.venue='steam' AND v.side='SELL' AND v.first_seen_obs IS NOT NULL AND v.gone_obs IS NULL
+      GROUP BY s.raw_bucket
     `).all(accountId) as Array<{ status: string; count: number; receive: number }>;
     const listing = (status: string): { count: number; receive: number } =>
       listings.find((row) => row.status === status) ?? { count: 0, receive: 0 };
 
     const buyOrders = raw.prepare(`
-      SELECT COUNT(*) AS count, COALESCE(SUM(price_cents * quantity_remaining), 0) AS open
-      FROM buy_order WHERE account_id=? AND active=1
+      SELECT COUNT(*) AS count, COALESCE(SUM(price_cents * (quantity - filled)), 0) AS open
+      FROM venue_order WHERE account_id=? AND venue='steam' AND side='BUY' AND first_seen_obs IS NOT NULL AND state NOT LIKE 'ENDED_%'
     `).get(accountId) as { count: number; open: number };
     // Counted beside Steam's, never summed into its money: a CSFloat order is US dollars.
-    const csfloatBuyOrders = raw.prepare('SELECT COUNT(*) AS count FROM csfloat_buy_order WHERE account_id=?').get(accountId) as { count: number };
+    const csfloatBuyOrders = raw.prepare(`SELECT COUNT(*) AS count FROM venue_order WHERE account_id=? AND venue='csfloat' AND side='BUY'
+      AND first_seen_obs IS NOT NULL AND gone_obs IS NULL`).get(accountId) as { count: number };
+    // A balance `/me` did not name is unknown, not zero; an absent pending figure is nothing pending.
+    const csfloat = new MarketplaceStore(this.database).currentStatus(accountId);
+    const csfloatWallet: VenueWallet | null = csfloat && csfloat.available_cents !== null
+      ? { currency: CSFLOAT_CURRENCY, availableCents: csfloat.available_cents, pendingCents: csfloat.pending_cents ?? 0, observedAt: csfloat.observed_at }
+      : null;
 
     // The same arithmetic buy-order admission uses (cslytics-app-docs/steam/wallet.md): money the engine
     // has committed but Steam has not yet shown back to it is still spent.
     const reservedCents = new LedgerStore(this.database).reservedWalletCents(accountId);
     const externalCommitmentCents = new LedgerStore(this.database).externalOrderCommitmentCents(accountId);
 
-    const visible = this.database.publishedInventoryVisibility(accountId);
     const items = raw.prepare(`
-      SELECT location, COUNT(*) AS count FROM ${this.database.inventoryReadTable('item', accountId)}
-      WHERE account_id=? AND unit_kind='individual'${visible.sql}
+      SELECT location, COUNT(*) AS count FROM item
+      WHERE account_id=? AND unit_kind='individual'
       GROUP BY location
-    `).all(accountId, ...visible.params) as Array<{ location: string; count: number }>;
+    `).all(accountId) as Array<{ location: string; count: number }>;
     const located = (location: string): number => items.find((row) => row.location === location)?.count ?? 0;
 
     const commodities = raw.prepare(`
-      SELECT location, COALESCE(SUM(quantity), 0) AS units FROM ${this.database.inventoryReadTable('item', accountId)}
+      SELECT location, COALESCE(SUM(quantity), 0) AS units FROM item
       WHERE account_id=? AND unit_kind='fungible' AND location<>'MISSING' GROUP BY location
     `).all(accountId) as Array<{ location: string; units: number }>;
     const commodityAt = (location: string): number => commodities.find((row) => row.location === location)?.units ?? 0;
     const listedOf = (kind: 'individual' | 'fungible'): number => (raw.prepare(`
-      SELECT COALESCE(SUM(quantity), 0) AS units FROM ${this.database.inventoryReadTable('item', accountId)} AS held
-      WHERE account_id=? AND unit_kind=? AND location<>'MISSING'${kind === 'individual' ? visible.sql : ''} AND ${steamListedSql('held')}
-    `).get(accountId, kind, ...(kind === 'individual' ? visible.params : [])) as { units: number }).units;
+      SELECT COALESCE(SUM(quantity), 0) AS units FROM item AS held
+      WHERE account_id=? AND unit_kind=? AND location<>'MISSING' AND ${steamListedSql('held')}
+    `).get(accountId, kind) as { units: number }).units;
     const storage = raw.prepare(`
       SELECT COUNT(*) AS units, COALESCE(SUM(contains_count), 0) AS stored
       FROM storage_unit WHERE account_id=?
@@ -383,6 +407,7 @@ export class EngineViews {
       wallet: wallet
         ? { balanceCents: wallet.balance_cents, delayedBalanceCents: wallet.delayed_balance_cents, observedAt: wallet.observed_at }
         : null,
+      csfloatWallet,
       reservedCents,
       externalCommitmentCents,
       availableToCommitCents: wallet ? wallet.balance_cents - reservedCents - externalCommitmentCents : null,

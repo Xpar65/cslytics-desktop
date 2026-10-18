@@ -1,11 +1,11 @@
 import type { EngineDatabase, ObservationRow } from '../db/database.js';
-import { FRESHNESS, freshness, surfaceName, type Surface, type SurfaceRef } from '../kernel/evidence.js';
+import { FRESHNESS, freshness, type Surface, type SurfaceRef } from '../kernel/evidence.js';
 
 /**
  * When a surface is next worth reading.
  *
- * Pure: given the latest observation for a scope, the account's tier and its backoff state, it
- * returns a due time. It reaches no port, opens no transaction and reads no clock of its own.
+ * Pure: given the latest observation for a scope and the account's tier, it returns a due time. It
+ * reaches no port, opens no transaction and reads no clock of its own.
  *
  * The base intervals extend `FRESHNESS` rather than restating it. `FRESHNESS` already answers
  * "how long is one complete observation worth trusting?", and "refresh before it stops being
@@ -46,8 +46,8 @@ export const CADENCE: Record<Surface, CadenceRule> = {
   // item on a CSFloat-connected account was refused for the rest of it.
   'csfloat-trades': { activeMs: FRESHNESS['csfloat-trades'].maxAgeMs, backgroundMs: 20 * 60_000 },
   'csfloat-trade': { activeMs: 60_000, backgroundMs: 5 * 60_000, eventDrivenOnly: true },
-  // One listing by id. The loop has a ref for one only while a delist or reprice waits on it
-  // (`RefreshService.scopes`), so a timer here reads nothing else; it is what keeps reading after
+  // One listing by id. The broker has a scope for one only while a delist or reprice waits on it
+  // (`ReadBroker.scopes`), so a timer here reads nothing else; it is what keeps reading after
   // the proof bound, so a delist CSFloat could not be read for during an outage is still read
   // for once it answers, rather than waiting for someone to refresh (CSF-45).
   'csfloat-listing': { activeMs: 5 * 60_000, backgroundMs: 20 * 60_000 },
@@ -105,20 +105,17 @@ export type DueInput = {
   /** The latest observation for exactly this scope, or undefined when there has never been one. */
   observation: ObservationRow | undefined;
   now: Date;
-  backoff?: BackoffState | undefined;
-  /** Set when a signal asked for this surface since the last read. Overrides the timer, not the budget. */
-  requested?: boolean;
   /** Only meaningful for `steam-wallet`: false lets the quiet interval apply. */
   hasOpenCommitment?: boolean;
   /** An owned transfer is waiting on offers, or on both inventories after acceptance. */
   transferIntervalMs?: number;
-  /** When a waiting action's need makes this scope due (`policy/proof.ts`). Never past the backoff. */
+  /** When a waiting action's need makes this scope due (`policy/proof.ts`). */
   proofDueAtMs?: number | undefined;
 };
 
 export type DueVerdict =
-  | { due: true; because: 'never-observed' | 'requested' | 'proof' | 'stale' | 'incomplete' }
-  | { due: false; because: 'fresh' | 'backing-off' | 'event-driven-only'; nextDueAtMs: number };
+  | { due: true; because: 'never-observed' | 'proof' | 'stale' | 'incomplete' }
+  | { due: false; because: 'fresh' | 'event-driven-only'; nextDueAtMs: number };
 
 export function baseIntervalMs(surface: Surface, tier: Tier, hasOpenCommitment = true): number {
   const rule = CADENCE[surface];
@@ -127,21 +124,20 @@ export function baseIntervalMs(surface: Surface, tier: Tier, hasOpenCommitment =
 }
 
 /**
- * Whether this surface should be read now.
+ * Whether this surface is worth reading now, from its evidence alone: the cadence source of the
+ * read broker (read broker plan D10).
  *
- * Note what is *not* here: nothing about actions, attempts or mutations. This decides when to
- * look, never whether to act. Re-sending a mutation is repository rule 1's business and the
- * scheduler that consumes this has no verb for it.
+ * Note what is *not* here. Nothing about actions, attempts or mutations: this decides when to
+ * look, never whether to act, and re-sending a mutation is repository rule 1's business. And
+ * nothing about holds or requests: a scope held after a failure, and a read somebody asked for,
+ * are the broker's own state. It raises a need for a due scope and keeps it through a hold, so a
+ * verdict here is never past a hold and never consumed by one.
  */
 export function isDue(input: DueInput): DueVerdict {
   const nowMs = input.now.getTime();
   const surface = input.ref.surface;
   const rule = CADENCE[surface];
 
-  if (input.backoff && input.backoff.notBeforeMs > nowMs && !input.requested) {
-    return { due: false, because: 'backing-off', nextDueAtMs: input.backoff.notBeforeMs };
-  }
-  if (input.requested) return { due: true, because: 'requested' };
   const proofAtMs = input.proofDueAtMs ?? Number.POSITIVE_INFINITY;
   if (proofAtMs <= nowMs) return { due: true, because: 'proof' };
   if (rule.eventDrivenOnly) {
@@ -150,14 +146,9 @@ export function isDue(input: DueInput): DueVerdict {
   if (!input.observation) return { due: true, because: 'never-observed' };
 
   const grade = freshness(input.observation, surface, input.now);
-  if (grade === 'INCOMPLETE') {
-    // An incomplete walk proves nothing (rule 5), so it does not reset the clock. It is due
-    // again as soon as its backoff allows, which is the branch above.
-    const notBefore = input.backoff?.notBeforeMs ?? nowMs;
-    return notBefore <= nowMs
-      ? { due: true, because: 'incomplete' }
-      : { due: false, because: 'backing-off', nextDueAtMs: notBefore };
-  }
+  // An incomplete walk proves nothing (rule 5), so it does not reset the clock: the scope is due
+  // again as soon as the hold its failure earned lifts, which the broker waits out.
+  if (grade === 'INCOMPLETE') return { due: true, because: 'incomplete' };
 
   const interval = Math.min(baseIntervalMs(surface, input.tier, input.hasOpenCommitment ?? true),input.transferIntervalMs ?? Infinity);
   const startedMs = Date.parse(input.observation.started_at);
@@ -169,17 +160,14 @@ export function isDue(input: DueInput): DueVerdict {
 /**
  * True when this account holds something that could move its wallet without the user acting.
  *
- * Read from persisted observation, never inferred from an attempt: an open listing is one Steam
- * showed us in a walk, and an open buy order is one the book still lists.
+ * Read from the one order table: a listing or a buy order on any venue that no observation has
+ * closed out, which includes a request of ours no walk has yet shown.
  */
 export function hasOpenCommitment(database: EngineDatabase, accountId: string): boolean {
   const row = database.raw().prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM market_listing WHERE account_id=? AND status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')) AS listings,
-      (SELECT COUNT(*) FROM buy_order WHERE account_id=? AND active=1) AS orders,
-      (SELECT COUNT(*) FROM venue_order WHERE account_id=? AND state NOT LIKE 'ENDED_%') AS open_orders
-  `).get(accountId, accountId, accountId) as { listings: number; orders: number; open_orders: number };
-  return row.listings > 0 || row.orders > 0 || row.open_orders > 0;
+    SELECT COUNT(*) AS open_orders FROM venue_order WHERE account_id=? AND state NOT LIKE 'ENDED_%'
+  `).get(accountId) as { open_orders: number };
+  return row.open_orders > 0;
 }
 
 /** The latest observation for one scope, in the shape `isDue` wants. */
@@ -188,6 +176,6 @@ export function latestFor(database: EngineDatabase, accountId: string, ref: Surf
     accountId,
     FRESHNESS[ref.surface].scope,
     ref.scope.id ?? null,
-    surfaceName(ref)
+    ref.surface
   );
 }

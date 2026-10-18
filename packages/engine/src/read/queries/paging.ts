@@ -26,8 +26,9 @@ export function assertAccountScope(database: EngineDatabase, ids: readonly strin
   if (database.knownAccountIds(accounts).length !== accounts.length) throw new Error('Unknown account in scope');
   return accounts;
 }
+/** The inventory each account's cursors were cut over: the last complete walk of it. */
 export function readRevision(database: EngineDatabase, accounts: readonly string[]): string {
-  return accounts.map(id => `${id}:${database.publication(id, 'gc-inventory', '')?.published_generation ?? 0}`).join('|');
+  return accounts.map(id => `${id}:${database.latestCompleteObservationForScope(id, 'account', null, 'gc-inventory')?.id ?? 0}`).join('|');
 }
 export function hash(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 export function decode(cursor: string): Cursor {
@@ -69,7 +70,7 @@ export function queryPage<T>(database: EngineDatabase, request: PageableRequest,
   // A cursor read going one way is not a cursor into the other, so the direction is bound too. It
   // joins the hash only when it descends, which keeps every ascending cursor already issued valid.
   const binding = hash({ domain, accounts, filter: request.filter ?? {}, sort: 'sort' in request ? request.sort ?? 'localId' : '', ...(descending ? { direction: 'desc' } : {}) });
-  const marks = database.raw().prepare(`SELECT account_id, surface, revision FROM read_revision WHERE account_id IN (${accounts.map(() => '?')}) ORDER BY account_id,surface`).all(...accounts);
+  const marks = database.revisionMarks(accounts);
   const revision = hash([marks, readRevision(database, accounts)]);
   const cursor = request.cursor ? decode(request.cursor) : undefined;
   if (cursor && (cursor.binding !== binding || cursor.revision !== revision || cursor.after.length !== keys.length)) return { kind: 'stale-page', reason: 'cursor does not match surface, scope, filter, sort or revision' };

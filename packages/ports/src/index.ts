@@ -18,6 +18,8 @@ export type { FeeLine, MarketplaceFee, MarketplaceFeeSchedule, MarketplaceId, Pr
 export { MARKETPLACE_FEES, buyerPaysFor, listPriceOf, quoteFromBuyer, quoteFromReceive, receiveFor } from './fees.js';
 export { KIT_ATTRIBUTES_BY_ITEM, KIT_ATTRIBUTES_BY_QUALITY, attributeValue, commodityMatchKey, kitToken, matchKey } from './item-key.js';
 export { STEAM_ID64_BASE, accountIdFromSteamId64, steamId64FromAccountId } from './steam-id.js';
+export type { WearBand } from './wear.js';
+export { WEAR_TIERS, wearBand, wearBandSql } from './wear.js';
 
 /**
  * What one Engine Runtime is composed from.

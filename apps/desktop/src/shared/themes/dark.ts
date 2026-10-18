@@ -66,9 +66,20 @@ export const dark: Theme = {
     '--wear-bs': '#D2635F',
 
     '--cs-hold-wallet': '#6E9BF0',
+    '--cs-hold-csfloat': '#E08D5B',
+    '--cs-hold-inventory': '#8FB889',
     '--cs-hold-listed': '#4FB6A5',
     '--cs-hold-unconfirmed': '#B48CE0',
     '--cs-hold-hatch': 'rgba(255, 255, 255, 0.5)',
+
+    '--cs-series-1': '#6E9BF0',
+    '--cs-series-2': '#4FB6A5',
+    '--cs-series-3': '#B48CE0',
+    '--cs-series-4': '#E08D5B',
+    '--cs-series-5': '#C8B78E',
+    '--cs-series-6': '#D2635F',
+    '--cs-series-7': '#4CC2FF',
+    '--cs-series-8': '#8E97A8',
 
     '--cs-avatar-bg-sl': '26% 24%',
     '--cs-avatar-ring-sl': '30% 38%',

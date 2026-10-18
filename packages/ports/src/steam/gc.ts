@@ -92,6 +92,12 @@ export type CasketRead = {
   countGeneration: number;
   itemsGeneration: number;
   completeness: 'complete' | 'incomplete' | 'stale-count';
+  /**
+   * What the read cost. `cache` answered from the session's object cache and sent the Game
+   * Coordinator nothing; `wire` sent `CasketItemLoadContents`, which the GC answers with every
+   * child as an object create. The engine budgets the second and not the first.
+   */
+  transport: 'cache' | 'wire';
 };
 
 /**
@@ -150,6 +156,13 @@ export interface SteamGcPort {
   connectionStatus(accountId: AccountId): GcStatus;
   getInventorySnapshot(accountId: AccountId): Promise<{ items: RawEconItem[]; generation: number }>;
   events(accountId: AccountId): AsyncIterable<GcEvent>;
+  /**
+   * Every event the queue holds now, in order, without waiting for one. The engine's event loop
+   * takes them with the event it was woken by and applies the batch in one turn, so a unit's
+   * contents load, which the GC answers with every child as an object create, is one settle and
+   * not one per child.
+   */
+  drainEvents(accountId: AccountId): GcEvent[];
   listStorageUnits(accountId: AccountId): Promise<StorageUnit[]>;
   getCasketContents(accountId: AccountId, casketId: AssetId): Promise<CasketRead>;
   addToCasket(accountId: AccountId, casketId: AssetId, itemId: AssetId): Promise<MutationOutcome>;

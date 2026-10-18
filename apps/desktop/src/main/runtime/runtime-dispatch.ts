@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { pageCommandMembers, pageTransfers, readDetail, bounded, csfloatOperationAccount, selectionAccounts, selectionMembers, type TradingEngine, type ObservationRow, type CommandRequest, type ListingFilter, type TransferMember, type TransferPreview } from '@cslytics/engine';
+import { pageCommandMembers, pageTransfers, readDetail, bounded, csfloatOperationAccount, selectionAccounts, selectionMembers, type TradingEngine, type ObservationRow, type ReadOutcome, type RefusalReason, type CommandRequest, type ListingFilter, type TransferMember, type TransferPreview } from '@cslytics/engine';
 import type { EngineCommand } from '../../shared/api.js';
 
 export function createRuntimeDispatch(engine: TradingEngine, hasStoredCredential: (id: string) => Promise<boolean>) {
@@ -41,8 +41,8 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     case 'csfloat.deliver': {
       await ensureGc(command.accountId);
       await engine.csfloatSelling.refresh(command.accountId,true);
-      const op = engine.csfloatDelivery.queue(command.accountId,command.commandId,command.tradeId);
-      await engine.csfloatDelivery.advance(op.id);
+      const delivery = engine.csfloatDelivery.queue(command.accountId,command.commandId,command.tradeId);
+      await engine.csfloatDelivery.advance(delivery.id);
       return null;
     }
     case 'csfloat.deliveryRefresh': {
@@ -64,9 +64,9 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     case 'transfer.submit': {
       const members: TransferMember[] = command.members?.map(definedFields) ?? [];
       if (command.manifestToken) {
-        const manifest = engine.database.selectionManifest(command.manifestToken);
-        if (!manifest || manifest.state !== 'COMPLETE' || manifest.revision !== command.manifestRevision) throw new Error('Selection token is stale');
-        const rows = selectionMembers(engine.database, manifest.token, manifest.revision, 6201);
+        const draft = engine.database.draft(command.manifestToken);
+        if (!draft || draft.preparing || draft.state !== 'DRAFT' || draft.revision !== command.manifestRevision) throw new Error('Selection token is stale');
+        const rows = selectionMembers(engine.database, draft.id, 6201);
         if (rows.length > 6200) throw new Error('Transfer selection exceeds the request size bound');
         members.push(...rows.map(row => ({accountId:row.accountId,quantity:row.quantity,casketId:row.casketId,
           ...(row.stackKey ? {stackKey:row.stackKey} : {localId:row.memberId})})));
@@ -80,6 +80,7 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     case 'storage.contentsPage': return engine.pageInventory({ ...definedFields(command), filter: { location: 'CASKET', casketId: command.casketId } });
     case 'inventory.detail': return readDetail(engine.database, 'inventory', command.accountId, command.id);
     case 'orders.detail': return readDetail(engine.database, 'orders', command.accountId, command.id);
+    case 'orders.close': return engine.closeOrder(command.accountId, command.orderId, command.as);
     case 'history.detail': return readDetail(engine.database, 'history', command.accountId, command.id);
     case 'trades.detail': return readDetail(engine.database, 'trades', command.accountId, command.id);
     case 'ledger.detail': return readDetail(engine.database, 'ledger', command.accountId, command.id);
@@ -165,6 +166,15 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
         ...(rest.filter !== undefined ? { filter: engineFilter(rest.filter) } : {})
       });
     }
+    // The valuation's read (portfolio and pricing plan D6): identity keys and wear bands, which
+    // main spells into market names. The envelope is `positions` or `needs-filter`, never a page.
+    case 'inventory.positions': {
+      const rest = definedFields(command);
+      return engine.pageInventoryPositions({
+        accountIds: rest.accountIds,
+        ...(rest.filter !== undefined ? { filter: engineFilter(rest.filter) } : {})
+      });
+    }
     // Two read-only relays. Main interprets neither: `work.open` rows are decorated with names on
     // the way out and nothing more, and eligibility is the engine's answer verbatim.
     case 'work.open': return engine.views.pageOpenWork({ accountIds: command.accountIds });
@@ -186,8 +196,8 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     case 'trades.entry': return engine.views.readTradeEntry(definedFields(command));
     case 'trades.items': return engine.views.pageTradeItems(definedFields(command));
     case 'trades.sync': {
-      const offers = await engine.observe(command.accountId, 'steam-trade-offers');
-      const history = await engine.observe(command.accountId, 'steam-trade-history');
+      const offers = await engine.observeOutcome(command.accountId, 'steam-trade-offers');
+      const history = await engine.observeOutcome(command.accountId, 'steam-trade-history');
       return { offers: walkReply(offers), history: walkReply(history) };
     }
     case 'selection.capture': return engine.captureSelection({
@@ -195,6 +205,14 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
       members: command.members.map(definedFields)
     });
     case 'selection.read': return engine.readSelection(command.token);
+    case 'selection.exclude': return engine.updateSelection(command.token, command.revision, {
+      exclude: command.members.map((member) => ({ accountId: member.accountId, localId: member.localId }))
+    });
+    case 'store.precheck': return engine.commands.precheck({
+      ...(command.members ? { members: command.members } : {}),
+      ...(command.manifestToken ? { manifestToken: command.manifestToken } : {}),
+      destinations: command.destinations
+    });
     case 'command.read': return engine.commandProgress(command.commandId);
     case 'command.stop': return engine.stopCommand(command.commandId);
     case 'storage.sync':
@@ -240,7 +258,7 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
         label: engine.database.storageUnit(command.accountId, command.casketId)?.label ?? null
       };
     }
-    case 'market.sync': return walkReply(await engine.observe(command.accountId, 'steam-market'));
+    case 'market.sync': return walkReply(await engine.observeOutcome(command.accountId, 'steam-market'));
     case 'market.read': return engine.marketView(command.accountId);
     case 'plan.read': return engine.dryRunPlan(command.accountId);
     case 'goals.preview': return engine.previewPlan(command.accountId);
@@ -319,7 +337,8 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
         ...(command.manifestToken ? { manifestToken: command.manifestToken } : {}),
         ...(command.manifestRevision ? { manifestRevision: command.manifestRevision } : {}),
         ...(command.destinations ? { destinations: command.destinations } : {}),
-        ...(command.priceReceiveCents ? { priceReceiveCents: command.priceReceiveCents } : {})
+        ...(command.priceReceiveCents ? { priceReceiveCents: command.priceReceiveCents } : {}),
+        ...(command.consent?.length ? { consent: command.consent } : {})
       });
     case 'listing.remove': {
       const action = engine.queueDelist(command.accountId, command.listingId);
@@ -350,7 +369,6 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
       const action = engine.queueCancelBuyOrder(command.accountId, command.buyOrderId);
       return engine.executeCancelBuyOrder(action.id);
     }
-    case 'timeline.read': return engine.timeline(command.accountId);
     case 'portfolio.read': return engine.portfolio(command.accountIds);
     case 'session.status': {
       const rows = [];
@@ -370,7 +388,7 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
       // Only accounts being kept current, which is to say signed in: reading one that is not would
       // sign it in, and an account left signed out stays that way until someone connects it.
       const refreshed: Record<string, readonly string[]> = {};
-      const kept = new Set(engine.refresh.keptCurrent());
+      const kept = new Set(engine.reads.keptCurrent());
       for (const accountId of command.accountIds) {
         if (kept.has(accountId)) refreshed[accountId] = await engine.refreshNow(accountId);
       }
@@ -385,6 +403,13 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     case 'refresh.scope':
       engine.setActiveAccount(command.accountId);
       return { kind: 'scoped', accountId: command.accountId };
+    // Main answers the rest itself (`release.*`, `settings.*`, `cslytics.*`, the price commands)
+    // and never forwards them. Anything else that reaches here is a command this table does not
+    // know, and the answer is a refusal by name rather than `undefined`: a caller reading a field
+    // off a silent nothing fails one step later, in a place that says nothing about which command
+    // was missing (the `inventory.positions` gap read as "Cannot read properties of undefined").
+    default:
+      throw new Error(`The Engine Runtime has no handler for "${String((command as { type?: unknown }).type)}"`);
   }
 }
 
@@ -433,12 +458,16 @@ function listingEngineFilter(filter: NonNullable<Extract<EngineCommand, { type: 
   return rest;
 }
 
+/** The commands that only move items through this account's own units, which ask no venue anything before admission. */
+const MOVES_ONLY: ReadonlySet<CommandRequest['kind']> = new Set<CommandRequest['kind']>(['RETRIEVE', 'STORE', 'TRANSFER', 'DELIST_TO_STORE']);
+
 async function submitApprovedCommand(request: CommandRequest): Promise<unknown> {
-  // Preflight refuses a member whose CSFloat coverage has lapsed rather than read an unwalked
-  // stall as an empty one (CSF-13), and it is synchronous by design, so the books have to be
-  // current before it runs. `RETRIEVE` is the exception the engine itself makes: nothing a venue
-  // says can forbid bringing an item back into main inventory.
-  if (request.kind !== 'RETRIEVE') {
+  // A listing's preflight refuses a member whose CSFloat coverage has lapsed rather than read an
+  // unwalked stall as an empty one (CSF-13), and it is synchronous by design, so the books have to
+  // be current before it runs. A move between this account's inventory and its units asks no
+  // venue's age (bulk storage plan D7): the store pre-check already named what the record holds,
+  // and a CSFloat read before every Store press is what made a store slow to start.
+  if (!MOVES_ONLY.has(request.kind)) {
     for (const accountId of commandAccounts(request)) {
       if (engine.marketplaceStatus(accountId).status !== 'CONNECTED') continue;
       await engine.ensureFresh(accountId, ['csfloat-stall', 'csfloat-trades']);
@@ -456,12 +485,25 @@ function commandAccounts(request: CommandRequest): string[] {
   return [...accounts];
 }
 
+/** Why the broker made no walk, in words a sync button can show. */
+const REFUSED: Record<RefusalReason, string> = {
+  breaker: 'this surface failed repeatedly and is resting before it is asked again',
+  'no-session': 'the account has no Game Coordinator session',
+  'no-venue': 'the account is not connected to this venue',
+  incomplete: 'the walk did not complete',
+  withdrawn: 'the read was withdrawn before it ran'
+};
+
 /**
  * What a sync button is told about the walk it asked for: the observation's own record. A read
- * the breaker held back made no walk, and says so rather than looking like an empty book (rule 5).
+ * the broker refused made no walk, and says why rather than looking like an empty book (rule 5):
+ * a resting surface names what it last answered, so a 429 reads as a 429.
  */
-function walkReply(row: ObservationRow | undefined): { observationId: number | null; complete: boolean; pagesWalked: number; totalExpected: number | null; error?: string } {
-  if (!row) return { observationId: null, complete: false, pagesWalked: 0, totalExpected: null, error: 'Not read: this surface failed repeatedly and is resting before it is asked again' };
+function walkReply(outcome: ReadOutcome): { observationId: number | null; complete: boolean; pagesWalked: number; totalExpected: number | null; error?: string } {
+  if (outcome.kind === 'refused') {
+    return { observationId: null, complete: false, pagesWalked: 0, totalExpected: null, error: `Not read: ${REFUSED[outcome.reason]}${outcome.detail ? ` (${outcome.detail})` : ''}` };
+  }
+  const row: ObservationRow = outcome.observation;
   return {
     observationId: row.id,
     complete: row.complete === 1,

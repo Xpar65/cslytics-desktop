@@ -1,11 +1,13 @@
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
+  DEFAULT_CSFLOAT, DEFAULT_CURRENCY,
   DEFAULT_LAUNCH,
   DEFAULT_SETTINGS,
   settingsSchema,
   type AccountLaunch,
   type AppearanceSettings,
+  type CurrencySettings,
   type DesktopSettings
 } from '../shared/api.js';
 import { THEME_PREFERENCES } from '../shared/themes/index.js';
@@ -69,6 +71,25 @@ export class SettingsStore {
     return this.write({ ...this.settings, accounts: { ...this.settings.accounts, [accountId]: launch } });
   }
 
+  /** The duplicate-protection switch, the same way (consolidation plan D13). */
+  writeCsfloatProtection(enabled: boolean): DesktopSettings {
+    return this.write({ ...this.settings, csfloat: { ...this.settings.csfloat, protection: enabled } });
+  }
+
+  /** Replaces the currency section, the same way. A chosen base is recorded as chosen. */
+  writeCurrency(currency: CurrencySettings): DesktopSettings {
+    return this.write({ ...this.settings, currency });
+  }
+
+  /**
+   * Pins the base currency from the first account's wallet, once. A base already pinned or
+   * chosen is left alone, so adding or removing accounts later never moves the figures.
+   */
+  pinBaseCurrency(code: string): DesktopSettings {
+    if (this.settings.currency.base !== null) return this.settings;
+    return this.write({ ...this.settings, currency: { ...this.settings.currency, base: code, baseSource: 'first-account' } });
+  }
+
   /**
    * Drops everything this file holds about one account. Removing the account is the only caller:
    * its preferences are data about it on this computer, and go with the rest.
@@ -121,10 +142,26 @@ function storedAccounts(raw: unknown): DesktopSettings['accounts'] {
   return accounts;
 }
 
+const storedCurrency = z.object({
+  base: z.string().regex(/^[A-Z]{3}$/).nullable().catch(DEFAULT_CURRENCY.base),
+  baseSource: z.enum(['first-account', 'chosen']).catch(DEFAULT_CURRENCY.baseSource),
+  showAccountPagesInBase: z.boolean().catch(DEFAULT_CURRENCY.showAccountPagesInBase)
+}).catch(DEFAULT_CURRENCY);
+
+const storedCsfloat = z.object({
+  protection: z.boolean().catch(DEFAULT_CSFLOAT.protection)
+}).catch(DEFAULT_CSFLOAT);
+
 /** A parsed file as settings, or null when it is not a settings file at all. */
 export function settingsFrom(raw: unknown): DesktopSettings | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const file = raw as Record<string, unknown>;
   if (typeof file.version !== 'number') return null;
-  return { version: 1, appearance: storedAppearance.parse(file.appearance ?? {}), accounts: storedAccounts(file.accounts) };
+  return {
+    version: 1,
+    appearance: storedAppearance.parse(file.appearance ?? {}),
+    accounts: storedAccounts(file.accounts),
+    currency: storedCurrency.parse(file.currency ?? {}),
+    csfloat: storedCsfloat.parse(file.csfloat ?? {})
+  };
 }

@@ -1,8 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { AccountId } from '@cslytics/ports';
+import type { CommandMemberState } from './alphabets.js';
 import { applySchema, existingVersion, SchemaNewerThanAppError, SCHEMA_VERSION } from './index.js';
 import { backupBeforeUpgrade } from './backup.js';
+import { WorkStore, isSettled } from './work.js';
+import { OrderStore } from './orders.js';
+import type { OrderVenue } from './alphabets.js';
 
 export type AccountRow = {
   id: string;
@@ -12,6 +16,9 @@ export type AccountRow = {
   persona_name: string | null;
   avatar_hash: string | null;
   persona_obs: number | null;
+  /** The account's own trade token and the read that gave it (D14); the partner id is derived from the SteamID64. */
+  trade_token: string | null;
+  trade_token_obs: number | null;
 };
 
 /** Steam login names are unique and case-insensitive; this is the local `accountId`. */
@@ -57,7 +64,7 @@ export type ItemRow = {
   /** The identity key's fourth field, derived on ingest by `kernel/identity.kitToken`. */
   kit: string;
   stable_key: string;
-  current_asset_id: string | null;
+  asset_id: string | null;
   /**
    * Where the Game Coordinator holds the unit. Never "on the market": the GC keeps a listed item in
    * the inventory, so being listed is an open listing (`db/steam-listing.ts`), not a location.
@@ -70,7 +77,6 @@ export type ItemRow = {
   last_seen_obs: number;
   location_obs: number | null;
   location_generation: number | null;
-  row_generation?: number;
   /** `individual` (paint tuple, storage unit) or `fungible`; decides the read model's row shape. */
   unit_kind: 'individual' | 'fungible';
   /** The interchangeability key (holdings plan D4): `kernel/identity.groupKey`. */
@@ -111,7 +117,7 @@ export type ActionRow = {
   kind: string;
   target_id: string;
   desired_version: number;
-  desired_id: string;
+  desired_id: string | null;
   state: 'READY' | 'RUNNING' | 'AWAITING_OBSERVATION' | 'DONE' | 'FAILED';
   resource_key: string;
   created_at: string;
@@ -121,6 +127,8 @@ export type ActionRow = {
   params_json: string | null;
   resolved_by_obs: number | null;
   resolution: 'OBSERVED_APPLIED' | 'OBSERVED_NOT_APPLIED' | null;
+  /** The hop of a command this action carries, when no standing intent does (consolidation plan D3). */
+  step_id: string | null;
 };
 
 export type DesiredStateRow = {
@@ -131,7 +139,6 @@ export type DesiredStateRow = {
   version: number;
   intent: string;
   params_json: string;
-  basis: string;
   created_at: string;
   superseded_by: string | null;
   authority: string;
@@ -139,6 +146,8 @@ export type DesiredStateRow = {
   suspended_at: string | null;
   blocked_until: string | null;
   expires_at: string | null;
+  /** The command that set the goal, when one did (consolidation plan D15). */
+  command_id: string | null;
 };
 
 /** A stack as `commodityStacks` reads it: the fungible units of one group at one location, summed. */
@@ -169,60 +178,53 @@ export type CommandRow = {
   id: string;
   correlation_id: string;
   kind: string;
-  state: 'REJECTED' | 'ADMITTED' | 'RUNNING' | 'PARTIAL' | 'COMPLETE' | 'STOPPED';
+  state: 'DRAFT' | 'REJECTED' | 'ADMITTED' | 'RUNNING' | 'PARTIAL' | 'COMPLETE' | 'STOPPED';
   reject_reason: string | null;
   created_at: string;
   preparing?: number;
   manifest_token?: string | null;
   observed_completed?: number;
+  revision?: number;
+  filter_json?: string | null;
 };
 
-export type PublicationRow = {
-  account_id: string;
-  surface: string;
-  scope_id: string;
-  published_generation: number | null;
-  staging_generation: number | null;
-  staging_state: string;
-  published_at: string | null;
-};
+/** The kind of a command that is a selection draft (consolidation plan §4.4). */
+export const SELECTION_KIND = 'SELECTION';
 
-export type SelectionManifestRow = {
-  token: string;
-  revision: number;
-  state: 'DRAFT' | 'COMPLETE' | 'RELEASED';
-  account_ids_json: string;
-  filter_json: string;
-  created_at: string;
-  handle_count: number;
-  quantity_total: number;
-};
+/** One frozen member of a selection draft, as `command_member.input_json` keeps it. */
+export type DraftMember = { accountId: string; localId?: string; stackKey?: string; quantity: number; location: string | null; casketId: string | null };
+export type DraftMemberRow = DraftMember & { memberId: string };
 
-export type SelectionMemberRow = {
-  token: string;
-  revision: number;
-  account_id: string;
-  member_id: string;
-  stack_key: string | null;
-  location: string | null;
-  casket_id: string | null;
-  quantity: number;
-};
-
+/**
+ * A command member: the holding a command is about, the terms it was admitted with, and the words
+ * no hop can say for it (`COMMAND_MEMBER_STATES`). What it is doing is its hops in `work_step`.
+ */
 export type CommandMemberRow = {
   input_json?: string | null;
   command_id: string;
   account_id: string;
-  member_id: string;
+  local_id: string;
   stack_key: string | null;
   quantity: number;
   destination: string | null;
   price_receive_cents: number | null;
-  state: string;
-  action_id: string | null;
+  state: CommandMemberState;
 };
 
+/** A member as read back, with the action its latest hop carries, for callers that act on it. */
+export type CommandMemberView = CommandMemberRow & { action_id: string | null };
+
 const IN_FLIGHT_STATES = "('READY','RUNNING','AWAITING_OBSERVATION')";
+
+/** What `enqueueAction` takes: the common fields and exactly one carrier. */
+export type EnqueueActionInput = {
+  accountId: string;
+  actionKind: string;
+  targetId: string;
+  resourceKey: string;
+  params: unknown;
+  now: string;
+} & ({ desiredId: string; desiredVersion: number } | { stepId: string });
 
 export type CheckpointRow = {
   account_id: string; surface: string; scope_id: string; cursor_json: string;
@@ -232,9 +234,17 @@ export type CheckpointRow = {
 export class EngineDatabase {
   private readonly sqlite: DatabaseSync;
 
-  constructor(path: string) {
+  /**
+   * `now` is the engine's clock, used for the two stamps written while the record opens: the
+   * schema stamp and the recovery of actions interrupted mid-flight. No statement here asks SQLite
+   * for the time (consolidation plan D23); the runtime passes its clock and a test its virtual one.
+   */
+  constructor(path: string, now: () => string = () => new Date().toISOString()) {
     this.sqlite = new DatabaseSync(path);
     try {
+      // The connection, in one place (consolidation plan D20). Foreign keys are off by default in
+      // SQLite and every delete here relies on them; the busy timeout covers a read-only diagnostic
+      // copy, since the runtime is the only writer.
       this.sqlite.exec('PRAGMA foreign_keys = ON');
       this.sqlite.exec('PRAGMA busy_timeout = 5000');
       // A record a newer build wrote is refused before anything here writes to it — switching the
@@ -244,17 +254,30 @@ export class EngineDatabase {
       const found = existingVersion(this.sqlite);
       if (found !== null && found > SCHEMA_VERSION) throw new SchemaNewerThanAppError(found, SCHEMA_VERSION);
       this.sqlite.exec('PRAGMA journal_mode = WAL');
-      if (found !== null && found < SCHEMA_VERSION && path !== ':memory:') backupBeforeUpgrade(this.sqlite, path, found, new Date());
-      applySchema(this.sqlite);
+      // FULL, not NORMAL: a committed intent (a command, a sent attempt) must survive a power cut,
+      // because the next open reasons from it. The log is truncated after a checkpoint so a busy
+      // walk does not leave a large -wal beside the record for good.
+      this.sqlite.exec('PRAGMA synchronous = FULL');
+      this.sqlite.exec('PRAGMA journal_size_limit = 16777216');
+      if (found !== null && found < SCHEMA_VERSION && path !== ':memory:') backupBeforeUpgrade(this.sqlite, path, found, new Date(now()));
+      applySchema(this.sqlite, now());
+      // Statistics for the planner, gathered only when SQLite judges them stale (D20). Without
+      // them every index choice is a guess, and records in use had none for five weeks.
+      this.sqlite.exec('PRAGMA optimize');
     } catch (error) {
       this.sqlite.close();
       throw error;
     }
-    this.recoverInterruptedActions();
+    this.recoverInterruptedActions(now());
   }
 
   close(): void {
     if (!this.sqlite.isOpen) return;
+    try {
+      this.sqlite.exec('PRAGMA optimize');
+    } catch {
+      // Statistics are a courtesy to the next open; closing never waits on them.
+    }
     this.sqlite.close();
   }
 
@@ -343,8 +366,8 @@ export class EngineDatabase {
       pagesWalked: observation.pagesWalked ?? 0,
       totalExpected: observation.totalExpected ?? null,
       error: observation.error ?? null,
-      scopeKind: observation.scopeKind ?? (observation.surface.startsWith('gc-casket:') ? 'casket' : 'account'),
-      scopeId: observation.scopeId ?? (observation.surface.startsWith('gc-casket:') ? observation.surface.slice(10) : null)
+      scopeKind: observation.scopeKind ?? 'account',
+      scopeId: observation.scopeId ?? null
     });
     return Number(result.lastInsertRowid);
   }
@@ -382,13 +405,6 @@ export class EngineDatabase {
    * The row generation a walk writes under: the staging one while a snapshot stages, else the
    * published one. `HoldingsStore.upsertUnit` is the writer that needs it.
    */
-  activeRowGeneration(accountId: string, surface: string, scopeId: string, fallback: number | null): number {
-    const pub = this.publication(accountId, surface, scopeId);
-    if (pub?.staging_state === 'STAGING' && pub.staging_generation != null) return pub.staging_generation;
-    if (pub?.published_generation != null) return pub.published_generation;
-    return fallback ?? 0;
-  }
-
   reserveMainSlot(accountId: string, actionId: string): void {
     this.sqlite.prepare(`
       INSERT INTO reservation(account_id, ref_kind, ref_id, amount_cents, state)
@@ -398,7 +414,9 @@ export class EngineDatabase {
   }
 
   markSlotSubmitted(accountId: string, actionId: string): void {
-    this.sqlite.prepare(`UPDATE reservation SET state='SUBMITTED_UNOBSERVED' WHERE account_id=? AND ref_kind='MAIN_SLOT' AND ref_id=?`).run(accountId, actionId);
+    // Only a slot still held: a retrieve's own SO event can prove it, and consume the slot, before
+    // its answer arrives, and the answer must not hold the slot again (L-10, 2026-10-16).
+    this.sqlite.prepare(`UPDATE reservation SET state='SUBMITTED_UNOBSERVED' WHERE account_id=? AND ref_kind='MAIN_SLOT' AND ref_id=? AND state='ACTIVE'`).run(accountId, actionId);
   }
 
   storageUnit(accountId: string, casketId: string): StorageUnitRow | undefined {
@@ -413,6 +431,7 @@ export class EngineDatabase {
    */
   setStorageUnitLabel(accountId: string, casketId: string, label: string | null, observationId: number): void {
     this.sqlite.prepare(`UPDATE storage_unit SET label=?, label_obs=? WHERE account_id=? AND casket_id=?`).run(label, observationId, accountId, casketId);
+    this.touch(accountId, 'storage_unit');
   }
 
   releaseSlot(accountId: string, actionId: string, consumed: boolean): void {
@@ -425,16 +444,19 @@ export class EngineDatabase {
       SELECT COALESCE(SUM(amount_cents),0) AS count FROM reservation
       WHERE account_id=? AND ref_kind='MAIN_SLOT' AND state IN ('ACTIVE','SUBMITTED_UNOBSERVED')
     `).get(accountId) as { count: number };
-    const incoming = this.sqlite.prepare(`SELECT COALESCE(SUM(json_extract(asset.value,'$.quantity')),0) AS count
-      FROM transfer_batch batch,json_each(batch.assets_json) asset
-      WHERE batch.destination_account_id=? AND batch.state NOT IN ('DONE','ENDED','FAILED')`).get(accountId) as { count: number };
+    // Every member of an open transfer toward this account holds one of its slots until the
+    // delivery is proved or the offer ends.
+    const incoming = this.sqlite.prepare(`SELECT COALESCE(SUM(m.quantity),0) AS count
+      FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
+      JOIN command_member m ON m.command_id=s.command_id AND m.account_id=s.account_id
+      WHERE s.kind='SEND' AND d.destination_account_id=? AND s.state IN ('QUEUED','SENT','AWAITING_OBSERVATION','RETRYING')`).get(accountId) as { count: number };
     return row.count + incoming.count;
   }
 
   insertCommand(row: CommandRow): void {
     this.sqlite.prepare(`
-      INSERT INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed, revision, filter_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       row.id,
       row.correlation_id,
@@ -444,7 +466,9 @@ export class EngineDatabase {
       row.created_at,
       row.preparing ?? 0,
       row.manifest_token ?? null,
-      row.observed_completed ?? 0
+      row.observed_completed ?? 0,
+      row.revision ?? 1,
+      row.filter_json ?? null
     );
   }
 
@@ -458,22 +482,23 @@ export class EngineDatabase {
 
   insertCommandMember(row: CommandMemberRow): void {
     this.sqlite.prepare(`
-      INSERT INTO command_member(command_id, account_id, member_id, stack_key, quantity, destination, price_receive_cents, state, action_id, input_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.command_id, row.account_id, row.member_id, row.stack_key, row.quantity, row.destination, row.price_receive_cents, row.state, row.action_id, row.input_json ?? null);
+      INSERT INTO command_member(command_id, account_id, local_id, stack_key, quantity, destination, price_receive_cents, state, input_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(row.command_id, row.account_id, row.local_id, row.stack_key, row.quantity, row.destination, row.price_receive_cents, row.state, row.input_json ?? null);
+    this.touch(row.account_id, 'command_member');
   }
 
-  commandMembers(commandId: string): CommandMemberRow[] {
-    return this.sqlite.prepare(`SELECT * FROM command_member WHERE command_id=?`).all(commandId) as CommandMemberRow[];
+  /** A command's members in the order they were written, each with the action its latest hop carries. */
+  commandMembers(commandId: string): CommandMemberView[] {
+    return this.sqlite.prepare(`SELECT m.*, (
+        SELECT s.action_id FROM work_step s WHERE s.command_id=m.command_id AND s.account_id=m.account_id AND s.local_id=m.local_id AND s.action_id IS NOT NULL
+        ORDER BY s.ordinal DESC LIMIT 1) AS action_id
+      FROM command_member m WHERE m.command_id=? ORDER BY m.rowid`).all(commandId) as CommandMemberView[];
   }
 
-  setCommandMember(commandId: string, accountId: string, memberId: string, patch: { state?: string; action_id?: string | null }): void {
-    if (patch.state !== undefined) {
-      this.sqlite.prepare(`UPDATE command_member SET state=? WHERE command_id=? AND account_id=? AND member_id=?`).run(patch.state, commandId, accountId, memberId);
-    }
-    if (patch.action_id !== undefined) {
-      this.sqlite.prepare(`UPDATE command_member SET action_id=? WHERE command_id=? AND account_id=? AND member_id=?`).run(patch.action_id, commandId, accountId, memberId);
-    }
+  setCommandMember(commandId: string, accountId: string, memberId: string, patch: { state: CommandMemberState }): void {
+    this.sqlite.prepare(`UPDATE command_member SET state=? WHERE command_id=? AND account_id=? AND local_id=?`).run(patch.state, commandId, accountId, memberId);
+    this.touch(accountId, 'command_member');
   }
 
   canUpdateLocation(item: ItemRow, observation: ObservationRow): boolean {
@@ -495,59 +520,30 @@ export class EngineDatabase {
       location_generation=COALESCE(?,location_generation),
       last_seen_obs=CASE WHEN ?='MISSING' THEN last_seen_obs ELSE ? END WHERE account_id=? AND local_id=?`)
       .run(location, casketId, obsId, obs.generation, location, obsId, accountId, localId);
+    this.touch(accountId, 'item');
   }
 
   /** Why a `MISSING` row ended, once evidence names it (holdings plan D8). Never overwrites a reason. */
   setEndReason(accountId: string, localId: string, reason: 'sold' | 'traded' | 'consumed' | 'unknown'): void {
     this.sqlite.prepare(`UPDATE item SET end_reason=? WHERE account_id=? AND local_id=? AND location='MISSING' AND end_reason IS NULL`).run(reason, accountId, localId);
+    this.touch(accountId, 'item');
   }
 
   itemByLocalId(accountId: string, localId: string): ItemRow | undefined {
-    const visible = this.publishedInventoryVisibility(accountId);
-    return this.sqlite.prepare(`
-      SELECT * FROM ${this.inventoryReadTable('item', accountId)} WHERE account_id=? AND local_id=?${visible.sql}
-    `).get(accountId, localId, ...visible.params) as ItemRow | undefined;
+    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? AND local_id=?`).get(accountId, localId) as ItemRow | undefined;
   }
 
   itemByAssetId(accountId: string, assetId: string): ItemRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? AND current_asset_id=?`).get(accountId, assetId) as ItemRow | undefined;
+    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? AND asset_id=?`).get(accountId, assetId) as ItemRow | undefined;
   }
 
   items(accountId: string): ItemRow[] {
-    const visible = this.publishedInventoryVisibility(accountId);
-    return this.sqlite.prepare(`
-      SELECT * FROM ${this.inventoryReadTable('item', accountId)} WHERE account_id=?${visible.sql} ORDER BY local_id
-    `).all(accountId, ...visible.params) as ItemRow[];
-  }
-
-  /**
-   * Reader-facing inventory table. While a snapshot is staging, MAIN rows come from the
-   * last published backup; CASKET/MISSING stay on the live table. When nothing is staging this
-   * is the base table so a 200k COUNT can use the ordinary indexes.
-   */
-  inventoryReadTable(table: 'item', accountId: string): string {
-    if (this.publication(accountId, 'gc-inventory', '')?.staging_state !== 'STAGING') return table;
-    const quoted = (this.sqlite.prepare('SELECT quote(?) AS q').get(accountId) as { q: string }).q;
-    return `(SELECT * FROM ${table} WHERE account_id=${quoted} AND location IN ('CASKET','MISSING')
-      UNION ALL SELECT * FROM inventory_backup_${table} WHERE account_id=${quoted})`;
-  }
-
-  /**
-   * Hide MAIN rows from an unpublished staging generation. MISSING stays visible:
-   * an unresolved fingerprint or a concluded absence is still the last known identity.
-   */
-  publishedInventoryVisibility(accountId: string): { sql: string; params: number[] } {
-    const published = this.publication(accountId, 'gc-inventory', '')?.published_generation;
-    if (published == null) return { sql: '', params: [] };
-    return { sql: ` AND (location IN ('CASKET','MISSING') OR row_generation=?)`, params: [published] };
+    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? ORDER BY local_id`).all(accountId) as ItemRow[];
   }
 
   /** Units in main inventory, of either kind, by quantity. */
   countMainItems(accountId: string): number {
-    const visible = this.publishedInventoryVisibility(accountId);
-    const row = this.sqlite.prepare(`
-      SELECT COALESCE(SUM(quantity),0) AS count FROM ${this.inventoryReadTable('item', accountId)} WHERE account_id=? AND location='MAIN'${visible.sql}
-    `).get(accountId, ...visible.params) as { count: number };
+    const row = this.sqlite.prepare(`SELECT COALESCE(SUM(quantity),0) AS count FROM item WHERE account_id=? AND location='MAIN'`).get(accountId) as { count: number };
     return row.count;
   }
 
@@ -557,7 +553,7 @@ export class EngineDatabase {
     targetId: string;
     intent: string;
     params: unknown;
-    basis: string;
+    commandId: string | null;
     actionKind: string;
     resourceKey: string;
     now: string;
@@ -573,9 +569,9 @@ export class EngineDatabase {
       if (current) this.retireUnsent(current.id, input.now);
       if (input.resourceKey.startsWith('item:') && this.unresolvedInFlight(input.accountId, input.resourceKey)) throw new Error('Item has an unresolved in-flight action; declare a goal to supersede its intent');
       this.sqlite.prepare(`
-        INSERT INTO desired_state(id, account_id, target_kind, target_id, version, intent, params_json, basis, created_at)
+        INSERT INTO desired_state(id, account_id, target_kind, target_id, version, intent, params_json, command_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(desiredId, input.accountId, input.targetKind, input.targetId, version, input.intent, JSON.stringify(input.params), input.basis, input.now);
+      `).run(desiredId, input.accountId, input.targetKind, input.targetId, version, input.intent, JSON.stringify(input.params), input.commandId, input.now);
       const actionId = randomUUID();
       this.sqlite.prepare(`
         INSERT INTO action(id, account_id, kind, target_id, desired_version, desired_id, state, resource_key, created_at, updated_at, params_json)
@@ -606,7 +602,7 @@ export class EngineDatabase {
     targetId: string;
     intent: string;
     params: unknown;
-    basis: string;
+    commandId: string | null;
     now: string;
   }): DesiredStateRow {
     return this.transaction(() => {
@@ -618,43 +614,46 @@ export class EngineDatabase {
       if (current) this.sqlite.prepare(`UPDATE desired_state SET superseded_by=? WHERE id=?`).run(desiredId, current.id);
       if (current) this.retireUnsent(current.id, input.now);
       this.sqlite.prepare(`
-        INSERT INTO desired_state(id, account_id, target_kind, target_id, version, intent, params_json, basis, created_at)
+        INSERT INTO desired_state(id, account_id, target_kind, target_id, version, intent, params_json, command_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(desiredId, input.accountId, input.targetKind, input.targetId, version, input.intent, paramsJson, input.basis, input.now);
+      `).run(desiredId, input.accountId, input.targetKind, input.targetId, version, input.intent, paramsJson, input.commandId, input.now);
       return this.desiredState(desiredId)!;
     });
   }
 
   /** Effect-layer row for a goal that already exists. Never used to store a future sequence. */
-  enqueueAction(input: {
-    accountId: string;
-    desiredId: string;
-    desiredVersion: number;
-    actionKind: string;
-    targetId: string;
-    resourceKey: string;
-    params: unknown;
-    now: string;
-  }): ActionRow {
+  /**
+   * Queues one action. It carries a standing intent (`desiredId`) or one hop of a command
+   * (`stepId`), never both (consolidation plan D3); a step-carried action has no goal to be
+   * suspended, superseded or to expire, and its step says what it is for.
+   */
+  enqueueAction(input: EnqueueActionInput): ActionRow {
     return this.transaction(() => {
-      if (this.inFlight(input.accountId, input.resourceKey)) {
+      if (input.resourceKey.startsWith('item:')) {
+        // A holding's one action (D3). A request not yet sent, or proved absent and waiting its
+        // resend, gives way to the newer one, as a goal's unsent action did; an attempt no walk
+        // has explained cannot be built on (N-SELL-04), and one a walk explained may be.
+        this.retireReady(input.accountId, input.resourceKey, input.now);
+        if (this.unresolvedInFlight(input.accountId, input.resourceKey)) throw new Error('Item has an unresolved in-flight action; wait for the walk that explains it');
+      } else if (this.inFlight(input.accountId, input.resourceKey)) {
         throw new Error(`Resource ${input.resourceKey} already has an in-flight action`);
       }
       const actionId = randomUUID();
       this.sqlite.prepare(`
-        INSERT INTO action(id, account_id, kind, target_id, desired_version, desired_id, state, resource_key, created_at, updated_at, params_json)
-        VALUES (?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?)
+        INSERT INTO action(id, account_id, kind, target_id, desired_version, desired_id, state, resource_key, created_at, updated_at, params_json, step_id)
+        VALUES (?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, ?)
       `).run(
         actionId,
         input.accountId,
         input.actionKind,
         input.targetId,
-        input.desiredVersion,
-        input.desiredId,
+        'stepId' in input ? 0 : input.desiredVersion,
+        'stepId' in input ? null : input.desiredId,
         input.resourceKey,
         input.now,
         input.now,
-        JSON.stringify(input.params)
+        JSON.stringify(input.params),
+        'stepId' in input ? input.stepId : null
       );
       return this.action(actionId)!;
     });
@@ -686,6 +685,12 @@ export class EngineDatabase {
     return Boolean(row);
   }
 
+  /** Whether a store or retrieve of ours has gone out on this item and is not settled yet. Asked per GC item event. */
+  casketMoveOut(accountId: string, localId: string): boolean {
+    return this.sqlite.prepare(`SELECT 1 FROM action WHERE account_id=? AND state IN ('RUNNING','AWAITING_OBSERVATION')
+      AND kind IN ('STORE_IN_CASKET','RETRIEVE_FROM_CASKET') AND target_id=? LIMIT 1`).get(accountId, localId) !== undefined;
+  }
+
   /**
    * An attempt on this resource whose outcome no observation has explained yet.
    *
@@ -700,6 +705,26 @@ export class EngineDatabase {
       SELECT 1 AS hit FROM action WHERE account_id=? AND resource_key=? AND state IN ${IN_FLIGHT_STATES} AND resolved_by_obs IS NULL
     `).get(accountId, resourceKey) as { hit: number } | undefined;
     return Boolean(row);
+  }
+
+  /** An attempt sent for the resource that no observation has explained yet: a mutation nobody can yet account for. */
+  unexplainedAttempt(accountId: string, resourceKey: string): boolean {
+    const row = this.sqlite.prepare(`
+      SELECT 1 AS hit FROM action WHERE account_id=? AND resource_key=? AND state IN ('RUNNING','AWAITING_OBSERVATION') AND resolved_by_obs IS NULL
+    `).get(accountId, resourceKey) as { hit: number } | undefined;
+    return Boolean(row);
+  }
+
+  /** Fails the unsent actions on a resource as superseded by a newer request, and the hops they carry with them. */
+  private retireReady(accountId: string, resourceKey: string, now: string): void {
+    const ready = this.sqlite.prepare(`SELECT id FROM action WHERE account_id=? AND resource_key=? AND state='READY'`).all(accountId, resourceKey) as Array<{ id: string }>;
+    if (!ready.length) return;
+    const work = new WorkStore(this);
+    for (const { id } of ready) {
+      this.setActionState(id, 'FAILED', now, 'superseded');
+      const step = work.byAction(id);
+      if (step && !isSettled(step)) work.failHop(step, 'Superseded by a later request', now);
+    }
   }
 
   inFlightAction(accountId: string, resourceKey: string): ActionRow | undefined {
@@ -724,6 +749,38 @@ export class EngineDatabase {
     return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? ORDER BY created_at, id`).all(accountId) as ActionRow[];
   }
 
+  /**
+   * The account's actions awaiting observation, oldest first, less the hops of these commands. A
+   * command whose dispatch is running proves its own round, so proof demand leaves its hops out
+   * here rather than asking each one's owner what it needs and then dropping it: a store of 968
+   * asked that, a few queries each, of every waiting store on every answer.
+   */
+  awaitingActionsOutside(accountId: string, commandIds: readonly string[]): ActionRow[] {
+    if (commandIds.length === 0) return this.actions(accountId, 'AWAITING_OBSERVATION');
+    return this.sqlite.prepare(`SELECT a.* FROM action a WHERE a.account_id=? AND a.state='AWAITING_OBSERVATION'
+      AND NOT EXISTS (SELECT 1 FROM work_step s WHERE s.id=a.step_id AND s.command_id IN (SELECT value FROM json_each(?)))
+      ORDER BY a.created_at, a.id`).all(accountId, JSON.stringify(commandIds)) as ActionRow[];
+  }
+
+  /**
+   * The account's actions awaiting observation of these kinds, oldest first. A reconciler that
+   * settles two kinds asks for those two: loading every waiting action to skip the rest cost each
+   * settle of a bulk store a row per waiting move.
+   */
+  awaitingActionsOfKinds(accountId: string, kinds: readonly string[]): ActionRow[] {
+    return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? AND state='AWAITING_OBSERVATION'
+      AND kind IN (SELECT value FROM json_each(?)) ORDER BY created_at, id`).all(accountId, JSON.stringify(kinds)) as ActionRow[];
+  }
+
+  /**
+   * The account's actions awaiting observation that are about one of these items, and every rename,
+   * oldest first: what an item event can settle. The key list is one JSON value, however long.
+   */
+  awaitingActionsAbout(accountId: string, targetIds: readonly string[]): ActionRow[] {
+    return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? AND state='AWAITING_OBSERVATION'
+      AND (kind='RENAME_CASKET' OR target_id IN (SELECT value FROM json_each(?))) ORDER BY created_at, id`).all(accountId, JSON.stringify(targetIds)) as ActionRow[];
+  }
+
   startAttempt(actionId: string, now: string): string {
     const attemptId = randomUUID();
     this.transaction(() => {
@@ -741,7 +798,8 @@ export class EngineDatabase {
     this.transaction(() => {
       const action = this.action(actionId);
       if (!action) throw new Error(`Unknown action ${actionId}`);
-      const desired = this.sqlite.prepare(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null };
+      const desired = action.desired_id === null ? { superseded_by: null }
+        : this.sqlite.prepare(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null };
       const state = outcome === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION';
       this.sqlite.prepare(`UPDATE attempt SET finished_at=?, outcome=?, response_ref=? WHERE id=?`).run(now, outcome, JSON.stringify(response), attemptId);
       this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, desired.superseded_by ? 'superseded' : error ?? null, actionId);
@@ -752,12 +810,20 @@ export class EngineDatabase {
     this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, error ?? null, actionId);
   }
 
+  /** The goal a goal-carried action belongs to; a step-carried action has none, and this says so. */
+  goalOf(action: ActionRow): string {
+    if (action.desired_id === null) throw new Error(`Action ${action.id} carries a step, not a goal`);
+    return action.desired_id;
+  }
+
   currentDesired(action: ActionRow): boolean {
+    if (action.desired_id === null) return true;
     const row = this.sqlite.prepare(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null } | undefined;
     return row?.superseded_by === null;
   }
 
   desiredParams(action: ActionRow): unknown {
+    if (action.desired_id === null) return JSON.parse(action.params_json ?? 'null') as unknown;
     const row = this.sqlite.prepare(`SELECT params_json FROM desired_state WHERE id=?`).get(action.desired_id) as { params_json: string };
     return JSON.parse(row.params_json);
   }
@@ -765,6 +831,7 @@ export class EngineDatabase {
   addEvent(accountId: string, kind: string, payload: unknown, now: string): void {
     this.sqlite.prepare(`INSERT INTO event(id, account_id, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), accountId, kind, JSON.stringify(payload), now);
+    this.touch(accountId, 'event');
   }
 
   /**
@@ -781,6 +848,7 @@ export class EngineDatabase {
     if (seen) return;
     this.sqlite.prepare(`INSERT INTO event(id, account_id, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), accountId, kind, json, now);
+    this.touch(accountId, 'event');
   }
 
   events(accountId: string): Array<{ id: string; kind: string; payload_json: string; at: string }> {
@@ -795,22 +863,9 @@ export class EngineDatabase {
     return this.sqlite.prepare(`SELECT * FROM attempt WHERE action_id=? ORDER BY rowid DESC LIMIT 1`).get(actionId) as AttemptRow | undefined;
   }
 
-  openOrder(action: ActionRow, venue: string, now: string): string {
-    const existing = this.sqlite.prepare(`SELECT order_id FROM venue_order WHERE account_id=? AND action_id=?`).get(action.account_id, action.id) as { order_id: string } | undefined;
-    const conflict = this.sqlite.prepare(`SELECT 1 FROM venue_order WHERE account_id=? AND local_id=? AND side='SELL'
-          AND state NOT LIKE 'ENDED_%' AND order_id<>?`).get(action.account_id, action.target_id, existing?.order_id ?? '');
-    if (conflict) throw new Error('Item already has an open or unexplained order');
-    if (existing) {
-      this.sqlite.prepare(`UPDATE venue_order SET state='SUBMITTED', ended_at=NULL, end_reason=NULL, end_evidence=NULL WHERE account_id=? AND order_id=?`).run(action.account_id, existing.order_id);
-      return existing.order_id;
-    }
-    const orderId = randomUUID();
-    this.sqlite.prepare(`INSERT INTO venue_order(account_id,order_id,venue,side,local_id,price_receive_cents,opened_at,
-      opened_from_intent,intent_version,action_id,managed,state,venue_detail_json) VALUES (?,?,?,'SELL',?,?,?,?,?,?,1,'SUBMITTED',?)`)
-      .run(action.account_id, orderId, venue, action.target_id, (this.actionParams(action) as { priceReceiveCents: number }).priceReceiveCents,
-        now, action.desired_id, action.desired_version, action.id,
-        JSON.stringify({ assetId: this.itemByLocalId(action.account_id, action.target_id)?.current_asset_id }));
-    return orderId;
+  /** Our own sell order, opened as the create attempt starts (`OrderStore.open`). */
+  openOrder(action: ActionRow, venue: OrderVenue, now: string): string {
+    return new OrderStore(this).open(action, venue, now);
   }
 
   resolveAction(action: ActionRow, observationId: number, applied: boolean, now: string): void {
@@ -818,8 +873,7 @@ export class EngineDatabase {
     const state = applied ? 'DONE' : this.currentDesired(action) ? 'READY' : 'FAILED';
     this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, resolved_by_obs=?, resolution=?, error=? WHERE id=?`)
       .run(state, now, observationId, applied ? 'OBSERVED_APPLIED' : 'OBSERVED_NOT_APPLIED', applied ? null : 'complete-observation-proved-not-applied', action.id);
-    if (!applied) this.sqlite.prepare(`UPDATE venue_order SET state='ENDED_NOT_APPLIED', ended_at=?, end_evidence=?, confidence='proven',
-      end_reason='Complete observation proved request absent' WHERE account_id=? AND action_id=? AND first_open_obs IS NULL`).run(now, observationId, action.account_id, action.id);
+    if (!applied) new OrderStore(this).endNotApplied(action, observationId, now);
   }
 
   suspendGoal(accountId: string, desiredId: string, reason: string, now: string, blockedUntil: string | null = null): void {
@@ -835,117 +889,80 @@ export class EngineDatabase {
       const id = randomUUID();
       this.sqlite.prepare(`UPDATE desired_state SET superseded_by=? WHERE account_id=? AND id=?`).run(id, accountId, desiredId);
       this.retireUnsent(desiredId, now);
-      this.sqlite.prepare(`INSERT INTO desired_state(id,account_id,target_kind,target_id,version,intent,params_json,basis,created_at,authority,expires_at)
+      this.sqlite.prepare(`INSERT INTO desired_state(id,account_id,target_kind,target_id,version,intent,params_json,command_id,created_at,authority,expires_at)
         VALUES (?,?,?,?,?,?,?,?,?,'HUMAN',?)`).run(id, accountId, goal.target_kind, goal.target_id, goal.version + 1,
-          resolution === 'resume' ? goal.intent : 'NONE', goal.params_json, `human-${resolution}`, now, new Date(Date.parse(now) + 7 * 86400_000).toISOString());
+          resolution === 'resume' ? goal.intent : 'NONE', goal.params_json, null, now, new Date(Date.parse(now) + 7 * 86400_000).toISOString());
       return this.desiredState(id)!;
     });
   }
 
-  publication(accountId: string, surface: string, scopeId: string): PublicationRow | undefined {
-    return this.sqlite.prepare(`
-      SELECT * FROM inventory_publication WHERE account_id=? AND surface=? AND scope_id=?
-    `).get(accountId, surface, scopeId) as PublicationRow | undefined;
+  // --- Selection drafts ---------------------------------------------------
+
+  /**
+   * A selection capture is a command in `DRAFT` (kind `SELECTION`) whose members are the frozen
+   * set (consolidation plan §4.4): the window holds its token and submits it as the members of an
+   * executable command, which copies them. `preparing` is 1 while a matching capture is still
+   * writing pages; a capture that could not finish is `STOPPED` with the reason, and one a crash
+   * interrupted is `REJECTED` on the next open, as any interrupted preparation is.
+   */
+  insertDraft(token: string, accountIds: readonly string[], filter: unknown, now: string, preparing: boolean): void {
+    this.insertCommand({ id: token, correlation_id: randomUUID(), kind: SELECTION_KIND, state: 'DRAFT', reject_reason: null, created_at: now,
+      preparing: preparing ? 1 : 0, manifest_token: null, observed_completed: 0, revision: 1, filter_json: JSON.stringify({ accountIds, filter: filter ?? {} }) });
   }
 
-  beginStaging(accountId: string, surface: string, scopeId: string, generation: number): number {
-    if (surface === 'gc-inventory' && scopeId === '' && this.publication(accountId, surface, scopeId)?.staging_state !== 'STAGING') {
-      this.sqlite.prepare(`DELETE FROM inventory_backup_item WHERE account_id=?`).run(accountId);
-      this.sqlite.prepare(`INSERT INTO inventory_backup_item SELECT * FROM item WHERE account_id=? AND location NOT IN ('CASKET','MISSING')`).run(accountId);
-    }
-    this.sqlite.prepare(`
-      INSERT INTO inventory_publication(account_id, surface, scope_id, published_generation, staging_generation, staging_state, published_at)
-      VALUES (?, ?, ?, NULL, ?, 'STAGING', NULL)
-      ON CONFLICT(account_id, surface, scope_id) DO UPDATE SET staging_generation=excluded.staging_generation, staging_state='STAGING'
-    `).run(accountId, surface, scopeId, generation);
-    return generation;
+  draft(token: string): CommandRow | undefined {
+    const row = this.command(token);
+    return row?.kind === SELECTION_KIND ? row : undefined;
   }
 
-  abortStaging(accountId: string, surface: string, scopeId: string, generation: number): void {
-    if (surface === 'gc-inventory' && scopeId === '') {
-      const columns = (this.sqlite.prepare(`PRAGMA table_info(item)`).all() as Array<{ name: string }>).map(row => row.name);
-      this.sqlite.prepare(`INSERT INTO item SELECT * FROM inventory_backup_item WHERE account_id=?
-        ON CONFLICT(local_id) DO UPDATE SET ${columns.map(name => `${name}=excluded.${name}`).join(',')}`).run(accountId);
-      this.sqlite.prepare(`DELETE FROM inventory_backup_item WHERE account_id=?`).run(accountId);
-    }
-    this.sqlite.prepare(`
-      UPDATE inventory_publication SET staging_state='INACTIVE', staging_generation=NULL
-      WHERE account_id=? AND surface=? AND scope_id=? AND staging_generation=?
-    `).run(accountId, surface, scopeId, generation);
-    this.sqlite.prepare(`
-      DELETE FROM item WHERE account_id=? AND row_generation=? AND location<>'CASKET'
-    `).run(accountId, generation);
-    // Rows first seen by the aborted walk are gone; their accessory rows must not outlive them.
-    this.sqlite.prepare(`DELETE FROM item_accessory WHERE account_id=? AND local_id NOT IN (SELECT local_id FROM item WHERE account_id=?)`).run(accountId, accountId);
+  insertDraftMember(token: string, member: DraftMember): void {
+    this.insertCommandMember({ command_id: token, account_id: member.accountId, local_id: member.localId ?? member.stackKey ?? randomUUID(),
+      stack_key: member.stackKey ?? null, quantity: member.quantity, destination: null, price_receive_cents: null, state: 'DRAFT', input_json: JSON.stringify(member) });
   }
 
-  publishGeneration(accountId: string, surface: string, scopeId: string, generation: number): void {
-    if (surface === 'gc-inventory' && scopeId === '') this.sqlite.prepare(`DELETE FROM inventory_backup_item WHERE account_id=?`).run(accountId);
-    this.sqlite.prepare(`
-      INSERT INTO inventory_publication(account_id, surface, scope_id, published_generation, staging_generation, staging_state, published_at)
-      VALUES (?, ?, ?, ?, NULL, 'INACTIVE', datetime('now'))
-      ON CONFLICT(account_id, surface, scope_id) DO UPDATE SET
-        published_generation=excluded.published_generation, staging_generation=NULL, staging_state='INACTIVE', published_at=excluded.published_at
-    `).run(accountId, surface, scopeId, generation);
+  /** A draft's members in account and member order: one page after a key, or all of them. */
+  draftMembers(token: string, page?: { after: readonly [string, string]; limit: number }): DraftMemberRow[] {
+    const rows = (page
+      ? this.sqlite.prepare(`SELECT account_id, local_id, input_json FROM command_member WHERE command_id=? AND state='DRAFT' AND (account_id, local_id)>(?, ?)
+          ORDER BY account_id, local_id LIMIT ?`).all(token, page.after[0], page.after[1], page.limit)
+      : this.sqlite.prepare(`SELECT account_id, local_id, input_json FROM command_member WHERE command_id=? AND state='DRAFT' ORDER BY account_id, local_id`).all(token)
+    ) as Array<{ account_id: string; local_id: string; input_json: string | null }>;
+    return rows.map((row) => ({ ...(JSON.parse(row.input_json ?? '{}') as DraftMember), accountId: row.account_id, memberId: row.local_id }));
   }
 
-  insertSelectionManifest(row: SelectionManifestRow): void {
-    this.sqlite.prepare(`
-      INSERT INTO selection_manifest(token, revision, state, account_ids_json, filter_json, created_at, handle_count, quantity_total)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.token, row.revision, row.state, row.account_ids_json, row.filter_json, row.created_at, row.handle_count, row.quantity_total);
+  draftCounts(token: string): { handles: number; quantity: number } {
+    return this.sqlite.prepare(`SELECT COUNT(*) AS handles, COALESCE(SUM(quantity),0) AS quantity FROM command_member WHERE command_id=? AND state='DRAFT'`)
+      .get(token) as { handles: number; quantity: number };
   }
 
-  selectionManifest(token: string): SelectionManifestRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM selection_manifest WHERE token=?`).get(token) as SelectionManifestRow | undefined;
+  /** Drops members from a draft and counts a new revision, so the token submitted with the old one is refused as stale. */
+  excludeDraftMembers(token: string, exclude: ReadonlyArray<{ accountId: string; memberId: string }>): void {
+    this.transaction(() => {
+      const remove = this.sqlite.prepare(`DELETE FROM command_member WHERE command_id=? AND account_id=? AND local_id=? AND state='DRAFT'`);
+      for (const member of exclude) remove.run(token, member.accountId, member.memberId);
+      for (const accountId of new Set(exclude.map((member) => member.accountId))) this.touch(accountId, 'command_member');
+      this.sqlite.prepare('UPDATE command SET revision=revision+1 WHERE id=?').run(token);
+    });
   }
 
-  updateSelectionManifest(token: string, patch: Partial<Pick<SelectionManifestRow, 'revision' | 'state' | 'handle_count' | 'quantity_total'>>): void {
-    if (patch.revision !== undefined) this.sqlite.prepare(`UPDATE selection_manifest SET revision=? WHERE token=?`).run(patch.revision, token);
-    if (patch.state !== undefined) this.sqlite.prepare(`UPDATE selection_manifest SET state=? WHERE token=?`).run(patch.state, token);
-    if (patch.handle_count !== undefined) this.sqlite.prepare(`UPDATE selection_manifest SET handle_count=? WHERE token=?`).run(patch.handle_count, token);
-    if (patch.quantity_total !== undefined) this.sqlite.prepare(`UPDATE selection_manifest SET quantity_total=? WHERE token=?`).run(patch.quantity_total, token);
-  }
-
-  insertSelectionMember(row: SelectionMemberRow): void {
-    this.sqlite.prepare(`
-      INSERT INTO selection_member(token, revision, account_id, member_id, stack_key, location, casket_id, quantity)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.token, row.revision, row.account_id, row.member_id, row.stack_key, row.location, row.casket_id, row.quantity);
-  }
-
-  selectionMembers(token: string, revision: number): SelectionMemberRow[] {
-    return this.sqlite.prepare(`
-      SELECT * FROM selection_member WHERE token=? AND revision=? ORDER BY account_id, member_id
-    `).all(token, revision) as SelectionMemberRow[];
-  }
-
-  /** Freezes matching rows in SQLite. The renderer never receives the member list. */
-  captureMatchingSelection(
+  /** Freezes matching rows into a draft in SQLite. The renderer never receives the member list. */
+  captureMatchingDraft(
     token: string,
-    revision: number,
     accountIds: readonly string[],
     filter?: { search?: string; location?: ItemRow['location'] }
   ): { handles: number; quantity: number } {
-    const insert = this.sqlite.prepare(`
-      INSERT INTO selection_member(token, revision, account_id, member_id, stack_key, location, casket_id, quantity)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
     let handles = 0;
     let quantity = 0;
     for (const accountId of accountIds) {
-      // One member per holding, of either kind. The published-generation predicate applies to
-      // individual rows only, as it does on the inventory page (`inventoryQuery`).
-      const visible = this.publishedInventoryVisibility(accountId);
+      // One member per holding, of either kind.
       const itemSql = `
         SELECT local_id, location, casket_id, quantity FROM item
         WHERE account_id=? AND location<>'MISSING'
-          AND (unit_kind='fungible' OR (unit_kind='individual'${visible.sql}))
         ${filter?.location ? 'AND location=?' : ''}
       `;
-      const itemParams: Array<string | number> = [accountId, ...visible.params, ...(filter?.location ? [filter.location] : [])];
+      const itemParams: Array<string | number> = [accountId, ...(filter?.location ? [filter.location] : [])];
       for (const row of this.sqlite.prepare(itemSql).all(...itemParams) as Array<{ local_id: string; location: string; casket_id: string | null; quantity: number }>) {
-        insert.run(token, revision, accountId, row.local_id, null, row.location, row.casket_id, row.quantity);
+        this.insertDraftMember(token, { accountId, localId: row.local_id, quantity: row.quantity, location: row.location, casketId: row.casket_id });
         handles += 1;
         quantity += row.quantity;
       }
@@ -956,8 +973,39 @@ export class EngineDatabase {
   // --- Observation coverage -----------------------------------------------
 
   checkpoint(accountId: string, surface: string, scopeId = ''): CheckpointRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM observation_checkpoint WHERE account_id=? AND surface=? AND scope_id=?`)
+    return this.sqlite.prepare(`SELECT account_id, surface, scope_id, cursor_json, covered_through, observation_id, updated_at
+      FROM surface_state WHERE account_id=? AND surface=? AND scope_id=? AND cursor_json IS NOT NULL`)
       .get(accountId, surface, scopeId) as CheckpointRow | undefined;
+  }
+
+  /**
+   * Counts a write to a paged surface (consolidation plan D9). The store that writes the table
+   * calls it in the same transaction, and a keyset cursor cut under the old count is refused
+   * (`read/queries/paging.ts`). There is no trigger: the engine is the sole writer, and
+   * `tests/unit/revision-sites.test.ts` holds every write site to this call.
+   */
+  touch(accountId: string, surface: string): void {
+    this.sqlite.prepare(`INSERT INTO surface_state(account_id, surface, scope_id, revision) VALUES (?, ?, '', 1)
+      ON CONFLICT(account_id, surface, scope_id) DO UPDATE SET revision=revision+1`).run(accountId, surface);
+  }
+
+  /**
+   * The duplicate-protection switch (consolidation plan D13): this desktop's preference, handed in
+   * by main when the runtime starts and on every change, steering admission across venues and
+   * persisted nowhere in the record. `version` counts the changes, so a step admitted under one
+   * setting can say which.
+   */
+  private protection = { preventDuplicates: true, version: 1 };
+  marketplaceProtection(): { preventDuplicates: boolean; version: number } { return { ...this.protection }; }
+  setMarketplaceProtection(enabled: boolean): void {
+    if (this.protection.preventDuplicates === enabled) return;
+    this.protection = { preventDuplicates: enabled, version: this.protection.version + 1 };
+  }
+
+  /** Every surface written at least once for the accounts, with its count: what a cursor is bound to. */
+  revisionMarks(accounts: readonly string[]): Array<{ account_id: string; surface: string; revision: number }> {
+    return this.sqlite.prepare(`SELECT account_id, surface, revision FROM surface_state WHERE account_id IN (${accounts.map(() => '?').join(',')}) AND revision>0
+      ORDER BY account_id, surface`).all(...accounts) as Array<{ account_id: string; surface: string; revision: number }>;
   }
 
   /**
@@ -972,7 +1020,7 @@ export class EngineDatabase {
     coveredThrough: string | null; observationId: number; now: string;
   }): void {
     this.sqlite.prepare(`
-      INSERT INTO observation_checkpoint(account_id, surface, scope_id, cursor_json, covered_through, observation_id, updated_at)
+      INSERT INTO surface_state(account_id, surface, scope_id, cursor_json, covered_through, observation_id, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(account_id, surface, scope_id) DO UPDATE SET cursor_json=excluded.cursor_json,
         covered_through=excluded.covered_through, observation_id=excluded.observation_id, updated_at=excluded.updated_at
@@ -990,11 +1038,11 @@ export class EngineDatabase {
       WHERE desired_id=? AND state='READY'`).run(now, desiredId);
   }
 
-  private recoverInterruptedActions(): void {
+  private recoverInterruptedActions(now: string): void {
     this.sqlite.prepare("UPDATE command SET state='REJECTED',reject_reason='Preparation interrupted before admission',preparing=0 WHERE preparing=1").run();
     this.sqlite.prepare(`
-      UPDATE action SET state='AWAITING_OBSERVATION', error='process-interrupted-before-outcome', updated_at=datetime('now')
+      UPDATE action SET state='AWAITING_OBSERVATION', error='process-interrupted-before-outcome', updated_at=?
       WHERE state='RUNNING'
-    `).run();
+    `).run(now);
   }
 }

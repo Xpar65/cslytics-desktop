@@ -9,7 +9,7 @@ export type ItemRow = {
   paint_seed: number | null;
   quality: number;
   stable_key: string;
-  current_asset_id: string | null;
+  asset_id: string | null;
   location: 'MAIN' | 'CASKET' | 'MISSING';
   casket_id: string | null;
   tradable_after: string | null;
@@ -41,7 +41,8 @@ export type WalletRow = {
   observed_at: string;
   balance_cents: number;
   delayed_balance_cents: number;
-  currency: number;
+  /** Steam's currency id, or null for a wallet whose currency no read has named: never assumed. */
+  currency: number | null;
 };
 
 export type StorageUnitRow = {
@@ -58,7 +59,6 @@ export type MarketState = {
   latestObservation: { id: number; complete: number; finished_at: string; total_expected: number | null } | undefined;
 };
 
-export type TimelineEntry = { id: string; kind: string; payload: unknown; at: string };
 
 export type GoalConflict = { id: string; targetId: string; reason: string; blockedUntil: string | null; suspendedAt: string };
 export type GoalPreview = { localId: string; kind: string; action?: string; reason?: string; because?: unknown; surface?: string; scope?: { kind: string; id?: string } };
@@ -72,12 +72,19 @@ export type GoalPreview = { localId: string; kind: string; action?: string; reas
  */
 export type SurfaceEvidence = { observedAt: string | null; settled: boolean };
 
+/** A venue balance: spendable now, and what the venue is still holding, in `currency`. */
+export type VenueWallet = { currency: number; availableCents: number; pendingCents: number; observedAt: string };
+
 export type AccountHoldings = {
   accountId: string;
   accountName: string;
   steamId64: string;
+  /** The Steam wallet's currency, and so every Steam figure's. The CSFloat wallet carries its own. */
   currency: number | null;
+  /** The Steam wallet: `balanceCents` is spendable, `delayedBalanceCents` is pending. */
   wallet: { balanceCents: number; delayedBalanceCents: number; observedAt: string } | null;
+  /** The CSFloat balance for the connection that exists now; null with no key or no read (CSF-04). */
+  csfloatWallet: VenueWallet | null;
   reservedCents: number;
   /** An order opened on the Steam website commits the same balance; counted, never reserved (BUY-02). */
   externalCommitmentCents?: number;

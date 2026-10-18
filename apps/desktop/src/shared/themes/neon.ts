@@ -80,9 +80,20 @@ export const neon: Theme = {
     '--wear-bs': '#FF4D6D',
 
     '--cs-hold-wallet': '#5B8CFF',
+    '--cs-hold-csfloat': '#FF9D4D',
+    '--cs-hold-inventory': '#7CF57A',
     '--cs-hold-listed': '#2DE0C8',
     '--cs-hold-unconfirmed': '#E37BFF',
     '--cs-hold-hatch': 'rgba(255, 255, 255, 0.45)',
+
+    '--cs-series-1': '#5B8CFF',
+    '--cs-series-2': '#2DE0C8',
+    '--cs-series-3': '#E37BFF',
+    '--cs-series-4': '#FF9D4D',
+    '--cs-series-5': '#E8D27A',
+    '--cs-series-6': '#FF4D6D',
+    '--cs-series-7': '#22E4F5',
+    '--cs-series-8': '#9A8FB8',
 
     '--cs-avatar-bg-sl': '45% 20%',
     '--cs-avatar-ring-sl': '70% 45%',

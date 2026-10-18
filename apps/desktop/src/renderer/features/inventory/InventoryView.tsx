@@ -85,13 +85,15 @@ const HIGHLIGHT_CAP = 1_000;
  * as much as a skin: forty cases are forty rows to tick, as they are forty tiles. The inspector on the right is the same panel the tile view uses: click a copy
  * to see the skin and the actions that copy actually allows.
  */
-export function InventoryView({ accountIds, accounts = [], selection, onSelection, selectionOnly = false }: {
+export function InventoryView({ accountIds, accounts = [], selection, onSelection, selectionOnly = false, onOpenItem }: {
   accountIds: string[];
   /** Names (and optional avatar refs and Steam ids) for the ids, so a row can say which account owns it. */
-  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; steamId64?: string | null | undefined }> | undefined;
+  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; steamId64?: string | null | undefined; currency?: number | null | undefined }> | undefined;
   selection: InventorySelection;
   onSelection: (next: InventorySelection) => void;
   selectionOnly?: boolean;
+  /** Opens the item page for a market name: the book, the history and the curve (plan §7). */
+  onOpenItem?: ((name: string) => void) | undefined;
 }): React.JSX.Element {
   const { chips, setChips, scope, queryScope, scopeAccounts } = useScopedChips(accountIds, accounts);
   const [view, setView] = useState<'grouped' | 'tiles'>(() => (
@@ -365,6 +367,7 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
       selection={selection}
       subject={subject}
       busyKeys={busyKeys}
+      onOpenItem={onOpenItem}
       onMessage={setMessage}
       destinations={destinations}
       onDestinations={setDestinations}
@@ -459,7 +462,7 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
       rail={filterRail}
     >
       <div className="toolbar page-controls">
-        <FilterBar chips={chips} onChange={setChips} accounts={scopeAccounts} units={scopeUnits} />
+        <FilterBar chips={chips} onChange={setChips} accounts={scopeAccounts} units={scopeUnits} holdingsOf={queryScope.split('\0')} />
         {view === 'tiles'
           ? <SortControl label="Sort items by" options={TILE_SORTS} value={tileSort} direction={tileDirection} onSort={setTileSort} onDirection={setTileDirection} />
           : <SortControl label="Sort item groups by" options={GROUP_SORTS} value={groupSort} direction={groupDirection} onSort={setGroupSort} onDirection={setGroupDirection} />}

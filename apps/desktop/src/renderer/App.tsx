@@ -8,10 +8,13 @@ import type {
   AccountHoldings,
   ConnectionReport
 } from './lib/types.js';
-import { formatCents } from './lib/format.js';
+import { formatAmount } from './lib/money.js';
 import { describeConnection } from './lib/connection.js';
 import { plural } from './lib/labels.js';
 import { heldCounts } from './lib/portfolio.js';
+import { refreshCurrency } from './lib/currency.js';
+import { PortfolioPage } from './features/portfolio/PortfolioPage.jsx';
+import { ItemsView } from './features/items/ItemsView.jsx';
 import { SignIn } from './features/accounts/SignIn.jsx';
 import { AccountBar } from './features/accounts/AccountBar.jsx';
 import { AccountsPanel, type AccountCard } from './features/accounts/AccountsPanel.jsx';
@@ -56,6 +59,7 @@ const SECTIONS: ReadonlyArray<SectionEntry> = [
   { id: 'portfolio', label: 'Portfolio', icon: 'dashboard', perAccount: false, group: 'Overview', blurb: 'Everything observed across your accounts' },
   { id: 'inventory', label: 'Inventory', icon: 'package', perAccount: false, group: 'Overview', blurb: 'Items by name, wherever they are' },
   { id: 'trades', label: 'Trades', icon: 'arrow-left-right', perAccount: false, group: 'Overview', blurb: 'Current and past trades, and what each was for' },
+  { id: 'items', label: 'Items', icon: 'trending-up', perAccount: false, group: 'Overview', blurb: 'Any market item: its order book, its price history and its float curve' },
   { id: 'listings', label: 'Listings', icon: 'layers', perAccount: false, group: 'Markets', blurb: 'Everything listed, on every account and venue' },
   { id: 'buy-orders', label: 'Buy orders', icon: 'shopping-cart', perAccount: false, group: 'Markets', blurb: 'Every open buy order, on every account and venue' },
   { id: 'store', label: 'Store', icon: 'tag', perAccount: true, group: 'Markets', blurb: 'Keys, tools and passes from the CS2 in-game store' },
@@ -110,6 +114,11 @@ export function App(): React.JSX.Element {
   /** `null` is the all-accounts scope; otherwise the account every per-account tab is showing. */
   const [scope, setScope] = useState<string | null>(null);
   const [section, setSection] = useState<Section>('portfolio');
+  /**
+   * The Items page's open market name, and the page it was opened from, which is where its Back
+   * goes. `from` is null when the page was reached from the sidebar: there is nowhere to go back to.
+   */
+  const [itemView, setItemView] = useState<{ name: string | null; from: Section | null }>({ name: null, from: null });
   /** The Records page's open tab. Kept here rather than in the page, which remounts on every scope change. */
   const [recordTab, setRecordTab] = useState<RecordTab>('orders');
   const [signingIn, setSigningIn] = useState<SignInTarget | null>(null);
@@ -157,8 +166,12 @@ export function App(): React.JSX.Element {
 
   const accountIds = useMemo(() => accounts.map((entry) => entry.accountId), [accounts]);
   const accountNames = useMemo(
-    () => accounts.map((entry) => ({ id: entry.accountId, name: entry.accountName, avatarRef: entry.avatarRef, steamId64: entry.steamId64 })),
-    [accounts]
+    () => accounts.map((entry) => ({
+      id: entry.accountId, name: entry.accountName, avatarRef: entry.avatarRef, steamId64: entry.steamId64,
+      // The wallet currency, once a market read has named it: every Steam figure a page prints for the account is in it.
+      currency: holdings.find((row) => row.accountId === entry.accountId)?.currency ?? null
+    })),
+    [accounts, holdings]
   );
   const activeAccount = accounts.find((entry) => entry.accountId === scope) ?? null;
   const key = activeAccount?.accountId ?? '';
@@ -187,6 +200,8 @@ export function App(): React.JSX.Element {
     setHoldings(nextHoldings);
     setConnections(nextConnections);
     setVenues(Object.fromEntries(nextVenues.filter((entry): entry is readonly [string, MarketplaceStatus] => entry !== null)));
+    // Main may have just pinned the base currency from the first wallet it saw (lib/currency.ts).
+    void refreshCurrency();
   }, []);
 
   /** One account's CSFloat status, as a Settings action just read it back. */
@@ -199,13 +214,14 @@ export function App(): React.JSX.Element {
   }, [refreshPortfolio, accountIds]);
 
   /** Runs one operation, keeping the status line honest about what happened. */
-  const run = useCallback(async (label: string, work: () => Promise<void>): Promise<void> => {
+  // `work` may answer with its own closing line, for an operation whose "done" is not a plain done.
+  const run = useCallback(async (label: string, work: () => Promise<void | string>): Promise<void> => {
     setBusy(true);
     setStatus({ tone: 'busy', message: label });
     try {
-      await work();
+      const outcome = await work();
       await refresh();
-      setStatus({ tone: 'idle', message: `${label} — done` });
+      setStatus({ tone: 'idle', message: outcome ?? `${label} — done` });
     } catch (error) {
       setStatus({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
       // A failed operation is very often *about* the connection — the CS2 session was taken by
@@ -423,12 +439,14 @@ export function App(): React.JSX.Element {
    * The Engine Runtime keeps every signed-in account current on its own, so this exists for the
    * one thing a scheduler cannot know about: something the user just did on the Steam website.
    */
-  const refreshNow = useCallback(async (accountIds: readonly string[]): Promise<void> => {
-    if (accountIds.length === 0) return;
-    await engine.refreshNow(accountIds);
+  /** Answers with the surfaces each account's pass read, so the caller can say when that was nothing. */
+  const refreshNow = useCallback(async (accountIds: readonly string[]): Promise<Record<string, string[]>> => {
+    if (accountIds.length === 0) return {};
+    const refreshed = await engine.refreshNow(accountIds);
     // Persona hashes land in `account` during the pass; re-list so faces update without
     // waiting on the change-notice relay (same reason inventory re-reads after a sync).
     await reloadAccounts();
+    return refreshed;
   }, [reloadAccounts]);
 
   /** One account's launch preferences, written; the switches then show what came back. */
@@ -475,6 +493,8 @@ export function App(): React.JSX.Element {
     records: 0,
     // No count yet: the Trades page carries its own, per list.
     trades: 0,
+    // No count: the page is a search over the catalogue, not a list of anything held.
+    items: 0,
     settings: 0,
     portfolio: accounts.length,
     inventory: totals.items
@@ -483,7 +503,7 @@ export function App(): React.JSX.Element {
   const activeHoldings = holdings.find((row) => row.accountId === key);
   const activeHeld = activeHoldings ? heldCounts(activeHoldings.counts) : null;
   const wallet = activeHoldings?.wallet
-    ? { balance_cents: activeHoldings.wallet.balanceCents, currency: activeHoldings.currency ?? 21 }
+    ? { balance_cents: activeHoldings.wallet.balanceCents, currency: activeHoldings.currency }
     : null;
   const current = [...SECTIONS, SETTINGS].find((entry) => entry.id === section) ?? SECTIONS[0]!;
   const connection = describeConnection(connections.find((row) => row.accountId === key));
@@ -529,7 +549,30 @@ export function App(): React.JSX.Element {
     </button>
   );
 
+  /** Opens one market name on the Items page, remembering the page it came from for Back. */
+  const openItem = (name: string, from: Section): void => {
+    setItemView({ name, from });
+    setSection('items');
+  };
+
+  // Back is offered only to an item opened from another page; from the sidebar there is nowhere to
+  // go back to. Going back keeps the name, so Items reopens on it, and forgets where it came from.
+  const itemsFrom = itemView.from;
+  const backFromItems = useMemo(() => {
+    if (itemsFrom === null) return null;
+    const label = [...SECTIONS, SETTINGS].find((entry) => entry.id === itemsFrom)?.label ?? 'the last page';
+    return {
+      label,
+      onBack: () => {
+        setItemView((view) => ({ ...view, from: null }));
+        setSection(itemsFrom);
+      }
+    };
+  }, [itemsFrom]);
+
   const pick = (entry: SectionEntry): void => {
+    // The sidebar is a fresh visit: Items keeps the item it last showed, but there is no Back.
+    if (entry.id === 'items') setItemView((view) => ({ ...view, from: null }));
     setSection(entry.id);
     // A per-account page has to be about an account. Picking one from the all-accounts scope
     // selects the account that was last open rather than leaving the user on a page that
@@ -644,10 +687,16 @@ export function App(): React.JSX.Element {
             data-busy={busy && status.message.startsWith('Refreshing') ? 'true' : undefined}
             disabled={busy || accounts.length === 0}
             title="Everything refreshes on its own. Use this after changing something on the Steam website."
-            onClick={() => void run('Refreshing now', () =>
+            onClick={() => void run('Refreshing now', async () => {
               // The runtime reads only the accounts it is keeping current: one left signed out
               // stays that way until someone presses Connect for it.
-              refreshNow(activeAccount ? [activeAccount.accountId] : accountIds))}
+              const refreshed = await refreshNow(activeAccount ? [activeAccount.accountId] : accountIds);
+              // A pass right after a sign-in finds every surface current or still being read by the
+              // launch sweep, and the CS2 session not yet up, so it reads nothing. That is not a
+              // refresh done: say what happened, and that the rest arrives on its own.
+              const read = Object.values(refreshed).flat().length;
+              return read === 0 ? 'Refreshing now — nothing new to read: everything is current or still loading, and will refresh on its own' : undefined;
+            })}
           >
             <Icon name="refresh" size={16} />
             <span className="nav-text">{activeAccount ? 'Refresh now' : 'Refresh all now'}</span>
@@ -778,10 +827,25 @@ export function App(): React.JSX.Element {
             {/* Gated on `loaded` for the same reason the account list is: before the runtime has
                 answered, "no accounts yet" is a guess, and it is the one guess that reads as a
                 lost database. */}
+            {section === 'items' && accountIds.length > 0 ? (
+              <ItemsView
+                name={itemView.name}
+                accountIds={scope ? [scope] : accountIds}
+                onOpen={(name) => setItemView((view) => ({ ...view, name }))}
+                back={backFromItems}
+              />
+            ) : null}
+            {section === 'items' && loaded && accountIds.length === 0 ? (
+              <Panel><Empty icon="trending-up" title="No accounts yet" hint="Add a Steam account to look items up." /></Panel>
+            ) : null}
             {section === 'portfolio' && loaded && accounts.length > 0 ? (
-              <Panel>
-                <Empty icon="sparkles" title="Coming soon" hint="Holdings across your accounts will appear here." />
-              </Panel>
+              <PortfolioPage
+                accountIds={scope ? [scope] : accountIds}
+                holdings={scope ? holdings.filter((row) => row.accountId === scope) : holdings}
+                scope={scope}
+                avatars={Object.fromEntries(accounts.map((entry) => [entry.accountId, entry.avatarRef]))}
+                onSelectAccount={(accountId) => { setScope(accountId); setSection('inventory'); }}
+              />
             ) : null}
 
             {section === 'portfolio' && loaded && accounts.length > 0 ? (
@@ -806,7 +870,7 @@ export function App(): React.JSX.Element {
                   label="Wallet"
                   icon="wallet"
                   tone="accent"
-                  value={formatCents(wallet?.balance_cents ?? null, wallet?.currency ?? 21)}
+                  value={formatAmount(wallet?.balance_cents ?? null, wallet?.currency ?? null)}
                   note={wallet ? undefined : 'not observed yet'}
                 />
               </div>
@@ -819,7 +883,7 @@ export function App(): React.JSX.Element {
             ) : null}
 
             {section === 'inventory' && accountIds.length > 0 ? (
-              <InventoryView accountIds={scope ? [scope] : accountIds} accounts={accountNames} selection={inventorySelection} onSelection={setInventorySelection} />
+              <InventoryView accountIds={scope ? [scope] : accountIds} accounts={accountNames} selection={inventorySelection} onSelection={setInventorySelection} onOpenItem={(name) => openItem(name, 'inventory')} />
             ) : null}
             {section === 'trades' && accountIds.length > 0 ? (
               <TradesView accountIds={scope ? [scope] : accountIds} accounts={accountNames} />

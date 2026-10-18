@@ -12,7 +12,7 @@ pnpm smoke:packaged    # starts the packaged app and proves it opens a record an
 
 `electron-builder.config.mjs` is the installer and the update feed; `src/main/release/` is the
 profile pin, the version header, the stop switch and the updater. What they decide, and why it is
-permanent once a public build ships, is the [desktop release plan](../../cslytics-app-docs/plans/desktop-release-plan.md).
+permanent once a public build ships, is the [desktop release plan](../../cslytics-app-docs/plans/completed/desktop-release-plan.md).
 With Cursor open on the repository, package into a folder outside it (`CSLYTICS_PACKAGE_DIR`):
 something indexing the workspace holds the freshly extracted `default_app.asar` open, and
 electron-builder then fails renaming `win-unpacked.tmp` with EPERM.

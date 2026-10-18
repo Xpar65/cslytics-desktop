@@ -132,21 +132,22 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
   const marks = accounts.map(() => '?').join(',');
 
   const listings = database.raw().prepare(`
-    SELECT m.account_id AS accountId, 'SELL_LISTING' AS kind, m.listing_id AS id,
+    SELECT m.account_id AS accountId, 'SELL_LISTING' AS kind, m.venue_order_id AS id,
       m.hash_name AS hashName, m.local_id AS localId,
       IFNULL(${ITEM_MATCH_SQL}, '') AS matchKey,
       i.def_index AS defIndex, i.paint_index AS paintIndex, i.quality AS quality,
       i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
-      m.buyer_price_cents AS buyerPriceCents, m.price_receive_cents AS receiveCents,
-      (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=m.account_id ORDER BY w.id DESC LIMIT 1) AS currency,
+      s.buyer_price_cents AS buyerPriceCents, m.price_cents AS receiveCents,
+      COALESCE(m.currency, (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=m.account_id ORDER BY w.id DESC LIMIT 1)) AS currency,
       NULL AS counterparty, 1 AS items, 1 AS distinctItems,
       first.finished_at AS waitingSince, NULL AS expiresAt,
       last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete
-    FROM market_listing m
+    FROM venue_order m
+    JOIN steam_order s ON s.account_id=m.account_id AND s.order_id=m.order_id
     LEFT JOIN item i ON i.account_id=m.account_id AND i.local_id=m.local_id
     LEFT JOIN observation last ON last.id=m.last_seen_obs
     LEFT JOIN observation first ON first.id=m.first_seen_obs
-    WHERE m.account_id IN (${marks}) AND m.status='PENDING_CONFIRMATION'
+    WHERE m.account_id IN (${marks}) AND m.venue='steam' AND m.side='SELL' AND m.state='PENDING_EXTERNAL' AND m.gone_obs IS NULL
   `).all(...accounts) as WaitingRow[];
 
   /*
@@ -166,7 +167,7 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
       i.def_index AS defIndex, i.paint_index AS paintIndex, i.quality AS quality,
       i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
       NULL AS buyerPriceCents, NULL AS receiveCents, NULL AS currency,
-      t.counterparty_id AS counterparty,
+      t.counterparty_steam_id64 AS counterparty,
       (SELECT COUNT(*) FROM trade_line l
         WHERE l.account_id=t.account_id AND l.offer_id=t.offer_id AND l.side='GIVE') AS items,
       (SELECT COUNT(DISTINCT IFNULL(${matchSql('li')}, 'asset:' || l.asset_id))

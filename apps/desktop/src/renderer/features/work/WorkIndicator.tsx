@@ -7,7 +7,7 @@ import { WaitingPill } from './Waiting.js';
 import { WORK_STATE, destinationOf, plural, stateLabel, venuePhrase } from '../../lib/labels.js';
 import { Outbox, type OutboxSend } from './outbox.js';
 import { useWaiting } from './use-waiting.js';
-import { isOpenWork } from './work-busy.js';
+import { isOpenWork, WAITING_STATES } from './work-busy.js';
 import { acknowledgeSeen, browserSeenStore, readSeenFailures, unseenFailures, writeSeenFailures } from './work-seen.js';
 
 export { isOpenWork };
@@ -336,7 +336,7 @@ export function WorkIndicator({ accountIds, accounts, onOpenListings }: {
   const awaitingVenue = subject!.memberState === 'AWAITING_VENUE';
   const destination = awaitingVenue ? destinationOf(subject!.commandKind) : destinationOf(subject!.commandKind, subject!.actionKind);
   const state = stateLabel(WORK_STATE, subject!.memberState);
-  const waiting = subject!.memberState === 'SUBMITTED' || subject!.memberState === 'RETRYING' || subject!.actionState === 'AWAITING_OBSERVATION' || awaitingVenue;
+  const waiting = WAITING_STATES.has(subject!.memberState) || subject!.actionState === 'AWAITING_OBSERVATION';
   const mode = failed.length > 0 ? 'failed' : open.length === 0 ? 'done' : waiting ? 'waiting' : 'moving';
   const sentence = failed.length > 0
     ? `${state.label}: ${subject!.name}`

@@ -60,7 +60,7 @@ const SORTS: ReadonlyArray<SortOption<ListingSort>> = [
  */
 export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
   accountIds: string[];
-  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null }> | undefined;
+  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; currency?: number | null | undefined }> | undefined;
   /** Which venues each account has set up (`setUpByAccount`); an account is absent until known. */
   setUp: Readonly<Record<string, ReadonlySet<VenueId>>>;
   /** Opens one venue's page in Settings for one account. */
@@ -248,6 +248,7 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
               onChange={setChips}
               accounts={scopeAccounts}
               kinds={LISTING_CHIP_KINDS}
+              holdingsOf={queryScope.split('\0')}
               label="Filter listings"
               placeholder="Filter: awp fn st, f > 0.15, or a listing number"
             />

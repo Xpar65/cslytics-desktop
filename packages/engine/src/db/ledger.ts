@@ -10,8 +10,8 @@ import type { EngineDatabase } from './database.js';
 export type EconomicEventRow = {
   account_id: string; source_key: string; kind: string; occurred_at: string; quantity: number;
   amount_cents: number | null; fee_cents: number | null; currency: number | null;
-  amount_basis: 'EVIDENCED' | 'UNKNOWN'; attribution: 'ATTRIBUTED' | 'UNATTRIBUTED';
-  local_id: string | null; candidates_json: string; order_id: string | null; trade_id: string | null;
+  amount_basis: 'EVIDENCED' | 'UNKNOWN';
+  order_id: string | null; trade_id: string | null;
   offer_id: string | null; listing_id: string | null; corrects_source_key: string | null;
   observation_id: number; recorded_at: string;
 };
@@ -27,8 +27,6 @@ export type EconomicEventInput = {
   amountCents?: number | null;
   feeCents?: number | null;
   currency?: number | null;
-  localId?: string | null;
-  candidates?: readonly string[];
   orderId?: string | null;
   tradeId?: string | null;
   offerId?: string | null;
@@ -57,22 +55,21 @@ export class LedgerStore {
     if (evidenced && !Number.isInteger(input.amountCents)) throw new Error('Ledger amount must be integer minor units');
     const result = this.db.raw().prepare(`
       INSERT INTO economic_event(account_id, source_key, kind, occurred_at, quantity, amount_cents, fee_cents,
-        currency, amount_basis, attribution, local_id, candidates_json, order_id, trade_id, offer_id, listing_id,
+        currency, amount_basis, order_id, trade_id, offer_id, listing_id,
         corrects_source_key, observation_id, recorded_at)
-      VALUES (@account, @key, @kind, @occurred, @quantity, @amount, @fee, @currency, @basis, @attribution,
-        @local, @candidates, @orderId, @tradeId, @offerId, @listingId, @corrects, @obs, @now)
+      VALUES (@account, @key, @kind, @occurred, @quantity, @amount, @fee, @currency, @basis,
+        @orderId, @tradeId, @offerId, @listingId, @corrects, @obs, @now)
       ON CONFLICT(account_id, source_key) DO NOTHING
     `).run({
       account: input.accountId, key: input.sourceKey, kind: input.kind, occurred: input.occurredAt,
       quantity: input.quantity, amount: evidenced ? input.amountCents! : null,
       fee: input.feeCents ?? null, currency: input.currency ?? null,
       basis: evidenced ? 'EVIDENCED' : 'UNKNOWN',
-      attribution: input.localId ? 'ATTRIBUTED' : 'UNATTRIBUTED',
-      local: input.localId ?? null, candidates: JSON.stringify(input.candidates ?? []),
       orderId: input.orderId ?? null, tradeId: input.tradeId ?? null, offerId: input.offerId ?? null,
       listingId: input.listingId ?? null, corrects: input.correctsSourceKey ?? null,
       obs: input.observationId, now
     });
+    if (Number(result.changes) > 0) this.db.touch(input.accountId, 'economic_event');
     return Number(result.changes) > 0;
   }
 
@@ -91,7 +88,7 @@ export class LedgerStore {
    */
   recordBuyOrderFill(input: {
     accountId: string; buyOrderId: string; purchasedTotal: number; delta: number;
-    unitPriceCents: number; candidates?: readonly string[]; observationId: number; now: string;
+    unitPriceCents: number; observationId: number; now: string;
   }): boolean {
     const posted = this.postEconomicEvent({
       accountId: input.accountId,
@@ -100,7 +97,6 @@ export class LedgerStore {
       occurredAt: input.now,
       quantity: input.delta,
       amountCents: null,
-      candidates: input.candidates ?? [],
       orderId: input.buyOrderId,
       observationId: input.observationId
     }, input.now);
@@ -109,12 +105,6 @@ export class LedgerStore {
       UPDATE reservation SET amount_cents=MAX(0, amount_cents - ?)
       WHERE account_id=? AND ref_kind='BUY_ORDER' AND ref_id=? AND state IN ('ACTIVE','SUBMITTED_UNOBSERVED')
     `).run(input.delta * input.unitPriceCents, input.accountId, input.buyOrderId);
-    this.db.raw().prepare(`
-      INSERT INTO acquisition(id, account_id, buy_order_id, quantity, price_cents, attribution,
-        candidates_json, acquired_at, actual_amount_cents, amount_basis)
-      VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, 'UNATTRIBUTED', ?, ?, NULL, 'UNKNOWN')
-    `).run(input.accountId, input.buyOrderId, input.delta, input.unitPriceCents,
-      JSON.stringify(input.candidates ?? []), input.now);
     return true;
   }
 
@@ -137,6 +127,7 @@ export class LedgerStore {
       WHERE account_id=? AND source_key=? AND amount_basis='UNKNOWN'
     `).run(input.amountCents, input.feeCents ?? null, input.currency ?? null, input.observationId,
       input.accountId, input.sourceKey);
+    if (Number(result.changes) > 0) this.db.touch(input.accountId, 'economic_event');
     return Number(result.changes) > 0;
   }
 
@@ -149,10 +140,10 @@ export class LedgerStore {
    */
   externalOrderCommitmentCents(accountId: string): number {
     return (this.db.raw().prepare(`
-      SELECT COALESCE(SUM(o.price_cents * o.quantity_remaining), 0) AS amount FROM buy_order o
-      WHERE o.account_id=? AND o.active=1 AND NOT EXISTS (
+      SELECT COALESCE(SUM(o.price_cents * (o.quantity - o.filled)), 0) AS amount FROM venue_order o
+      WHERE o.account_id=? AND o.venue='steam' AND o.side='BUY' AND o.first_seen_obs IS NOT NULL AND o.state NOT LIKE 'ENDED_%' AND NOT EXISTS (
         SELECT 1 FROM reservation r WHERE r.account_id=o.account_id AND r.ref_kind='BUY_ORDER'
-          AND r.ref_id=o.buy_order_id AND r.state IN ('ACTIVE','SUBMITTED_UNOBSERVED'))
+          AND r.ref_id=o.venue_order_id AND r.state IN ('ACTIVE','SUBMITTED_UNOBSERVED'))
     `).get(accountId) as { amount: number }).amount;
   }
 

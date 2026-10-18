@@ -44,7 +44,7 @@ export class CsfloatListingService {
   }
 
   syncStall(accountId: AccountId): Promise<StallSyncResult> {
-    return this.context.reads.run(`${accountId}:${CSFLOAT_STALL_SURFACE}`, () => this.walk(accountId));
+    return this.walk(accountId);
   }
 
   async syncListing(accountId: AccountId, listingId: string): Promise<number> {
@@ -135,30 +135,9 @@ export class CsfloatListingService {
         finishedAt: this.context.now(), complete: true, pagesWalked: pages,
         totalExpected: totalCount ?? listings.length
       });
-      const upsert = database.raw().prepare(`
-        INSERT INTO csfloat_listing(account_id, listing_id, generation, type, state, price_cents, asset_id,
-          def_index, hash_name, paint_index, paint_seed, paint_wear, quality, stattrak, tradable, created_at,
-          first_seen_obs, last_seen_obs)
-        VALUES (@account, @listing, @generation, @type, @state, @price, @asset, @def, @hash, @paintIndex,
-          @paintSeed, @wear, @quality, @stattrak, @tradable, @createdAt, @obs, @obs)
-        ON CONFLICT(account_id, listing_id) DO UPDATE SET generation=excluded.generation, type=excluded.type,
-          state=excluded.state, price_cents=excluded.price_cents, asset_id=excluded.asset_id,
-          tradable=excluded.tradable, last_seen_obs=excluded.last_seen_obs
-      `);
-      for (const listing of listings) {
-        new CsfloatStore(database).publishContract(accountId,listing,id);
-        upsert.run({
-          account: accountId, listing: listing.listingId, generation, type: listing.type, state: listing.state,
-          price: listing.priceCents, asset: listing.item.assetId, def: listing.item.defIndex,
-          hash: listing.item.marketHashName, paintIndex: listing.item.paintIndex ?? null,
-          paintSeed: listing.item.paintSeed ?? null, wear: listing.item.floatValue ?? null,
-          quality: listing.item.quality ?? null,
-          stattrak: listing.item.isStatTrak === undefined ? null : Number(listing.item.isStatTrak),
-          tradable: listing.item.tradable ?? null, createdAt: listing.createdAt || null, obs: id
-        });
-      }
-      // Only a complete walk may conclude absence, and this one statement is how it does.
-      database.raw().prepare('DELETE FROM csfloat_listing WHERE account_id=? AND last_seen_obs<>?').run(accountId, id);
+      // Only a complete walk may say what is on the book, and this one write is how it does: every
+      // listing shown is stated and marked on the book, every listing not shown is marked gone.
+      new CsfloatStore(database).observeStall(accountId, id, listings);
       return id;
     });
     this.context.signals.emit({ kind: 'observed', accountId, surface: CSFLOAT_STALL_SURFACE, complete: true, observationId });

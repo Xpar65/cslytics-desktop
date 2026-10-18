@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { StorePurchasePage, StorePurchaseView } from '@cslytics/engine';
 import { engine, type EnrichedStoreSheet } from '../../lib/engine.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { Panel, PanelHeader } from '../../components/ui.js';
 import { PageHeader } from '../../components/PageHeader.js';
 import type { AccountHoldings } from '../../lib/types.js';
@@ -81,7 +81,7 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
       </div>
       <p data-testid="store-wallet">
         {holdings?.wallet
-          ? `Available to commit: ${available === null ? 'unknown' : formatCents(available, holdings.currency)} · wallet observed ${new Date(holdings.wallet.observedAt).toLocaleString()}`
+          ? `Available to commit: ${available === null ? 'unknown' : formatAmount(available, holdings.currency)} · wallet observed ${new Date(holdings.wallet.observedAt).toLocaleString()}`
           : 'Wallet not observed yet'}
       </p>
       {message ? <p role="status">{message}</p> : null}
@@ -90,7 +90,7 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
           const price = entry.salePriceCents ?? entry.priceCents;
           return <div className="inventory-data-row" key={entry.entryKey}>
             {entry.imageUrl ? <img src={entry.imageUrl} alt="" width={48} height={36} /> : null}
-            <span>{entry.name}<br /><small>{formatCents(price, currency)}{entry.salePriceCents !== null ? ` (was ${formatCents(entry.priceCents, currency)})` : ''}{entry.reason ? ` · ${entry.reason}` : ''}</small></span>
+            <span>{entry.name}<br /><small>{formatAmount(price, currency)}{entry.salePriceCents !== null ? ` (was ${formatAmount(entry.priceCents, currency)})` : ''}{entry.reason ? ` · ${entry.reason}` : ''}</small></span>
             <label>Qty <input className="input" type="number" min={0} max={100} step={1} inputMode="numeric" aria-label={`Quantity of ${entry.name}`}
               value={quantities[entry.entryKey] ?? 0} disabled={busy || !entry.purchasable}
               onChange={(event) => { const next = Math.max(0, Math.min(100, Math.floor(Number(event.target.value) || 0))); setQuantities((current) => ({ ...current, [entry.entryKey]: next })); resetCommand(); }} /></label>
@@ -98,7 +98,7 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
         })}
       </div> : <p>{sheet ? 'The sheet has no entries priced in this wallet currency.' : 'Refresh the price sheet to see what the store offers.'}</p>}
       <div className="toolbar page-controls">
-        <span data-testid="store-total">Total: {formatCents(total, currency)}{available !== null && total > available ? ' · exceeds the available balance' : ''}</span>
+        <span data-testid="store-total">Total: {formatAmount(total, currency)}{available !== null && total > available ? ' · exceeds the available balance' : ''}</span>
         <button className="btn" data-testid="store-buy" disabled={busy || !sheetUsable || selected.length === 0 || total <= 0 || (available !== null && total > available)}
           onClick={() => void run(async () => {
             await engine.storeBuy({ commandId: command.current, accountId, lines: selected.map((entry) => ({ entryKey: entry.entryKey, quantity: quantities[entry.entryKey] ?? 0, unitPriceCents: entry.salePriceCents ?? entry.priceCents })) });
@@ -112,7 +112,7 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
       <PanelHeader title="Purchases" subtitle="Every purchase this app has asked Steam for, with the evidence it has reached." />
       {purchases?.rows.length ? purchases.rows.map((row) => <div className="inventory-data-row" key={row.id} data-testid="store-purchase" data-state={row.state}>
         <span>{STATE_LABEL[row.state]}<br />
-          <small>{row.lines.map((line) => `${line.quantity} × ${line.entryKey}${line.observedQuantity ? ` (${line.observedQuantity} seen)` : ''}`).join(', ')} · {formatCents(row.requestedTotalCents, row.currency)} · {new Date(row.createdAt).toLocaleString()}</small>
+          <small>{row.lines.map((line) => `${line.quantity} × ${line.entryKey}${line.observedQuantity ? ` (${line.observedQuantity} seen)` : ''}`).join(', ')} · {formatAmount(row.requestedTotalCents, row.currency)} · {new Date(row.createdAt).toLocaleString()}</small>
           {row.txnId ? <><br /><small>Transaction {row.txnId}</small></> : null}
           {row.error ? <><br /><small role="alert">{row.error}</small></> : null}</span>
         {CANCELLABLE.has(row.state) ? <button className="btn" disabled={busy} onClick={() => void run(() => engine.storeCancel(accountId, row.id), 'Cancel sent; the reserved funds return once the wallet and inventory have been observed')}>Cancel</button> : null}

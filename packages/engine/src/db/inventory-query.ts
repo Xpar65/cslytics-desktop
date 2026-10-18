@@ -1,6 +1,6 @@
 import type { EngineDatabase, ItemRow } from './database.js';
 import { cannotTradeSql } from '../kernel/attributes.js';
-import { steamListedSql } from './steam-listing.js';
+import { steamListedSql } from './commitment.js';
 
 /**
  * What the engine will filter inventory by.
@@ -40,7 +40,7 @@ export type InventoryFilter = { matchKeys?: readonly string[]; location?: ItemRo
   excludeMatchKeys?: readonly string[]; excludeCannotTrade?: boolean;
   /**
    * `true` keeps the holdings an open Steam listing names, `false` the ones none does. Not a
-   * location: a listed item is in main inventory (`db/steam-listing.ts`).
+   * location: a listed item is in main inventory (`db/commitment.ts`).
    */
   listed?: boolean };
 export type InventoryQueryPage = { after?: readonly [string, string]; limit?: number };
@@ -53,11 +53,11 @@ export type InventoryQueryPage = { after?: readonly [string, string]; limit?: nu
  * bearing econ attributes that separate one sticker from another, since every sticker shares a def
  * index and has no paint kit. It is a stored column rather than an expression over attributes: the
  * attributes are not in this database, and an index cannot be built on something the row does not
- * carry. `kernel/identity.kitToken` derives it on ingest.
+ * carry. `kernel/identity.kitToken` derives it on ingest. One spelling for both unit kinds: a
+ * fungible unit has no paint index, so its key leaves that position empty, which is what lets the
+ * one index serve either kind (consolidation plan §4.2).
  */
-export const INDIVIDUAL_MATCH_SQL = "def_index || ':' || IFNULL(paint_index,'') || ':' || quality || ':' || IFNULL(kit,'')";
-/** Fungible units carry no paint index, so their key leaves that position empty. */
-export const COMMODITY_MATCH_SQL = "def_index || '::' || quality || ':' || IFNULL(kit,'')";
+export const IDENTITY_MATCH_SQL = "def_index || ':' || IFNULL(paint_index,'') || ':' || quality || ':' || IFNULL(kit,'')";
 
 function filterIsNarrow(filter: InventoryFilter): boolean {
   return Boolean(filter.matchKeys || filter.tradableOnly || filter.location || filter.casketId || filter.listed !== undefined
@@ -76,13 +76,13 @@ function hasIndividualPredicate(filter: InventoryFilter): boolean {
  * One row per holding, of either kind: a hundred cases are a hundred rows, as Steam's own
  * inventory shows them. Grouping them is `pageInventoryGroups`' job, by identity key, so nothing
  * here folds units together — not by lock date, not by location. The two branches differ only in
- * the identity expression each unit kind is indexed on and in which rows the published-generation
- * predicate applies to.
+ * the identity expression each unit kind is indexed on.
  */
 export function inventoryQuery(
-  database: EngineDatabase,
+  _database: EngineDatabase,
   accountIds: readonly string[],
-  filter: InventoryFilter = {},
+  filter: InventoryFilter,
+  now: string,
   page?: InventoryQueryPage,
   /**
    * `detected` adds `firstSeenAt`, the finished time of `first_seen_obs`. Only the detection
@@ -92,44 +92,59 @@ export function inventoryQuery(
 ) {
   const params: (string | number)[] = [];
   const limit = page?.limit === undefined ? undefined : Math.min(Math.max(1, page.limit | 0), 500);
-  // Bind catalogue keys rather than `IN (SELECT …)`. SQLite only uses item_catalogue_match's
-  // expression column for a bound list; a subquery search scans every row for the account.
   const matchKeys = filter.matchKeys;
-  const lockFree = "(tradable_after IS NULL OR tradable_after<=strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND (trade_protected_until IS NULL OR trade_protected_until<=strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
+  const bands = filter.wearBands?.filter((band) => band.matchKeys.length > 0);
+  // Every list a filter carries is one JSON value, read once by a CTE that every branch shares.
+  // A list spelled `?,?,…` spends a parameter per key in every branch, and a branch is an account
+  // and a unit kind: the Sticker category's 10,433 keys over two accounts was 41,736 parameters
+  // and "too many SQL variables" (2026-10-15).
+  //
+  // A bound list also told the planner how many keys it held, and a JSON value cannot, so the
+  // identity index is named rather than left to an estimate. On a small record the planner would
+  // otherwise walk the account in page order, and the plan `tests/unit/query-plans.registry.ts`
+  // proves would stop being the plan that runs; at field scale it chooses this index unprompted.
+  const lists: string[] = [];
+  const listParams: string[] = [];
+  const byIdentity = matchKeys && matchKeys.length > 0 ? ' INDEXED BY item_identity_match' : '';
+  if (matchKeys && matchKeys.length > 0) {
+    lists.push('named(key) AS MATERIALIZED (SELECT value FROM json_each(?))');
+    listParams.push(JSON.stringify(matchKeys));
+  }
+  if (filter.excludeMatchKeys && filter.excludeMatchKeys.length > 0) {
+    lists.push('excluded(key) AS MATERIALIZED (SELECT value FROM json_each(?))');
+    listParams.push(JSON.stringify(filter.excludeMatchKeys));
+  }
+  if (bands && bands.length > 0) {
+    lists.push(`band(key, low, high) AS MATERIALIZED (SELECT k.value, json_extract(b.value, '$.minWear'), json_extract(b.value, '$.maxWear')
+      FROM json_each(?) b, json_each(b.value, '$.matchKeys') k)`);
+    listParams.push(JSON.stringify(bands));
+  }
+  // The engine's clock, bound twice: a lock is over when its end is at or before now (D23).
+  const lockFree = '(tradable_after IS NULL OR tradable_after<=?) AND (trade_protected_until IS NULL OR trade_protected_until<=?)';
   const branches = accountIds.flatMap((accountId) => {
-    const visible = database.publishedInventoryVisibility(accountId);
     return [false, true].map((commodity) => {
-      const table = database.inventoryReadTable('item', accountId);
-      const match = commodity ? COMMODITY_MATCH_SQL : INDIVIDUAL_MATCH_SQL;
+      const match = IDENTITY_MATCH_SQL;
       let where = `account_id=? AND location<>'MISSING' AND unit_kind=${commodity ? "'fungible'" : "'individual'"}`;
       params.push(accountId);
-      // The published-generation predicate applies to individual rows only, as it always has.
-      if (!commodity) { where += visible.sql; params.push(...visible.params); }
       if (filter.location) { where += ' AND location=?'; params.push(filter.location); }
       if (filter.listed !== undefined) where += ` AND ${filter.listed ? '' : 'NOT '}${steamListedSql('inventory')}`;
       if (filter.casketId) { where += ' AND casket_id=?'; params.push(filter.casketId); }
-      if (matchKeys) {
-        if (matchKeys.length === 0) where += ' AND 0';
-        else {
-          where += ` AND (${match}) IN (${matchKeys.map(() => '?').join(',')})`;
-          params.push(...matchKeys);
-        }
-      }
+      if (matchKeys) where += matchKeys.length === 0 ? ' AND 0' : ` AND (${match}) IN (SELECT key FROM named)`;
       if (filter.excludeMatchKeys && filter.excludeMatchKeys.length > 0) {
         // Never a market item by kind, unless the Community read says this unit is: observation
         // outranks the catalogue.
-        where += ` AND NOT ((${match}) IN (${filter.excludeMatchKeys.map(() => '?').join(',')})
-          AND IFNULL((SELECT t.marketable FROM trade_inventory_item t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.current_asset_id), 0)<>1)`;
-        params.push(...filter.excludeMatchKeys);
+        where += ` AND NOT ((${match}) IN (SELECT key FROM excluded)
+          AND IFNULL((SELECT t.marketable FROM asset_evidence t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community'), 0)<>1)`;
       }
       if (filter.excludeCannotTrade) where += ` AND NOT (${cannotTradeSql('inventory')})`;
       if (filter.tradableOnly) {
         // Per unit, for either kind: the Community read names each asset, and every row carries
         // its own two locks.
-        where += ` AND location='MAIN' AND EXISTS (SELECT 1 FROM trade_inventory_item t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.current_asset_id AND t.tradable=1
-          AND t.observation_id=(SELECT MAX(o.id) FROM observation o WHERE o.account_id=t.account_id AND o.surface='steam-trade-inventory')
-          AND EXISTS (SELECT 1 FROM observation o WHERE o.id=t.observation_id AND o.complete=1 AND o.error IS NULL))`;
+        where += ` AND location='MAIN' AND EXISTS (SELECT 1 FROM asset_evidence t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community' AND t.tradable=1
+          AND t.last_seen_obs=(SELECT MAX(o.id) FROM observation o WHERE o.account_id=t.account_id AND o.surface='steam-trade-inventory')
+          AND EXISTS (SELECT 1 FROM observation o WHERE o.id=t.last_seen_obs AND o.complete=1 AND o.error IS NULL))`;
         where += ` AND ${lockFree}`;
+        params.push(now, now);
       }
       // Wear, seed and normalised-float bands are questions about an individual item. A case
       // has no float and no pattern, so the fungible branch answers "no row qualifies" rather
@@ -140,16 +155,12 @@ export function inventoryQuery(
           if (filter.minWear !== undefined) { where += ' AND paint_wear IS NOT NULL AND paint_wear>=?'; params.push(filter.minWear); }
           if (filter.maxWear !== undefined) { where += ' AND paint_wear IS NOT NULL AND paint_wear<=?'; params.push(filter.maxWear); }
           if (filter.paintSeed !== undefined) { where += ' AND paint_seed=?'; params.push(filter.paintSeed); }
-          if (filter.wearBands) {
+          if (bands) {
             // Each band is its own key set with its own absolute bounds: the same normalised
             // position is a different float in a 0–0.4 skin than in a 0–1 one, which is the whole
-            // reason the host computes bands rather than sending one range.
-            const bands = filter.wearBands.filter((band) => band.matchKeys.length > 0);
-            if (bands.length === 0) where += ' AND 0';
-            else {
-              where += ` AND (${bands.map((band) => `((${match}) IN (${band.matchKeys.map(() => '?').join(',')}) AND paint_wear IS NOT NULL AND paint_wear BETWEEN ? AND ?)`).join(' OR ')})`;
-              for (const band of bands) params.push(...band.matchKeys, band.minWear, band.maxWear);
-            }
+            // reason the host computes bands rather than sending one range. A key is in one band.
+            where += bands.length === 0 ? ' AND 0'
+              : ` AND paint_wear IS NOT NULL AND EXISTS (SELECT 1 FROM band b WHERE b.key=(${match}) AND paint_wear BETWEEN b.low AND b.high)`;
           }
         }
       }
@@ -157,10 +168,11 @@ export function inventoryQuery(
       // storable; `trade` is trade protection and is not — see `LockKind`.
       if (filter.lock) {
         if (filter.lock === 'market') {
-          where += " AND tradable_after IS NOT NULL AND tradable_after>strftime('%Y-%m-%dT%H:%M:%fZ','now')"
-            + " AND (trade_protected_until IS NULL OR trade_protected_until<=strftime('%Y-%m-%dT%H:%M:%fZ','now'))";
+          where += ' AND tradable_after IS NOT NULL AND tradable_after>? AND (trade_protected_until IS NULL OR trade_protected_until<=?)';
+          params.push(now, now);
         } else {
-          where += " AND trade_protected_until IS NOT NULL AND trade_protected_until>strftime('%Y-%m-%dT%H:%M:%fZ','now')";
+          where += ' AND trade_protected_until IS NOT NULL AND trade_protected_until>?';
+          params.push(now);
         }
       }
       if (page?.after) {
@@ -174,35 +186,34 @@ export function inventoryQuery(
         ${commodity ? 'quantity' : '1'} AS quantity, def_index AS defIndex, quality,
         paint_index AS paintIndex, paint_wear AS paintWear, paint_seed AS paintSeed,
         tradable_after AS tradableAfter, trade_protected_until AS tradeProtectedUntil, ${match} AS matchKey,
-        current_asset_id AS assetId,
+        asset_id AS assetId,
         (${steamListedSql('inventory')}) AS steamListed,
-        (SELECT t.marketable FROM trade_inventory_item t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.current_asset_id) AS marketable,
+        (SELECT t.marketable FROM asset_evidence t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community') AS marketable,
         (${cannotTradeSql('inventory')}) AS cannotTrade${columns?.detected ? `,
         (SELECT o.finished_at FROM observation o WHERE o.id=inventory.first_seen_obs) AS firstSeenAt` : ''}
-        FROM ${table} AS inventory WHERE ${where}${suffix}`;
+        FROM item AS inventory${byIdentity} WHERE ${where}${suffix}`;
       return suffix ? `SELECT * FROM (${select})` : select;
     });
   });
-  return { sql: branches.join(' UNION ALL '), params };
+  // The CTE comes first in the text, so its parameters come first in the list.
+  return { sql: `${lists.length ? `WITH ${lists.join(', ')} ` : ''}${branches.join(' UNION ALL ')}`, params: [...listParams, ...params] };
 }
 
 /** Unfiltered totals use per-account indexes; a filter still scans the matching union. */
-export function inventoryTotals(database: EngineDatabase, accountIds: readonly string[], filter: InventoryFilter = {}) {
+export function inventoryTotals(database: EngineDatabase, accountIds: readonly string[], filter: InventoryFilter, now: string) {
   if (filterIsNarrow(filter)) {
-    const query = inventoryQuery(database, accountIds, filter);
+    const query = inventoryQuery(database, accountIds, filter, now);
     return database.raw().prepare(`SELECT COUNT(*) AS rows, COALESCE(SUM(quantity),0) AS quantity, COUNT(DISTINCT matchKey) AS groups FROM (${query.sql})`).get(...query.params) as { rows: number; quantity: number; groups: number };
   }
   let rows = 0;
   let quantity = 0;
   for (const accountId of accountIds) {
-    const visible = database.publishedInventoryVisibility(accountId);
-    const table = database.inventoryReadTable('item', accountId);
     const items = database.raw().prepare(`
-      SELECT COUNT(*) AS n FROM ${table}
-      WHERE account_id=? AND location<>'MISSING' AND unit_kind='individual'${visible.sql}
-    `).get(accountId, ...visible.params) as { n: number };
+      SELECT COUNT(*) AS n FROM item
+      WHERE account_id=? AND location<>'MISSING' AND unit_kind='individual'
+    `).get(accountId) as { n: number };
     const units = database.raw().prepare(`
-      SELECT COUNT(*) AS n, COALESCE(SUM(quantity),0) AS q FROM ${table}
+      SELECT COUNT(*) AS n, COALESCE(SUM(quantity),0) AS q FROM item
       WHERE account_id=? AND location<>'MISSING' AND unit_kind='fungible'
     `).get(accountId) as { n: number; q: number };
     rows += items.n + units.n;

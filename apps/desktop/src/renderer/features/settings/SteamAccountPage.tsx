@@ -5,7 +5,7 @@ import { Icon, type IconName } from '../../components/Icon.js';
 import { Button, IconButton, KeyValue, Metric, Notice, Panel, PanelHeader, StatusBadge, Switch } from '../../components/ui.js';
 import { VenueMark } from '../../components/VenueMark.js';
 import { accountAction, describeConnection, type ConnectionTone } from '../../lib/connection.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { plural, type Tone } from '../../lib/labels.js';
 import { freshness, heldCounts } from '../../lib/portfolio.js';
 import type { AccountConnection, AccountHoldings } from '../../lib/types.js';
@@ -148,7 +148,7 @@ export function SteamAccountPage({ account, connection, connecting, holding, las
       <LaunchPanel launch={launch} onLaunch={onLaunch} />
 
       <div className="metrics">
-        <Metric label="Wallet" icon="wallet" tone="accent" value={formatCents(holding?.wallet?.balanceCents ?? null, holding?.currency ?? 21)} note={holding?.wallet ? age.label : 'not observed yet'} />
+        <Metric label="Wallet" icon="wallet" tone="accent" value={formatAmount(holding?.wallet?.balanceCents ?? null, holding?.currency ?? null)} note={holding?.wallet ? age.label : 'not observed yet'} />
         <Metric label="Inventory" icon="package" value={(held?.main ?? 0).toLocaleString()} />
         <Metric label="Storage" icon="archive" value={(held?.crated ?? 0).toLocaleString()} note={`in ${plural(holding?.counts.storageUnits ?? 0, 'unit')}`} />
         <Metric label="Listed" icon="tag" value={holding ? (holding.counts.listingsActive + holding.counts.listingsOnHold).toLocaleString() : '—'} />

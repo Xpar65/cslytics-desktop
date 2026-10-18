@@ -2,8 +2,8 @@ import type { AccountId } from '@cslytics/ports';
 import type { ActionRow, DesiredStateRow, ItemRow } from '../db/database.js';
 import type { EngineContext } from '../kernel/context.js';
 import { ACCOUNT_MARKET, locationEvidence, surfaceEvidence } from '../kernel/evidence.js';
+import { steamListedSql } from '../db/commitment.js';
 
-const OPEN_STATUSES = "('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')";
 
 export const LISTING_REVERSED = 'Listing ended outside this goal; review before relisting';
 export const LOCATION_REVERSED = 'Item moved outside this goal; review before retrying';
@@ -13,7 +13,7 @@ export const LOCATION_REVERSED = 'Item moved outside this goal; review before re
  *
  * Without this, the effect of our own store is indistinguishable from a stranger moving the item.
  * A listing is not here because it moves nothing: the Game Coordinator keeps a listed item in main
- * inventory (`db/steam-listing.ts`), and a listing that ended is the `sell-listing` branch's.
+ * inventory (`db/commitment.ts`), and a listing that ended is the `sell-listing` branch's.
  */
 const EFFECT: Record<string, ItemRow['location']> = {
   STORE_IN_CASKET: 'CASKET',
@@ -44,12 +44,12 @@ export function reconcileDivergence(context: EngineContext, accountId: AccountId
       // An order of ours was observed open and is now absent from a complete walk. The
       // create's own reconciler cannot see this once its action is DONE.
       if (market.grade !== 'SATISFIED') continue;
-      const ended = database.raw().prepare(`SELECT 1 FROM action a JOIN market_listing m ON m.account_id=a.account_id
-          AND m.local_id=a.target_id
-        JOIN observation first ON first.id=m.first_seen_obs
-        WHERE a.account_id=? AND a.desired_id=? AND a.kind='CREATE_SELL_LISTING' AND m.status='ABSENT' AND first.finished_at>=a.created_at
-        AND NOT EXISTS (SELECT 1 FROM market_listing open WHERE open.account_id=m.account_id
-          AND (open.local_id=m.local_id OR open.asset_id=m.asset_id) AND open.status IN ${OPEN_STATUSES})`)
+      const ended = database.raw().prepare(`SELECT 1 FROM action a JOIN venue_order v ON v.account_id=a.account_id
+          AND v.local_id=a.target_id AND v.venue='steam' AND v.side='SELL' AND v.gone_obs IS NOT NULL
+        JOIN observation first ON first.id=v.first_seen_obs
+        JOIN item i ON i.account_id=a.account_id AND i.local_id=a.target_id
+        WHERE a.account_id=? AND a.desired_id=? AND a.kind='CREATE_SELL_LISTING' AND first.finished_at>=a.created_at
+        AND NOT ${steamListedSql('i')}`)
         .get(accountId, goal.id);
       if (ended) database.suspendGoal(accountId, goal.id, LISTING_REVERSED, context.now());
       continue;

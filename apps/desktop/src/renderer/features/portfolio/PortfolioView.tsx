@@ -1,317 +1,290 @@
 import React, { useMemo } from 'react';
 import type { AccountHoldings } from '../../lib/types.js';
-import {
-  aggregate,
-  freshness,
-  heldCounts,
-  observedTotalCents,
-  segments,
-  share,
-  type HoldingsSegment,
-  type PortfolioCurrency
-} from '../../lib/portfolio.js';
-import { formatCents } from '../../lib/format.js';
+import type { AccountFigures, ObservedKey, PortfolioValuation } from '../../../shared/market.js';
+import { aggregate, freshness, heldCounts, quantity, share } from '../../lib/portfolio.js';
+import { formatAmount, type CurrencyRef } from '../../lib/money.js';
 import { plural } from '../../lib/labels.js';
 import { Avatar } from '../../components/Avatar.js';
-import { Icon, type IconName } from '../../components/Icon.js';
-import { Empty, Panel, PanelHeader } from '../../components/ui.jsx';
-import { PageHeader } from '../../components/PageHeader.jsx';
+import { Tip } from '../../components/Tip.js';
+import { VenueMark } from '../../components/VenueMark.js';
+import { Panel, PanelHeader, Skeleton } from '../../components/ui.jsx';
+import { Beside, FigureCard } from './FigureCard.js';
+import { MoneyFigures, shown, type Shown } from './money-figures.js';
 
 /**
- * Portfolio.
+ * Portfolio: the observed money, and the per-account table you click through into an account.
+ * Every number here is one a venue named — a wallet balance, a listing's proceeds, a buy order's
+ * total — as main grouped it by currency and converted it (plan §3, §5.2). The headline that adds
+ * the inventory's appraisal to these is the holdings panel above; what the inventory is *worth* is
+ * the Value panel's question.
  *
- * One headline figure, a stacked allocation bar, a row of value cards, and a per-account table
- * you click through into an account. What it does *not* do is value anything — see
- * `../lib/portfolio.ts` for why every number here is one a venue named rather than one this
- * app estimated.
+ * The wallets come first and apart: Steam's and CSFloat's are different money, in different
+ * currencies, spent on different venues, and each has a part its venue has not let the account
+ * spend yet. Spendable and pending are printed side by side, because a pending balance hidden in a
+ * footnote reads as money that can be spent.
  *
- * Two scopes, one component. Across every known account it shows the aggregate and the table;
- * scoped to one account it shows that account's own figures and no table, because a one-row
- * table is a worse way to read one row.
+ * The table is for the scope of every account; scoped to one account the page leaves it out,
+ * because a one-row table is a worse way to read one row.
  */
+
+/** CSFloat's balance is US dollars, whatever the account's Steam wallet is in. */
+const CSFLOAT_CURRENCY = 'USD';
+
 export function PortfolioView({
   holdings,
-  scope,
-  onSelectAccount,
-  avatars,
+  valuation = null,
   now = new Date()
 }: {
   holdings: readonly AccountHoldings[];
-  /** `null` = every signed-in account. Otherwise the one account being shown. */
-  scope: string | null;
-  onSelectAccount: (accountId: string) => void;
-  /** `avatar:<hash>` by accountId, when a persona walk has observed one. */
-  avatars?: Readonly<Record<string, string | null>> | undefined;
+  /** Main's figures for the same scope: every money figure on this page is one of its. */
+  valuation?: PortfolioValuation | null | undefined;
   now?: Date;
 }): React.JSX.Element {
   const totals = useMemo(() => aggregate(holdings), [holdings]);
-  const total = observedTotalCents(totals);
-  const bars = segments(totals);
-  const currency = displayCurrency(totals.currency);
-  const only = scope === null ? null : holdings.find((row) => row.accountId === scope) ?? null;
+  // The currency an empty Steam figure is printed in: the one Steam wallet currency, else the base.
+  const steamCodes = [...new Set(holdings.map((row) => row.currency).filter((code): code is number => code !== null))];
+  const steamHome: CurrencyRef = steamCodes.length === 1 ? steamCodes[0] : valuation?.base ?? null;
+  const show = (key: ObservedKey, home: CurrencyRef): Shown | null => (valuation ? shown(quantity(valuation, key), home) : null);
+  const steamAt = oldest(holdings.map((row) => row.wallet?.observedAt ?? null));
 
-  const description = <PageHeader subtitle="Observed money only. Inventory is counted, never appraised." />;
-
-  if (holdings.length === 0) {
-    return (
-      <Panel>
-        {description}
-        <Empty icon="wallet" title="Nothing observed yet" hint="Figures appear once an account has been connected and its wallet and market have been read." />
-      </Panel>
-    );
-  }
-
-  const marketAge = freshness(totals.market.observedAt, now);
-  const inventoryAge = freshness(totals.inventory.observedAt, now);
+  if (holdings.length === 0) return <></>;
 
   return (
     <>
-      {description}
-      <Panel className="enter">
-        <div className="panel-body">
-          <div className="holdings-head">
-            <div>
-              {/* Which accounts these are is the account strip's to say; this only names the figure. */}
-              <div className="holdings-label">{only ? `${only.accountName}'s holdings` : 'Total holdings'}</div>
-              <div className="holdings-total num" data-settled={totals.market.settled}>
-                {formatCents(total, currency)}
-              </div>
-              <div className="holdings-caption">
-                {/* CLAUDE.md rule 5. A walk that did not finish proves nothing about what it did
-                    not reach, so the figure above is a floor and has to say so. */}
-                {totals.market.settled
-                  ? <><Icon name="check-circle" size={13} /> Observed across wallet and open listings</>
-                  : <><Icon name="alert-circle" size={13} /> At least this much — the last market walk did not complete</>}
-              </div>
-              {totals.currency.kind === 'mixed' ? (
-                <div className="holdings-caption" data-tone="warn">
-                  <Icon name="alert-triangle" size={13} />
-                  Accounts report different Steam currencies ({totals.currency.codes.join(', ')}). This app has no
-                  exchange rate, so the figure above adds numbers that are not comparable — read the per-account rows.
+      <div
+        className="portfolio-observed enter enter-2"
+        data-testid="portfolio-observed-cards"
+        data-currencies={valuation ? valuation.observed.length : undefined}
+        data-converted={valuation && valuation.observed.length > 1 ? true : undefined}
+      >
+        <div className="wallet-cards">
+          <WalletCard
+            venue="steam"
+            title="Steam wallet"
+            testId="portfolio-wallet"
+            available={show('steam', steamHome)}
+            pending={show('steamPending', steamHome)}
+            share={valuation ? [valuation.observedInBase.steam.cents, valuation.observedInBase.steamPending.cents] : null}
+            age={freshness(steamAt, now)}
+            known={holdings.some((row) => row.wallet !== null)}
+            unknown="Not read yet"
+            tip="Spendable is what the wallet can pay with now. Pending is money Steam shows in the wallet but has not released yet."
+            pendingTip="In the wallet, not yet spendable. Steam releases it on its own schedule."
+            extra={valuation && valuation.observedInBase.reserved.cents ? (
+              <dl className="value-lines">
+                <div>
+                  <dt><Tip content="Committed by buy orders this app placed that Steam has not shown back yet. Still part of the balance above.">Held for this app&apos;s orders</Tip></dt>
+                  <dd className="num"><MoneyFigures figures={shown(quantity(valuation, 'reserved'), steamHome).figures} inline /></dd>
                 </div>
-              ) : null}
-            </div>
-            <dl className="holdings-evidence">
-              <div>
-                <dt><Icon name="store" size={12} /> Market</dt>
-                <dd data-tone={marketAge.tone}>{marketAge.label}{totals.market.settled ? '' : ' · partial'}</dd>
-              </div>
-              <div>
-                <dt><Icon name="package" size={12} /> Inventory</dt>
-                <dd data-tone={inventoryAge.tone}>{inventoryAge.label}{totals.inventory.settled ? '' : ' · partial'}</dd>
-              </div>
-            </dl>
-          </div>
-
-          <AllocationBar segments={bars} total={total} currency={currency} />
-
-          <div className="holdings-legend">
-            {bars.filter((segment) => segment.cents > 0).map((segment) => (
-              <span key={segment.key} className="holdings-legend-item">
-                <SegmentDot segment={segment} />
-                {segment.label}
-                <span className="num">{formatCents(segment.cents, currency)}</span>
-              </span>
-            ))}
-            {total === 0 ? <span className="holdings-legend-item quiet"><Icon name="info" size={12} /> Nothing observed yet — connect an account and let it refresh.</span> : null}
-          </div>
+              </dl>
+            ) : null}
+          />
+          <WalletCard
+            venue="csfloat"
+            title="CSFloat balance"
+            testId="portfolio-csfloat-wallet"
+            available={totals.csfloat.accounts > 0 ? show('csfloat', CSFLOAT_CURRENCY) : null}
+            pending={totals.csfloat.accounts > 0 ? show('csfloatPending', CSFLOAT_CURRENCY) : null}
+            share={valuation ? [valuation.observedInBase.csfloat.cents, valuation.observedInBase.csfloatPending.cents] : null}
+            age={freshness(totals.csfloat.observedAt, now)}
+            known={totals.csfloat.accounts > 0}
+            unknown={holdings.length === 1 ? 'No CSFloat key connected' : 'No account has a CSFloat key connected'}
+            tip={`Spendable is what CSFloat lets the account buy with now. Pending is sale money CSFloat is still holding.${holdings.length > 1 ? ` A key is connected on ${totals.csfloat.accounts} of ${holdings.length} accounts.` : ''}`}
+            pendingTip="Proceeds from sales CSFloat has not released yet. It cannot pay for a buy order."
+          />
         </div>
-      </Panel>
 
-      <div className="metrics">
-        <ValueCard
-          index={0}
-          icon="wallet"
-          variable="--cs-hold-wallet"
-          title="Wallet"
-          value={formatCents(totals.wallet?.balanceCents ?? null, currency)}
-          lines={[
-            { label: 'Delayed', value: formatCents(totals.wallet?.delayedBalanceCents ?? null, currency) },
-            { label: 'Reserved by this app', value: formatCents(totals.reservedCents, currency) }
-          ]}
-          note={totals.wallet ? undefined : 'not observed yet'}
-        />
-        <ValueCard
-          index={1}
-          icon="tag"
-          variable="--cs-hold-listed"
-          title="Listed proceeds"
-          value={formatCents(totals.listedReceiveCents + totals.onHoldReceiveCents, currency)}
-          lines={[
-            { label: `Live · ${totals.counts.listingsActive}`, value: formatCents(totals.listedReceiveCents, currency) },
-            { label: `On hold · ${totals.counts.listingsOnHold}`, value: formatCents(totals.onHoldReceiveCents, currency) }
-          ]}
-          note="What you receive; Steam adds the buyer fee on top."
-        />
-        <ValueCard
-          index={2}
-          icon="smartphone"
-          variable="--cs-hold-unconfirmed"
-          title="Awaiting confirmation"
-          value={formatCents(totals.awaitingConfirmationReceiveCents, currency)}
-          lines={[{ label: 'Listings', value: String(totals.counts.listingsAwaitingConfirmation) }]}
-          note="Waiting on a phone tap this app never makes."
-        />
-        <ValueCard
-          index={3}
-          icon="shopping-cart"
-          variable="--cs-hold-wallet"
-          title="Open buy orders"
-          value={formatCents(totals.buyOrderOpenCents, currency)}
-          lines={[{ label: 'Orders', value: String(totals.counts.buyOrdersActive) }]}
-          note="Reserved out of the wallet above, not added to it."
-        />
-        <ValueCard
-          index={4}
-          icon="package"
-          title="Items held"
-          value={heldCounts(totals.counts).total.toLocaleString()}
-          lines={[
-            { label: 'In storage units', value: `${heldCounts(totals.counts).crated.toLocaleString()} · ${plural(totals.counts.storageUnits, 'unit')}` },
-            { label: 'Stackable units', value: totals.counts.fungibleUnits.toLocaleString() }
-          ]}
-          note="Counted, not valued: there is no price catalogue."
-        />
+        <div className="metrics value-cards market-cards">
+          <FigureCard
+            index={0}
+            icon="tag"
+            hue="listed"
+            title="Listed"
+            testId="portfolio-listed"
+            tip="What you receive when these sell; the buyer pays Steam's fee on top. The items are still counted in inventory, so this is never added to the total."
+            value={show('listings', steamHome)}
+            // Live and on hold apart only when Steam is holding some: otherwise the one line would repeat the figure.
+            lines={valuation && totals.counts.listingsOnHold > 0 ? [
+              { label: `Live · ${totals.counts.listingsActive}`, value: shown(quantity(valuation, 'listed'), steamHome) },
+              { label: `On hold · ${totals.counts.listingsOnHold}`, value: shown(quantity(valuation, 'onHold'), steamHome), tip: 'Listings Steam is holding before they go live.' }
+            ] : [{ label: 'Listings', value: totals.counts.listingsActive.toLocaleString() }]}
+          />
+          <FigureCard
+            index={1}
+            icon="smartphone"
+            hue="unconfirmed"
+            title="Awaiting confirmation"
+            testId="portfolio-awaiting"
+            tip="Listings waiting for a tap in the Steam mobile app. This app never confirms them."
+            value={show('awaitingConfirmation', steamHome)}
+            lines={[{ label: 'Listings', value: totals.counts.listingsAwaitingConfirmation.toLocaleString() }]}
+          />
+          <FigureCard
+            index={2}
+            icon="shopping-cart"
+            hue="wallet"
+            title="Buy orders"
+            testId="portfolio-buy-orders"
+            tip="What open Steam buy orders would spend. Steam keeps it inside the wallet balance, so it is never added to anything."
+            value={show('buyOrders', steamHome)}
+            lines={[
+              { label: 'Steam', value: plural(totals.counts.buyOrdersActive, 'order') },
+              ...(totals.counts.csfloatBuyOrdersActive > 0 ? [{ label: 'CSFloat', value: plural(totals.counts.csfloatBuyOrdersActive, 'order') }] : [])
+            ]}
+          />
+        </div>
       </div>
-
-      {scope === null ? (
-        <Panel className="enter enter-2">
-          <PanelHeader icon="users" title="By account" subtitle="Select a row to open that account." />
-          <div className="panel-body flush">
-            <div className="rows">
-              <div className="row account-row row-head">
-                <span>Account</span>
-                <span>Observed</span>
-                <span>Wallet</span>
-                <span>Listed</span>
-                <span>Items</span>
-                <span>Synced</span>
-              </div>
-              {holdings.map((row) => {
-                const age = freshness(row.market.observedAt ?? row.inventory.observedAt, now);
-                const code = row.currency;
-                return (
-                  <button
-                    key={row.accountId}
-                    type="button"
-                    className="row account-row"
-                    aria-label={`Open ${row.accountName}`}
-                    onClick={() => onSelectAccount(row.accountId)}
-                  >
-                    <span className="account-row-name">
-                      <Avatar name={row.accountName} size={30} photo={avatars?.[row.accountId]} />
-                      <span className="grow">
-                        <span className="group-name">{row.accountName}</span>
-                        <span className="cell-sub">Steam ID {row.steamId64}</span>
-                      </span>
-                    </span>
-                    <span className="num" data-settled={row.market.settled}>
-                      {formatCents(observedTotalCents(row), code)}
-                    </span>
-                    <span className="num">{formatCents(row.wallet?.balanceCents ?? null, code)}</span>
-                    <span className="num">
-                      {formatCents(row.listedReceiveCents + row.onHoldReceiveCents, code)}
-                      <span className="cell-sub">{plural(row.counts.listingsActive + row.counts.listingsOnHold, 'listing')}</span>
-                    </span>
-                    <span className="num">
-                      {heldCounts(row.counts).total.toLocaleString()}
-                      <span className="cell-sub">{heldCounts(row.counts).crated.toLocaleString()} in storage</span>
-                    </span>
-                    <span className="holdings-age" data-tone={age.tone}>{age.label}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </Panel>
-      ) : null}
     </>
   );
 }
 
 /**
- * The stacked bar. Segments carry their own figure in the accessible name, because the visual
- * one is a width and a width is not readable.
+ * One venue's wallet: spendable and pending side by side, a thin meter of their split, and how old
+ * the read is. A wallet nobody has read is said to be unread, never printed as zero.
  */
-function AllocationBar({
-  segments: bars,
-  total,
-  currency
-}: {
-  segments: readonly HoldingsSegment[];
-  total: number;
-  currency: number | null;
-}): React.JSX.Element {
-  const visible = bars.filter((segment) => segment.cents > 0);
-  return (
-    <div className="allocation" role="img" aria-label="Holdings allocation">
-      {visible.length === 0 ? <div className="allocation-empty" /> : visible.map((segment, index) => (
-        <div
-          key={segment.key}
-          className="allocation-segment"
-          data-pending={segment.pending}
-          title={`${segment.label}: ${formatCents(segment.cents, currency)}`}
-          aria-label={`${segment.label}: ${formatCents(segment.cents, currency)}`}
-          style={{
-            flex: `0 1 ${share(segment.cents, total)}%`,
-            background: `var(${segment.variable})`,
-            animationDelay: `${index * 60}ms`
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
-function SegmentDot({ segment }: { segment: HoldingsSegment }): React.JSX.Element {
-  return (
-    <span
-      aria-hidden="true"
-      className="allocation-dot"
-      data-pending={segment.pending}
-      style={{ background: `var(${segment.variable})` }}
-    />
-  );
-}
-
-function ValueCard({
-  index,
-  icon,
-  variable,
-  title,
-  value,
-  lines,
-  note
-}: {
-  index: number;
-  icon: IconName;
-  variable?: string | undefined;
+function WalletCard({ venue, title, testId, available, pending, share: split, age, known, unknown, tip, pendingTip, extra }: {
+  venue: 'steam' | 'csfloat';
   title: string;
-  value: string;
-  lines: ReadonlyArray<{ label: string; value: string }>;
-  note?: string | undefined;
+  testId: string;
+  available: Shown | null;
+  pending: Shown | null;
+  /** Spendable and pending in the base, for the meter. */
+  share: [number | null, number | null] | null;
+  age: ReturnType<typeof freshness>;
+  known: boolean;
+  unknown: string;
+  tip: string;
+  pendingTip: string;
+  extra?: React.ReactNode;
 }): React.JSX.Element {
+  const [spendable, held] = split ?? [null, null];
+  const meter = known && spendable !== null && held !== null && spendable + held > 0 ? share(held, spendable + held) : null;
   return (
-    <article className="metric value-card enter" style={{ ...(variable ? { borderTopColor: `var(${variable})` } : {}), animationDelay: `${60 + index * 40}ms` }}>
-      <div className="metric-head">
-        <div className="metric-label">{title}</div>
-        <span className="metric-icon"><Icon name={icon} size={15} /></span>
+    <article className="wallet-card enter" data-testid={testId} data-venue={venue} data-known={known}>
+      <div className="wallet-head">
+        <VenueMark venue={venue} size={16} decorative />
+        <span className="wallet-title">{title}</span>
+        <Tip content={tip} label={`About the ${title.toLowerCase()}`} />
+        <span className="grow" />
+        {known ? <span className="wallet-age" data-tone={age.tone}>{age.label}</span> : null}
       </div>
-      <div className="metric-value num">{value}</div>
-      <dl className="value-lines">
-        {lines.map((line) => (
-          <div key={line.label}>
-            <dt>{line.label}</dt>
-            <dd className="num">{line.value}</dd>
+      {!known ? (
+        <div className="wallet-unknown">{unknown}</div>
+      ) : (
+        <>
+          <div className="wallet-figures">
+            <div className="wallet-figure">
+              <div className="wallet-figure-label">Spendable</div>
+              {available === null
+                ? <Skeleton width={150} height={26} />
+                : <div className="metric-value num" data-count={available.figures.length}><MoneyFigures figures={available.figures} /></div>}
+              {available ? <Beside value={available} /> : null}
+            </div>
+            <div className="wallet-figure" data-pending="true">
+              <div className="wallet-figure-label">
+                <span className="allocation-dot wallet-dot" data-pending="true" aria-hidden="true" />
+                <Tip content={pendingTip}>Pending</Tip>
+              </div>
+              {pending === null
+                ? <Skeleton width={110} height={22} />
+                : <div className="wallet-pending-value num"><MoneyFigures figures={pending.figures} /></div>}
+              {pending ? <Beside value={pending} /> : null}
+            </div>
           </div>
-        ))}
-      </dl>
-      {note ? <div className="metric-note">{note}</div> : null}
+          {meter !== null ? (
+            <div className="wallet-meter" role="img" aria-label={`${Math.round(meter)}% pending`}>
+              <span style={{ flexBasis: `${100 - meter}%` }} />
+              <span data-pending="true" style={{ flexBasis: `${meter}%` }} />
+            </div>
+          ) : null}
+          {extra}
+        </>
+      )}
     </article>
   );
 }
 
-/** `formatCents` wants a Steam currency code; a mixed or unobserved portfolio has none to give. */
-function displayCurrency(currency: PortfolioCurrency): number | null {
-  return currency.kind === 'single' ? currency.code : null;
+/**
+ * Per account: what it holds in the base, then each wallet in its own currency, its listings and
+ * its items. The holdings column is main's per-account figure, shown only once the fill has asked
+ * every held kind, for the same reason the headline waits.
+ */
+export function AccountsTable({ holdings, valuation, avatars, now = new Date(), onSelectAccount }: {
+  holdings: readonly AccountHoldings[];
+  valuation: PortfolioValuation | null;
+  avatars?: Readonly<Record<string, string | null>> | undefined;
+  now?: Date;
+  onSelectAccount: (accountId: string) => void;
+}): React.JSX.Element {
+  const figures: readonly AccountFigures[] | null = valuation?.valued ? valuation.accounts : null;
+  const base = valuation?.base ?? null;
+  return (
+    <Panel className="enter enter-4">
+      <PanelHeader icon="users" title="By account" />
+      <div className="panel-body flush">
+        <div className="rows">
+          <div className="row account-row row-head">
+            <span>Account</span>
+            <span><Tip content="Wallets plus items at the Steam mid price, in the portfolio's currency.">Holdings</Tip></span>
+            <span>Steam wallet</span>
+            <span>CSFloat</span>
+            <span>Listed</span>
+            <span>Items</span>
+            <span>Synced</span>
+          </div>
+          {holdings.map((row) => {
+            const age = freshness(row.market.observedAt ?? row.inventory.observedAt, now);
+            const total = figures?.find((entry) => entry.accountId === row.accountId)?.total ?? null;
+            const csfloat = row.csfloatWallet;
+            return (
+              <button
+                key={row.accountId}
+                type="button"
+                className="row account-row"
+                aria-label={`Open ${row.accountName}`}
+                onClick={() => onSelectAccount(row.accountId)}
+              >
+                <span className="account-row-name">
+                  <Avatar name={row.accountName} size={30} photo={avatars?.[row.accountId]} />
+                  <span className="grow">
+                    <span className="group-name">{row.accountName}</span>
+                    <span className="cell-sub">Steam ID {row.steamId64}</span>
+                  </span>
+                </span>
+                <span className="num account-holdings" data-settled={row.market.settled} data-complete={total?.complete}>
+                  {figures === null ? <Skeleton width={80} height={13} /> : total === null || total.cents === null || base === null ? '—' : `≈ ${formatAmount(total.cents, base)}`}
+                  {total && total.missingCurrencies.length > 0 ? <span className="cell-sub" data-tone="warn">no rate for {total.missingCurrencies.join(', ')}</span> : null}
+                </span>
+                <span className="num">
+                  {formatAmount(row.wallet?.balanceCents ?? null, row.currency)}
+                  {row.wallet && row.wallet.delayedBalanceCents > 0 ? <span className="cell-sub">+ {formatAmount(row.wallet.delayedBalanceCents, row.currency)} pending</span> : null}
+                </span>
+                <span className="num">
+                  {csfloat ? formatAmount(csfloat.availableCents, csfloat.currency) : <span className="quiet">—</span>}
+                  {csfloat && csfloat.pendingCents > 0 ? <span className="cell-sub">+ {formatAmount(csfloat.pendingCents, csfloat.currency)} pending</span> : null}
+                </span>
+                <span className="num">
+                  {formatAmount(row.listedReceiveCents + row.onHoldReceiveCents, row.currency)}
+                  <span className="cell-sub">{plural(row.counts.listingsActive + row.counts.listingsOnHold, 'listing')}</span>
+                </span>
+                <span className="num">
+                  {heldCounts(row.counts).total.toLocaleString()}
+                  <span className="cell-sub">{heldCounts(row.counts).crated.toLocaleString()} in storage</span>
+                </span>
+                <span className="holdings-age" data-tone={age.tone}>{age.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/**
+ * The oldest of the reads behind a figure: it is as current as its least current part. A wallet
+ * never read adds no money to the figure, so it has no age to add to it either.
+ */
+function oldest(stamps: ReadonlyArray<string | null>): string | null {
+  return stamps.reduce<string | null>((least, stamp) => (stamp === null ? least : least === null || stamp < least ? stamp : least), null);
 }

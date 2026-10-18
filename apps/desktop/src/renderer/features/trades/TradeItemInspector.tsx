@@ -49,7 +49,7 @@ export function TradeItemInspector({ item, entry, accounts, multiAccount, onClos
     ...(item.newAssetId ? [{ label: 'Asset ID after it', value: item.newAssetId, mono: true }] : []),
     { label: 'Class / instance', value: `${item.classId} / ${item.instanceId}`, mono: true },
     ...(item.csfloatTradeId ? [{ label: 'CSFloat trade', value: item.csfloatTradeId, mono: true }] : []),
-    ...(item.csfloatPriceCents !== null ? [{ label: 'CSFloat price', value: `${formatUsd(item.csfloatPriceCents)} USD`, copy: false }] : [])
+    ...(item.csfloatPriceCents !== null ? [{ label: 'CSFloat price', value: formatUsd(item.csfloatPriceCents), copy: false }] : [])
   ];
   const game: Fact[] = [];
   if (item.defIndex !== null) game.push({ label: 'Def index', value: String(item.defIndex), mono: true });
@@ -74,7 +74,7 @@ export function TradeItemInspector({ item, entry, accounts, multiAccount, onClos
     {item.unresolved && item.unresolved !== 'no-identity' ? <Caption icon="info">{UNRESOLVED_REASON[item.unresolved] ?? item.unresolved}</Caption> : null}
     {item.csfloatPriceCents !== null ? (
       <Caption icon="shopping-cart" tone="accent">
-        {item.side === 'RECEIVE' ? 'Bought' : 'Sold'} on CSFloat for {formatUsd(item.csfloatPriceCents)} USD
+        {item.side === 'RECEIVE' ? 'Bought' : 'Sold'} on CSFloat for {formatUsd(item.csfloatPriceCents)}
       </Caption>
     ) : null}
     <InspectorWear paintWear={item.paintWear} paintSeed={item.paintSeed} range={item} />

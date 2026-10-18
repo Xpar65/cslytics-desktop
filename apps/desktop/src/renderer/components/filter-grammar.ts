@@ -357,6 +357,132 @@ function withoutOwnerConflict(chips: readonly FilterChip[], added: FilterChip): 
   return [...chips];
 }
 
+/**
+ * A suggestion that finishes what is being typed rather than adding a chip: `fill` replaces the
+ * box's text, and the person types the number it still needs.
+ */
+export type Completion = { kind: ChipKind; label: string; fill: string; detail: string };
+
+/**
+ * The predicates, which need a number before they are a chip. Each offers its forms as soon as its
+ * keyword is recognisable, so `f` or `flo` already shows Float below and Float above, rather than
+ * nothing until `float>0` parses.
+ */
+const PREDICATES: ReadonlyArray<{
+  kind: 'float' | 'norm' | 'seed';
+  keywords: readonly string[];
+  /** The keyword a filled form is written with. */
+  word: string;
+  /** What is still to type, once the keyword and any operator are there. */
+  wanted: string;
+  forms: ReadonlyArray<{ op?: ChipOperator; label: string; example: string }>;
+}> = [
+  {
+    kind: 'float', keywords: FLOAT_KEYWORDS, word: 'float', wanted: 'Type a float from 0 to 1',
+    forms: [
+      { op: '<', label: 'Float below …', example: 'float < 0.07' },
+      { op: '>', label: 'Float above …', example: 'float > 0.38' },
+      { op: '=', label: 'Float about …', example: 'float = 0.15' }
+    ]
+  },
+  {
+    kind: 'norm', keywords: NORM_KEYWORDS, word: 'nf', wanted: 'Type a normalised float from 0 to 1',
+    forms: [
+      { op: '<', label: 'Normalised float below …', example: 'nf < 0.01 is the top 1 % of its range' },
+      { op: '>', label: 'Normalised float above …', example: 'nf > 0.99 is the bottom 1 %' },
+      { op: '=', label: 'Normalised float about …', example: 'nf = 0.5 is the middle of its range' }
+    ]
+  },
+  {
+    kind: 'seed', keywords: SEED_KEYWORDS, word: 'seed', wanted: 'Type a pattern from 0 to 1000',
+    forms: [{ label: 'Pattern …', example: 'seed 661, or #661' }]
+  }
+];
+
+/** The word filters, which are chips the moment their word is recognised. */
+const WORDS: ReadonlyArray<{ tokens: readonly string[]; chip: FilterChip }> = [
+  ...WEAR_TIERS.map((tier) => ({ tokens: tier.tokens, chip: wearChip(tier) })),
+  ...QUALITY.map((entry) => ({ tokens: entry.tokens, chip: { kind: 'category' as const, text: entry.quality, quality: entry.quality } })),
+  ...WHERE.map((entry) => ({ tokens: entry.tokens, chip: { kind: 'where' as const, text: entry.tokens[0]!, ...whereOf(entry) } })),
+  ...LOCKS.map((entry) => ({ tokens: entry.tokens, chip: { kind: 'lock' as const, text: entry.lock, lock: entry.lock } })),
+  { tokens: ['tradable'], chip: { kind: 'tradable', text: 'tradable' } }
+];
+
+/**
+ * What the word being typed could become, before it parses as anything.
+ *
+ * `parse` only claims a finished token, so on its own the bar is silent until a filter is typed in
+ * full. This looks at the tail of the text and offers three things:
+ *
+ *  - **A predicate's forms** while its keyword is typed or half typed (`f`, `flo`, `float`, `nf`,
+ *    `pat`), each filling the box with the keyword and its operator.
+ *  - **What a predicate still needs** once the operator is there but the number is not (`float >`,
+ *    `f<=`, `nf < 0.`), so Enter does not turn the half-typed predicate into a name search.
+ *  - **A word filter** whose word is half typed (`fact`, `factory n`, `sto`, `statt`), as its chip.
+ *
+ * A one-letter word only completes when it is a keyword itself, as `f` is: a single letter begins
+ * too many words to mean any of them. A filter `parse` already offers is not offered again, so `st`
+ * is StatTrak once, with In storage after it.
+ */
+export function completions(text: string): { chips: FilterChip[]; fills: Completion[] } {
+  const tokens = tokenise(text);
+  if (tokens.length === 0) return { chips: [], fills: [] };
+  const finished = /\s$/.test(text);
+
+  // A keyword and an operator, the number still to come. Up to three tokens, because the three
+  // parts may each have been typed with or without spaces.
+  for (const span of [3, 2, 1]) {
+    if (tokens.length < span) continue;
+    const tail = /^([a-z]+)(>=|<=|>|<|=)(\d*\.?)$/.exec(tokens.slice(-span).join(''));
+    if (!tail || NUMBER.test(tail[3]!)) continue;
+    const predicate = PREDICATES.find((entry) => entry.forms.some((form) => form.op) && entry.keywords.includes(tail[1]!));
+    if (!predicate) continue;
+    const op = tail[2] as ChipOperator;
+    const form = predicate.forms.find((entry) => entry.op === (op === '>=' ? '>' : op === '<=' ? '<' : op)) ?? predicate.forms[0]!;
+    return { chips: [], fills: [{ kind: predicate.kind, label: form.label, fill: text, detail: predicate.wanted }] };
+  }
+
+  const last = tokens.at(-1)!;
+  const before = tokens.slice(0, -1);
+  const fills: Completion[] = [];
+  for (const predicate of PREDICATES) {
+    const exact = predicate.keywords.includes(last);
+    const partial = !finished && last.length >= 2 && predicate.keywords.some((keyword) => keyword.startsWith(last));
+    if (!exact && !partial) continue;
+    for (const form of predicate.forms) {
+      fills.push({
+        kind: predicate.kind,
+        label: form.label,
+        fill: `${[...before, form.op ? `${predicate.word} ${form.op}` : predicate.word].join(' ')} `,
+        detail: form.example
+      });
+    }
+  }
+
+  // What `parse` already offers is not offered twice: `st` is StatTrak there, and In storage here.
+  const offered = new Set(parse(text).chips.map(filterKey));
+  const chips: FilterChip[] = [];
+  for (const span of [2, 1]) {
+    if (tokens.length < span) continue;
+    const typed = tokens.slice(-span).join(' ');
+    if (typed.length < 2) continue;
+    const prefix = finished ? `${typed} ` : typed;
+    for (const word of WORDS) {
+      const key = filterKey(word.chip);
+      if (offered.has(key) || !word.tokens.some((token) => token.startsWith(prefix))) continue;
+      offered.add(key);
+      chips.push(word.chip);
+    }
+  }
+  return { chips, fills };
+}
+
+/** What a chip filters by, so two chips that ask the same question are one suggestion. */
+function filterKey(chip: FilterChip): string {
+  const by = chip.kind === 'where' ? (chip.listed ? 'listed' : chip.location) : chip.quality ?? chip.lock ?? chip.text;
+  return `${chip.kind}:${by ?? chip.text}`;
+}
+
 export function removeChip(chips: readonly FilterChip[], index: number): FilterChip[] {
   return chips.filter((_, position) => position !== index);
 }

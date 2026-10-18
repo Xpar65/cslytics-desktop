@@ -1,6 +1,7 @@
 import type { EngineContext } from '../kernel/context.js';
 import { ACCOUNT_INVENTORY, surfaceEvidence } from '../kernel/evidence.js';
 import { TransferStore, type TransferAsset, type TransferMember } from '../db/transfers.js';
+import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { HoldingsStore } from '../db/holdings.js';
 import { COMMITTING_STATUSES } from './trade-status.js';
 import { marketplaceBlock } from '../kernel/marketplace-commitments.js';
@@ -34,7 +35,7 @@ export class TransferPlanner {
 
   plan(destinationAccountId: string, members: readonly TransferMember[], ownCommand = ''): TransferPlan {
     const db = this.context.database;
-    const store = new TransferStore(db);
+    const store = new TransferStore(db), evidence = new AssetEvidenceStore(db);
     const accounts = db.listAccounts();
     const result: TransferPlan = { destinationAccountId, groups: [], blocked: [], quantity: 0, retrievals: 0 };
     const block = (accountId: string, memberId: string, reason: string) => result.blocked.push({ accountId, memberId, reason });
@@ -58,26 +59,26 @@ export class TransferPlanner {
         const casketId = item.location === 'CASKET' && item.casket_id ? item.casket_id : null;
         const reason = this.itemRestriction(item.location,item.tradable_after,item.trade_protected_until,casketId !== null);
         if (reason) { block(member.accountId,key,reason); continue; }
-        if (!item.current_asset_id) { block(member.accountId,key,'Item has no current inventory asset'); continue; }
-        assets.push({ appId: 730, contextId: '2', assetId: item.current_asset_id, quantity: 1, localId: item.local_id,
+        if (!item.asset_id) { block(member.accountId,key,'Item has no current inventory asset'); continue; }
+        assets.push({ appId: 730, contextId: '2', assetId: item.asset_id, quantity: 1, localId: item.local_id,
           stableKey: item.stable_key, unitKind: item.unit_kind, defIndex: item.def_index, quality: item.quality, sourceQuantity: 1,
           ...(casketId ? { pendingRetrieval: true, casketId } : {}) });
       } else {
         let remaining = quantity;
-        const units = new HoldingsStore(db).units(member.accountId,member.stackKey).filter(u => u.location === 'MAIN' && u.current_asset_id);
+        const units = new HoldingsStore(db).units(member.accountId,member.stackKey).filter(u => u.location === 'MAIN' && u.asset_id);
         if (member.casketId) { block(member.accountId,key,'A stack in storage cannot be sent; retrieve it before sending'); continue; }
         for (const unit of units) {
           if (remaining <= 0) break;
-          const reason = this.assetRestriction(member.accountId,unit.current_asset_id!,unit.local_id,ownCommand);
+          const reason = this.assetRestriction(member.accountId,unit.asset_id!,unit.local_id,ownCommand);
           if (reason || (unit.reserved_command && unit.reserved_command !== ownCommand)) continue;
           const taken = Math.min(remaining,unit.quantity);
-          assets.push({ appId: 730, contextId: '2', assetId: unit.current_asset_id!, quantity: taken, localId: unit.local_id,
+          assets.push({ appId: 730, contextId: '2', assetId: unit.asset_id!, quantity: taken, localId: unit.local_id,
             stableKey: unit.stable_key, unitKind: unit.unit_kind, defIndex: unit.def_index, quality: unit.quality, sourceQuantity: unit.quantity });
           remaining -= taken;
         }
         if (remaining) {
           const first = units[0];
-          block(member.accountId,key, first ? this.assetRestriction(member.accountId,first.current_asset_id!,first.local_id,ownCommand) ?? 'Not enough available tradable quantity'
+          block(member.accountId,key, first ? this.assetRestriction(member.accountId,first.asset_id!,first.local_id,ownCommand) ?? 'Not enough available tradable quantity'
             : 'Item is not in main inventory; retrieve or delist it before sending'); continue;
         }
       }
@@ -85,7 +86,7 @@ export class TransferPlanner {
         const pending = asset.pendingRetrieval === true;
         const reason = this.assetRestriction(member.accountId,asset.assetId,asset.localId,ownCommand,pending);
         if (reason) { block(member.accountId,key,reason); continue; }
-        if (!pending && (store.eligibility(member.accountId,asset.assetId)?.quantity ?? 0) < asset.quantity) {
+        if (!pending && (evidence.community(member.accountId,asset.assetId)?.quantity ?? 0) < asset.quantity) {
           block(member.accountId,key,'Steam inventory quantity changed; refresh before sending'); continue;
         }
         const assetKey = `${member.accountId}:${asset.assetId}`;
@@ -150,18 +151,18 @@ export class TransferPlanner {
    * makes it once the item is observed in main inventory.
    */
   protected assetRestriction(accountId: string, assetId: string, localId: string, ownCommand: string, pendingRetrieval = false): string | null {
-    const db = this.context.database, store = new TransferStore(db);
+    const db = this.context.database, store = new TransferStore(db), evidence = new AssetEvidenceStore(db);
     const marketplace = marketplaceBlock(db,accountId,localId,'account-transfer',this.context.now());
     if (marketplace) return marketplace;
     // The Game Coordinator's `cannot trade` on the unit itself, which no Community read can lift
     // and which a crated item carries too, so it is judged before the deferred tradability below.
     if (storedCannotTrade(db.itemByAssetId(accountId,assetId)?.attributes_json)) return 'Item is marked untradable by Steam';
     if (!pendingRetrieval) {
-      const row = store.eligibility(accountId,assetId);
+      const row = evidence.community(accountId,assetId);
       // Require a positive current description even for cases and coins. An expired cooldown
       // never upgrades tradable=0; only a subsequent Steam observation can do that.
       const latest = store.fresh(accountId,'steam-trade-inventory',this.context.now());
-      if (!row || !latest || row.observation_id !== latest.id) return 'Tradability unknown; refresh trade eligibility';
+      if (!row || !latest || row.last_seen_obs !== latest.id) return 'Tradability unknown; refresh trade eligibility';
       const unit = db.itemByAssetId(accountId,assetId);
       if (unit?.unit_kind === 'fungible') {
         // A group unit carries the same two lock columns a skin does; the individual path
@@ -185,11 +186,10 @@ export class TransferPlanner {
     const db = this.context.database;
     const steamId = db.listAccounts().find(a => a.id === destination)?.steam_id64;
     if (!steamId || !/^\d{17}$/.test(steamId)) return 'Invalid destination identity';
-    const partner = (BigInt(steamId) - 76561197960265728n).toString();
-    const live = db.raw().prepare(`SELECT offer_id,counterparty_id FROM trade_offer WHERE account_id=? AND direction='SENT' AND raw_state IN (2,9)`).all(accountId) as Array<{ offer_id: string; counterparty_id: string }>;
+    const live = db.raw().prepare(`SELECT offer_id,counterparty_steam_id64 FROM trade_offer WHERE account_id=? AND direction='SENT' AND state_code IN (2,9)`).all(accountId) as Array<{ offer_id: string; counterparty_steam_id64: string }>;
     const pending = new TransferStore(db).batches().filter(b => b.account_id === accountId && b.command_id !== ownCommand && !['DONE','ENDED','FAILED'].includes(b.state)
       && !live.some(o => o.offer_id === b.offer_id));
-    if (live.length + pending.length >= 20 || live.filter(o => o.counterparty_id === partner).length + pending.filter(b => b.destination_account_id === destination).length >= 4) return 'Active trade offer budget reached';
+    if (live.length + pending.length >= 20 || live.filter(o => o.counterparty_steam_id64 === steamId).length + pending.filter(b => b.destination_account_id === destination).length >= 4) return 'Active trade offer budget reached';
     return null;
   }
 }

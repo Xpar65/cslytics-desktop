@@ -8,7 +8,7 @@ import { VenueMark } from '../../components/VenueMark.js';
 import { VenueFilter, useOfferedVenue } from '../../components/VenueFilter.js';
 import { VENUE_ID, VENUE_LABEL, VENUE_ORDER, byVenue, venueOffer, type VenueId } from '../../lib/marketplaces.js';
 import { useWorkRefresh } from '../work/WorkIndicator.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { currencyCode, formatDateTime, formatRelative, plural } from '../../lib/labels.js';
 import { SortControl, type SortDirection, type SortOption } from '../../components/SortControl.js';
 import { FilterBar } from '../../components/FilterBar.js';
@@ -558,7 +558,7 @@ function BuyOrderEditor({ row, summary, facts, sending, onSubmit, onClose }: {
         <input className="input" inputMode="numeric" value={quantity} onChange={(event) => setQuantity(event.target.value)} disabled={sending} aria-label="How many are wanted" />
       </Field>
       <span className="cell-sub buy-order-editor-note">
-        {problem ?? `CSFloat will pay at most ${formatCents(cents!, row.currency)} for each of ${wanted!.toLocaleString()}, ${formatCents(cents! * wanted!, row.currency)} in all${filtersChanged ? ', with the filters below' : summary ? `, and still only ${summary}` : ''}.`}
+        {problem ?? `CSFloat will pay at most ${formatAmount(cents!, row.currency)} for each of ${wanted!.toLocaleString()}, ${formatAmount(cents! * wanted!, row.currency)} in all${filtersChanged ? ', with the filters below' : summary ? `, and still only ${summary}` : ''}.`}
       </span>
       <BuyOrderFilterFields venue={row.venue} item={row.csfloatItem} held={held} draft={draft} onChange={setDraft} disabled={sending} />
       <Button type="submit" size="sm" variant="primary" loading={sending} disabled={Boolean(problem)}>Save</Button>

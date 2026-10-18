@@ -352,11 +352,20 @@ export const GROUP_KINDS: Readonly<Record<ActionGroup, readonly ActionKind[]>> =
 };
 
 export type GroupResult = {
-  /** Groups every selected row can take *some* route through. */
+  /** Groups every selected row can take *some* route through, and the partial groups some row can. */
   allowed: ActionGroup[];
   /** One entry per group some row allows and some row allows no route through at all. */
   blockers: Partial<Record<ActionGroup, Blocker>>;
 };
+
+/**
+ * The groups a selection is offered when only some of it can take them. A store of a thousand items
+ * nearly always holds one that cannot be stored — a trade-protected skin, a storage unit, a coin —
+ * and withholding Store from all of them over it sent a person hunting for the one item. The rest is
+ * stored, and the Store panel says what is left out (bulk storage plan D13, a product decision of
+ * 2026-10-16). Every other group still asks the whole selection.
+ */
+export const PARTIAL_GROUPS: ReadonlySet<ActionGroup> = new Set<ActionGroup>(['STORE']);
 
 /**
  * What a whole selection can be asked to do.
@@ -371,16 +380,21 @@ export type GroupResult = {
  * The blocker reason is the *default* venue's reason, because a row that can reach neither venue
  * is refused by both and Steam's words are the ones that name the item's real problem
  * ("trade-protected", "already listed") rather than CSFloat's connection state.
+ *
+ * A group in `PARTIAL_GROUPS` is offered when *some* row can take it, and its blocker then counts
+ * what will be left out.
  */
 export function groupsFor(rows: ReadonlyArray<{ row: ActionRow; verdict: ActionVerdict }>): GroupResult {
   if (rows.length === 0) return { allowed: [], blockers: {} };
   const takes = (verdict: ActionVerdict, group: ActionGroup): boolean =>
     GROUP_KINDS[group].some((kind) => verdict.allowed.includes(kind));
 
-  const allowed = GROUP_ORDER.filter((group) => rows.every(({ verdict }) => takes(verdict, group)));
+  const allowed = GROUP_ORDER.filter((group) => PARTIAL_GROUPS.has(group)
+    ? rows.some(({ verdict }) => takes(verdict, group))
+    : rows.every(({ verdict }) => takes(verdict, group)));
   const blockers: Partial<Record<ActionGroup, Blocker>> = {};
   for (const group of GROUP_ORDER) {
-    if (allowed.includes(group)) continue;
+    if (rows.every(({ verdict }) => takes(verdict, group))) continue;
     if (!rows.some(({ verdict }) => takes(verdict, group))) continue;
     const offenders = rows.filter(({ verdict }) => !takes(verdict, group));
     const first = offenders[0];

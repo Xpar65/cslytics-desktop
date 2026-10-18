@@ -6,8 +6,11 @@
  *
  * The engine has no catalogue, so it cannot compute `nf` and must never learn how. What it can
  * evaluate is `key ∈ set ∧ paint_wear ∈ [a, b]`, which is `matchKeys` with a real-float range
- * attached. CS2 uses a few dozen distinct `(minFloat, maxFloat)` pairs, so one `nf` predicate becomes
- * a few dozen keyed bands — computed here, in the host, where the float ranges live.
+ * attached. One `nf` predicate becomes one keyed band per distinct `(minFloat, maxFloat)` pair —
+ * computed here, in the host, where the float ranges live. The catalogue of 2026-10-10 has 156 such
+ * pairs over 4,816 skins, and every one is a band: the engine reads the list as one value, so its
+ * length costs nothing. A cap here once kept sixty-four, and a float chip on its own quietly left
+ * out every skin whose range sorted later (`tests/unit/wear-bands.test.ts`).
  */
 
 import { normToReal } from './float.js';
@@ -16,9 +19,6 @@ import type { CatalogueEntry, MatchKey } from './types.js';
 export type WearBand = { matchKeys: MatchKey[]; minWear: number; maxWear: number };
 export type NormPredicate = { op: '>' | '>=' | '<' | '<=' | '='; value: number };
 
-/** The same ceilings the engine puts on `matchKeys`, so a band list cannot outgrow a bound query. */
-export const MAX_BANDS = 64;
-export const MAX_BAND_KEYS = 20_000;
 /** `=` on a float is a tolerance, never an equality: the stored wear is a 32-bit float. */
 export const EQUALITY_TOLERANCE = 0.0005;
 /** `>` and `<` are strict; SQLite's BETWEEN is not. One float step is the difference. */
@@ -78,16 +78,12 @@ export function wearBandsFor(
   }
 
   const bands: WearBand[] = [];
-  let keyBudget = MAX_BAND_KEYS;
   const ordered = [...byRange.values()].sort((left, right) => left.range.minFloat - right.range.minFloat || left.range.maxFloat - right.range.maxFloat);
   for (const group of ordered) {
-    if (bands.length >= MAX_BANDS || keyBudget <= 0) break;
     const minWear = normToReal(window.low, group.range)!;
     const maxWear = normToReal(window.high, group.range)!;
     if (maxWear < minWear) continue;
-    const keys = group.keys.slice(0, keyBudget);
-    keyBudget -= keys.length;
-    bands.push({ matchKeys: keys, minWear, maxWear });
+    bands.push({ matchKeys: group.keys, minWear, maxWear });
   }
   return bands;
 }

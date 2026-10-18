@@ -5,7 +5,7 @@ import { ItemTile, TileAccountBadge, TileBadge, TileBusy, TileWear, stopTilePres
 import { IconButton } from '../../components/ui.js';
 import { Icon } from '../../components/Icon.js';
 import { VenueMark } from '../../components/VenueMark.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { formatDateTime } from '../../lib/labels.js';
 import { itemIsBusy } from '../work/work-busy.js';
 import { delistBlocked, repriceBlocked, type Delisting } from './listing-actions.js';
@@ -93,7 +93,7 @@ export function ListingTiles({ load, onRows, subject, onSubject, onReprice, deli
               {phase === 'idle' ? <>
                 <span
                   className="tile-price"
-                  title={row.receiveCents === null ? 'Buyer pays' : `Buyer pays · you receive ${formatCents(row.receiveCents, row.currency)}`}
+                  title={row.receiveCents === null ? 'Buyer pays' : `Buyer pays · you receive ${formatAmount(row.receiveCents, row.currency)}`}
                 >
                   <Money cents={row.buyerPriceCents} currency={row.currency} />
                 </span>

@@ -69,9 +69,20 @@ export const amber: Theme = {
     '--wear-bs': '#C9665C',
 
     '--cs-hold-wallet': '#8FA6C4',
+    '--cs-hold-csfloat': '#CDB88C',
+    '--cs-hold-inventory': '#A9B882',
     '--cs-hold-listed': '#7DB39A',
     '--cs-hold-unconfirmed': '#B998C6',
     '--cs-hold-hatch': 'rgba(255, 240, 220, 0.45)',
+
+    '--cs-series-1': '#8FA6C4',
+    '--cs-series-2': '#7DB39A',
+    '--cs-series-3': '#B998C6',
+    '--cs-series-4': '#D9905E',
+    '--cs-series-5': '#CDB88C',
+    '--cs-series-6': '#C9665C',
+    '--cs-series-7': '#7FB4C2',
+    '--cs-series-8': '#9A948A',
 
     '--cs-avatar-bg-sl': '24% 22%',
     '--cs-avatar-ring-sl': '28% 36%',

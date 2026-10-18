@@ -2,7 +2,7 @@ import React from 'react';
 import type { ListingPageRow, ListingVenue } from '@cslytics/engine';
 import { Button, Spinner } from '../../components/ui.js';
 import { stopTilePress } from '../../components/ItemTile.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { CSFLOAT_STATE, LISTING_STATUS, currencyCode, stateLabel, type StateLabel } from '../../lib/labels.js';
 
 /**
@@ -55,7 +55,7 @@ export function Money({ cents, currency, tone }: { cents: number | null; currenc
   const code = currencyCode(currency);
   return (
     <span className="money" data-tone={tone}>
-      <span className="num">{formatCents(cents, currency)}</span>
+      <span className="num">{formatAmount(cents, currency)}</span>
       <span className="currency-tag">{code || 'currency not observed'}</span>
     </span>
   );

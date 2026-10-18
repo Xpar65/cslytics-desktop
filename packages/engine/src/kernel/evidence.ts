@@ -1,5 +1,7 @@
 import type { ActionRow, EngineDatabase, ItemRow, ObservationRow, ScopeKind } from '../db/database.js';
-import { marketplaceBlock } from './marketplace-commitments.js';
+import { marketplaceBlock, type MarketplaceConsent } from './marketplace-commitments.js';
+import { committedSql } from '../db/commitment.js';
+import { CsfloatStore } from '../db/csfloat.js';
 
 export type Freshness = 'FRESH' | 'STALE' | 'INCOMPLETE' | 'NEVER';
 export type Surface =
@@ -73,11 +75,12 @@ export const ACCOUNT_MARKET: SurfaceRef = { surface: 'steam-market', scope: { ki
 export const ACCOUNT_WALLET: SurfaceRef = { surface: 'steam-wallet', scope: { kind: 'account' } };
 export const ACCOUNT_HISTORY: SurfaceRef = { surface: 'steam-market-history', scope: { kind: 'account' } };
 export const ACCOUNT_STORAGE_UNITS: SurfaceRef = { surface: 'gc-storage-units', scope: { kind: 'account' } };
+/** The name a request or a message gives a scope. Never an observation's `surface`: a casket's observation is surface `gc-casket` with the casket in `scope_id` (consolidation plan D14). */
 export function surfaceName(ref: SurfaceRef): string {
   return ref.surface === 'gc-casket' ? `gc-casket:${ref.scope.id}` : ref.surface;
 }
 export function surfaceOf(obs: ObservationRow): Surface {
-  return obs.surface.startsWith('gc-casket:') ? 'gc-casket' : obs.surface as Surface;
+  return obs.surface as Surface;
 }
 export function freshness(obs: ObservationRow | undefined, surface: Surface, now: Date): Freshness {
   if (!obs) return 'NEVER';
@@ -107,7 +110,7 @@ export function attemptReturned(database: EngineDatabase, action: ActionRow): st
 }
 
 export function surfaceEvidence(database: EngineDatabase, accountId: string, ref: SurfaceRef, now: Date, absence = false, action?: ActionRow): Evidence<ObservationRow> {
-  const obs = database.latestObservationForScope(accountId, ref.scope.kind, ref.scope.id ?? null, surfaceName(ref));
+  const obs = database.latestObservationForScope(accountId, ref.scope.kind, ref.scope.id ?? null, ref.surface);
   const state = freshness(obs, ref.surface, now);
   if (!obs || state !== 'FRESH' || (absence && FRESHNESS[ref.surface].proves !== 'set') || (action && !postAttempt(database, action, obs, absence))) {
     return { grade: 'UNKNOWN', want: ref, freshness: state === 'FRESH' ? 'INCOMPLETE' : state };
@@ -153,7 +156,7 @@ export const PRECONDITIONS: Record<ActionKind, readonly Precondition[]> = {
   RENAME_CASKET: ['casket-owned']
 };
 
-export function evaluatePreconditions(database: EngineDatabase, accountId: string, localId: string, checks: readonly Precondition[], now: Date, casketId?: string): Evidence<unknown>[] {
+export function evaluatePreconditions(database: EngineDatabase, accountId: string, localId: string, checks: readonly Precondition[], now: Date, casketId?: string, consent: readonly MarketplaceConsent[] = []): Evidence<unknown>[] {
   const item = database.itemByLocalId(accountId, localId);
   return checks.map((check): Evidence<unknown> => {
     if (check === 'casket-owned') {
@@ -164,18 +167,18 @@ export function evaluatePreconditions(database: EngineDatabase, accountId: strin
         : { grade: 'UNSATISFIED', reason: 'Storage unit is not owned by this account', observationId: evidence.observationId };
     }
     if (check === 'main') {
-      const reason = marketplaceBlock(database,accountId,localId,checks.includes('no-open-order') ? 'steam-list' : 'storage',now.toISOString());
+      const reason = marketplaceBlock(database,accountId,localId,checks.includes('no-open-order') ? 'steam-list' : 'storage',now.toISOString(),'',consent);
       if (reason) return { grade: 'UNSATISFIED', reason, observationId: 0 };
     }
     if (check === 'main' || check === 'casket') return locationEvidence(database, accountId, localId, check === 'main' ? 'MAIN' : 'CASKET', now);
     if (check === 'no-open-order') {
       const evidence = surfaceEvidence(database, accountId, ACCOUNT_MARKET, now, true);
       if (evidence.grade !== 'SATISFIED') return evidence;
-      // The book may know a unit by its asset id alone, before a walk bound the row.
-      const assetId = item?.current_asset_id ?? '';
-      const open = database.raw().prepare(`SELECT 1 FROM market_listing WHERE account_id=? AND (local_id=? OR asset_id=?) AND status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')`).get(accountId, localId, assetId);
-      const order = database.raw().prepare(`SELECT 1 FROM venue_order WHERE account_id=? AND (local_id=? OR json_extract(venue_detail_json,'$.assetId')=?) AND side='SELL' AND state NOT LIKE 'ENDED_%'`).get(accountId, localId, assetId);
-      return open || order ? { grade: 'UNSATISFIED', reason: 'Item already has an open or unexplained order', observationId: evidence.observationId } : satisfied(true, evidence.value);
+      // One question, by the holding's row and by its asset id, which the book may know a unit by
+      // before a walk bound the row (D5); Steam's own when cross-venue protection is off (XLIST-03).
+      const everyVenue = new CsfloatStore(database).policy().preventDuplicates;
+      const committed = database.raw().prepare(`SELECT 1 FROM item i WHERE i.account_id=? AND i.local_id=? AND ${committedSql('i', everyVenue ? undefined : 'steam')}`).get(accountId, localId);
+      return committed ? { grade: 'UNSATISFIED', reason: 'Item already has an open or unexplained order', observationId: evidence.observationId } : satisfied(true, evidence.value);
     }
     if (check === 'main-room' || check === 'casket-room') {
       const ref: SurfaceRef = check === 'main-room' ? ACCOUNT_INVENTORY : { surface: 'gc-casket', scope: { kind: 'casket', id: casketId ?? '' } };
@@ -187,7 +190,7 @@ export function evaluatePreconditions(database: EngineDatabase, accountId: strin
     }
     const evidence = locationEvidence(database, accountId, localId, item?.location ?? 'MAIN', now);
     if (evidence.grade !== 'SATISFIED') return evidence;
-    if (check === 'asset') return item?.current_asset_id ? evidence : { grade: 'UNSATISFIED', reason: 'Item has no current Steam asset id', observationId: evidence.observationId };
+    if (check === 'asset') return item?.asset_id ? evidence : { grade: 'UNSATISFIED', reason: 'Item has no current Steam asset id', observationId: evidence.observationId };
     const until = check === 'trade-protection' ? item?.trade_protected_until : item?.tradable_after;
     return until && Date.parse(until) > now.getTime()
       ? { grade: 'UNSATISFIED', reason: `${check} until ${until}`, observationId: evidence.observationId, blockedUntil: until }
@@ -195,8 +198,24 @@ export function evaluatePreconditions(database: EngineDatabase, accountId: strin
   });
 }
 
+/**
+ * A precondition no complete, fresh walk can answer yet. It is not a refusal: an incomplete or
+ * stale read proves nothing either way (rule 5), so a caller that can wait for the walk does.
+ */
+export class ObservationRequired extends Error {
+  constructor(readonly want: SurfaceRef, readonly freshness: Freshness) {
+    super(`Observation required: ${surfaceName(want)} (${freshness})`);
+    this.name = 'ObservationRequired';
+  }
+}
+
+/**
+ * Throws the first refusal, and only when there is none, the first read still owed. A
+ * precondition a walk has already refused is not worth waiting on another for.
+ */
 export function requirePreconditions(evidence: Evidence<unknown>[]): void {
-  const failed = evidence.find((entry) => entry.grade !== 'SATISFIED');
-  if (failed?.grade === 'UNKNOWN') throw new Error(`Observation required: ${surfaceName(failed.want)} (${failed.freshness})`);
-  if (failed?.grade === 'UNSATISFIED') throw new Error(failed.reason);
+  const refused = evidence.find((entry) => entry.grade === 'UNSATISFIED');
+  if (refused?.grade === 'UNSATISFIED') throw new Error(refused.reason);
+  const unknown = evidence.find((entry) => entry.grade === 'UNKNOWN');
+  if (unknown?.grade === 'UNKNOWN') throw new ObservationRequired(unknown.want, unknown.freshness);
 }

@@ -1,4 +1,5 @@
 import type { EngineDatabase } from './database.js';
+import { SELECTION_KIND } from './database.js';
 
 /** `remove` takes the account out of the record; `reset` keeps it and empties it. */
 export type PurgeMode = 'remove' | 'reset';
@@ -15,14 +16,12 @@ export type PurgeResult = { accountId: string; mode: PurgeMode; deleted: Record<
 export const ACCOUNTLESS_TABLES = {
   account: 'the account itself: deleted by remove, kept by reset',
   attempt: 'hangs off action, and goes with the account\'s actions',
-  command: 'spans accounts through command_member; deleted once no member and no transfer is left',
-  selection_manifest: 'names its accounts in account_ids_json; a selection naming this one is deleted whole',
-  marketplace_policy: 'one row for every account',
+  command: 'spans accounts through command_member; deleted once no member and no transfer is left, and a selection draft naming this account is deleted whole',
   schema_migration: 'the record\'s own history'
 } as const;
 
 /** What reset keeps beside the account row: its CSFloat connection and the reference to its key. */
-const RESET_KEEPS: ReadonlySet<string> = new Set(['credential_ref', 'marketplace_connection']);
+const RESET_KEEPS: ReadonlySet<string> = new Set(['credential_ref', 'venue_connection']);
 
 /** Columns that tie a row to an account. A transfer names two, and belongs to both. */
 const ACCOUNT_COLUMNS: ReadonlySet<string> = new Set(['account_id', 'destination_account_id']);
@@ -90,11 +89,12 @@ export class AccountPurgeStore {
   refusal(accountId: string): string | null {
     const waiting = this.db.raw().prepare(`
       SELECT COALESCE(mine.account_name, ?) AS mine, COALESCE(theirs.account_name, action.account_id) AS theirs
-      FROM transfer_batch batch
-      JOIN action ON action.id IN (batch.send_action_id, batch.accept_action_id, batch.cancel_action_id)
+      FROM work_step send JOIN transfer_detail detail ON detail.step_id=send.id
+      JOIN work_step hop ON hop.command_id=send.command_id AND hop.account_id IN (send.account_id, detail.destination_account_id)
+      JOIN action ON action.id=hop.action_id
       LEFT JOIN account mine ON mine.id=?
       LEFT JOIN account theirs ON theirs.id=action.account_id
-      WHERE (batch.account_id=? OR batch.destination_account_id=?) AND action.account_id<>?
+      WHERE send.kind='SEND' AND (send.account_id=? OR detail.destination_account_id=?) AND action.account_id<>?
         AND action.state IN ('READY','RUNNING','AWAITING_OBSERVATION')
       LIMIT 1`).get(accountId, accountId, accountId, accountId, accountId) as { mine: string; theirs: string } | undefined;
     if (!waiting) return null;
@@ -122,28 +122,26 @@ export class AccountPurgeStore {
         run('attempt', 'DELETE FROM attempt WHERE action_id IN (SELECT id FROM action WHERE account_id=?)', accountId);
         const commands = (sqlite.prepare('SELECT DISTINCT command_id FROM command_member WHERE account_id=?').all(accountId) as Array<{ command_id: string }>)
           .map((row) => row.command_id);
-        const selections = (sqlite.prepare(`SELECT token FROM selection_manifest
-          WHERE EXISTS (SELECT 1 FROM json_each(account_ids_json) WHERE value=?)`).all(accountId) as Array<{ token: string }>)
-          .map((row) => row.token);
-        for (const token of selections) {
-          run('selection_member', 'DELETE FROM selection_member WHERE token=?', token);
-          run('selection_manifest', 'DELETE FROM selection_manifest WHERE token=?', token);
+        // A selection draft is one frozen set: with this account gone it is a different selection,
+        // so a draft naming the account goes whole rather than shrinking under the window's token.
+        const drafts = (sqlite.prepare(`SELECT c.id FROM command c WHERE c.kind=? AND EXISTS (SELECT 1 FROM command_member m WHERE m.command_id=c.id AND m.account_id=?)`)
+          .all(SELECTION_KIND, accountId) as Array<{ id: string }>).map((row) => row.id);
+        for (const token of drafts) {
+          run('command_member', 'DELETE FROM command_member WHERE command_id=?', token);
+          run('command', 'DELETE FROM command WHERE id=?', token);
         }
         for (const { table, columns } of keyed) {
-          // Its delete triggers write it, so it goes last.
-          if (table === 'read_revision') continue;
           if (mode === 'reset' && this.resetKeeps().has(table)) continue;
           run(table, `DELETE FROM "${table}" WHERE ${columns.map((column) => `${column}=?`).join(' OR ')}`, ...columns.map(() => accountId));
         }
         for (const commandId of commands) {
           run('command', `DELETE FROM command WHERE id=?
             AND NOT EXISTS (SELECT 1 FROM command_member WHERE command_id=?)
-            AND NOT EXISTS (SELECT 1 FROM transfer_batch WHERE command_id=?)`, commandId, commandId, commandId);
+            AND NOT EXISTS (SELECT 1 FROM work_step WHERE command_id=?)`, commandId, commandId, commandId);
         }
         if (mode === 'remove') run('account', 'DELETE FROM account WHERE id=?', accountId);
         // The name and the picture are observed too; the next persona read writes them again.
-        else sqlite.prepare('UPDATE account SET persona_name=NULL, avatar_hash=NULL, persona_obs=NULL WHERE id=?').run(accountId);
-        run('read_revision', 'DELETE FROM read_revision WHERE account_id=?', accountId);
+        else sqlite.prepare('UPDATE account SET persona_name=NULL, avatar_hash=NULL, persona_obs=NULL, trade_token=NULL, trade_token_obs=NULL WHERE id=?').run(accountId);
         const dangling = this.violations().filter((violation) => !before.has(violationKey(violation)));
         if (dangling.length > 0) throw new AccountPurgeError([...new Set(dangling.map((row) => `${row.table} → ${row.parent}`))]);
       });

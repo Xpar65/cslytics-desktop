@@ -1,8 +1,10 @@
-import type { CsfloatListingItem } from '@cslytics/ports';
 import type { EngineContext } from '../kernel/context.js';
 import { CsfloatStore } from '../db/csfloat.js';
+import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { MarketplaceStore } from '../db/marketplace.js';
 import { TransferStore } from '../db/transfers.js';
+import { WorkStore } from '../db/work.js';
+import { OrderStore } from '../db/orders.js';
 import { ACCOUNT_INVENTORY, ACCOUNT_MARKET, surfaceEvidence, type Surface } from '../kernel/evidence.js';
 import { marketplaceBlock } from '../kernel/marketplace-commitments.js';
 import { storedCannotTrade } from '../kernel/attributes.js';
@@ -70,7 +72,7 @@ export class CsfloatSellingPolicy {
     const { database: db } = this.context, store = new CsfloatStore(db), now = this.context.now();
     this.validateAccount(member);
     const item = db.itemByLocalId(member.accountId,member.localId);
-    const asset = item?.current_asset_id;
+    const asset = item?.asset_id;
     if (!asset || item.location !== 'MAIN') throw new Error('Retrieve the item into main inventory before listing');
     // The Game Coordinator's own `cannot trade` on the unit, before anything a venue says: no read
     // of either inventory can make a granted music kit tradable.
@@ -80,24 +82,20 @@ export class CsfloatSellingPolicy {
     const conflict = marketplaceBlock(db,member.accountId,member.localId,'csfloat-list',now,ownOperation);
     if (conflict) throw new Error(conflict);
     const action = db.inFlightAction(member.accountId,`item:${member.localId}`);
-    if (action && action.id !== store.operation(ownOperation)?.action_id) throw new Error('Item has an unresolved operation');
+    if (action && action.id !== new WorkStore(db).step(ownOperation)?.action_id) throw new Error('Item has an unresolved operation');
     if (!store.fresh(member.accountId,'csfloat-inventory',now)) throw new Error('Refresh CSFloat inventory eligibility first');
-    const row = db.raw().prepare('SELECT item_json,observation_id FROM csfloat_inventory WHERE account_id=? AND asset_id=?').get(member.accountId,asset) as { item_json: string; observation_id: number } | undefined;
-    const eligibility = row ? JSON.parse(row.item_json) as CsfloatListingItem : null;
-    if (!eligibility || eligibility.tradable !== 1 || store.associate(member.accountId,eligibility) !== member.localId) throw new Error('CSFloat has not confirmed this exact item as tradable');
-    const transfers = new TransferStore(db), steamObs = transfers.fresh(member.accountId,'steam-trade-inventory',now), steam = transfers.eligibility(member.accountId,asset);
-    if (!steamObs || !steam || steam.observation_id !== steamObs.id || steam.tradable !== 1) throw new Error('Steam tradability must be positively observed');
+    const evidence = new AssetEvidenceStore(db), venue = evidence.csfloat(member.accountId,asset);
+    if (!venue || venue.eligible !== 1 || store.associate(member.accountId,venue.item) !== member.localId) throw new Error('CSFloat has not confirmed this exact item as tradable');
+    const transfers = new TransferStore(db), steamObs = transfers.fresh(member.accountId,'steam-trade-inventory',now), steam = evidence.community(member.accountId,asset);
+    if (!steamObs || !steam || steam.last_seen_obs !== steamObs.id || steam.tradable !== 1) throw new Error('Steam tradability must be positively observed');
     // Steam's own "can this be sold at all" (holdings plan D7): a unit Steam calls unmarketable is
     // not offered on any venue. Unknown stays allowed, as tradability above requires a positive read.
     if (steam.marketable === 0) throw new Error('Item is not marketable on Steam');
     if (!transfers.fresh(member.accountId,'steam-trade-offers',now)) throw new Error('Refresh Steam trade offers first');
     if (new TradeStore(db).committedTradeAssets(member.accountId,COMMITTING_STATUSES).some(a => a.asset_id === asset)) throw new Error('Item is already committed to a Steam trade');
     if (surfaceEvidence(db,member.accountId,ACCOUNT_MARKET,this.context.ports.clock.now()).grade !== 'SATISFIED') throw new Error('Refresh Steam listings first');
-    // An ended Steam listing keeps its row as ABSENT; only an open one is a competing advertisement.
-    const steamListing = db.raw().prepare(`SELECT 1 FROM market_listing WHERE account_id=? AND (local_id=? OR asset_id=?)
-      AND status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')`).get(member.accountId,member.localId,asset);
-    const steamOrder = db.raw().prepare(`SELECT 1 FROM venue_order WHERE account_id=? AND local_id=? AND state NOT LIKE 'ENDED_%' AND side='SELL'`).get(member.accountId,member.localId);
-    if (store.policy().preventDuplicates && (steamListing || steamOrder)) throw new Error('Item already has a Steam listing or unresolved sell order');
+    // An ended Steam order is explained; one open on the book or not yet explained is a competing advertisement (D5).
+    if (store.policy().preventDuplicates && new OrderStore(db).commitment(member.accountId,member.localId,asset,'steam')) throw new Error('Item already has a Steam listing or unresolved sell order');
     return asset;
   }
 
@@ -116,9 +114,9 @@ export class CsfloatSellingPolicy {
     this.validateAccount(member);
     const item = db.itemByLocalId(member.accountId,member.localId);
     if (item?.unit_kind === 'fungible') throw new Error('Only individual items can be listed from storage');
-    if (!item?.current_asset_id || item.location !== 'CASKET' || !item.casket_id) throw new Error('Item is not in a storage unit');
+    if (!item?.asset_id || item.location !== 'CASKET' || !item.casket_id) throw new Error('Item is not in a storage unit');
     if (storedCannotTrade(item.attributes_json)) throw new Error('Item is marked untradable by Steam');
-    const asset = item.current_asset_id;
+    const asset = item.asset_id;
     for (const until of [item.tradable_after,item.trade_protected_until]) if (until && (!Number.isFinite(Date.parse(until)) || until > now)) throw new Error(`Item is trade locked or protected until ${until}`);
     const conflict = marketplaceBlock(db,member.accountId,member.localId,'csfloat-list',now);
     if (conflict) throw new Error(conflict);
@@ -126,10 +124,7 @@ export class CsfloatSellingPolicy {
     if (!new TransferStore(db).fresh(member.accountId,'steam-trade-offers',now)) throw new Error('Refresh Steam trade offers first');
     if (new TradeStore(db).committedTradeAssets(member.accountId,COMMITTING_STATUSES).some(a => a.asset_id === asset)) throw new Error('Item is already committed to a Steam trade');
     if (surfaceEvidence(db,member.accountId,ACCOUNT_MARKET,this.context.ports.clock.now()).grade !== 'SATISFIED') throw new Error('Refresh Steam listings first');
-    const steamListing = db.raw().prepare(`SELECT 1 FROM market_listing WHERE account_id=? AND (local_id=? OR asset_id=?)
-      AND status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')`).get(member.accountId,member.localId,asset);
-    const steamOrder = db.raw().prepare(`SELECT 1 FROM venue_order WHERE account_id=? AND local_id=? AND state NOT LIKE 'ENDED_%' AND side='SELL'`).get(member.accountId,member.localId);
-    if (new CsfloatStore(db).policy().preventDuplicates && (steamListing || steamOrder)) throw new Error('Item already has a Steam listing or unresolved sell order');
+    if (new CsfloatStore(db).policy().preventDuplicates && new OrderStore(db).commitment(member.accountId,member.localId,asset,'steam')) throw new Error('Item already has a Steam listing or unresolved sell order');
     return { assetId: asset, casketId: item.casket_id };
   }
 

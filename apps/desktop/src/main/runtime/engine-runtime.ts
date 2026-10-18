@@ -50,7 +50,7 @@ const lockFd = acquireRuntimeLock(lockPath);
  */
 async function openRecord(path: string): Promise<EngineDatabase> {
   try {
-    return new EngineDatabase(path);
+    return new EngineDatabase(path, () => clock.now().toISOString());
   } catch (error) {
     if (!(error instanceof SchemaNewerThanAppError) && !(error instanceof SchemaBackupError)) throw error;
     releaseRuntimeLock(lockFd, lockPath);
@@ -153,7 +153,7 @@ const dispatch = createRuntimeDispatch(engine, (id) => auth.hasStoredCredential(
 /**
  * The runtime's one unprompted message to the rest of the app.
  *
- * Coalesced by `RefreshService` before it gets here, so a two-thousand-item snapshot is one
+ * Coalesced by `ReadBroker` before it gets here, so a two-thousand-item snapshot is one
  * notice rather than two thousand. Fire-and-forget on purpose: nothing acknowledges it, and a
  * notice lost to a closing window costs freshness, never correctness — the window's next read
  * comes from SQLite either way.
@@ -166,20 +166,40 @@ engine.onChanged = (notice) => {
     // refresh pass that had already written its observations.
   }
 };
+let engineStopped = false;
+function stopEngine(): void {
+  if (engineStopped) return;
+  engineStopped = true;
+  engine.shutdown();
+}
+
 let stopped = false;
 function stop(): void {
   if (stopped) return;
   stopped = true;
-  engine.shutdown();
+  stopEngine();
   database.close();
   releaseRuntimeLock(lockFd, lockPath);
+}
+
+/**
+ * How closing the app ends this process. The engine's loops stop first, so nothing more is sent;
+ * then every Steam client is logged off, because a process that just exits leaves Steam to time
+ * its session out, CS2 still playing, and a launch on the account before then can find its Game
+ * Coordinator taken; then the record closes. Main kills this process two seconds after asking, so
+ * the logoff is bounded below that (`CLIENT_LOGOFF_TIMEOUT_MS`). A crash still exits through the
+ * `exit` handler below, which cannot wait for Steam.
+ */
+async function shutdown(): Promise<void> {
+  stopEngine();
+  await clients.closeAll().catch(() => undefined);
+  stop();
 }
 
 parentPort.on('message', (event) => {
   const message = event.data;
   if (message?.kind === 'shutdown') {
-    stop();
-    process.exit(0);
+    void shutdown().finally(() => process.exit(0));
     return;
   }
   if (message?.kind !== 'request') return;

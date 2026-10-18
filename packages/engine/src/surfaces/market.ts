@@ -9,6 +9,12 @@ import { NEVER_RETRY, RETRY_POLICY, type RetryPolicy } from '../kernel/retry-pol
 import { OrderService } from './orders.js';
 import { HoldingsStore } from '../db/holdings.js';
 import { LedgerStore } from '../db/ledger.js';
+import { WorkStore } from '../db/work.js';
+import { OrderStore, type SeenSteamListing, type SteamListingRow } from '../db/orders.js';
+import { committedSql } from '../db/commitment.js';
+import { CsfloatStore } from '../db/csfloat.js';
+import { csfloatClaim } from '../kernel/marketplace-commitments.js';
+import type { SteamListingBucket } from '../db/alphabets.js';
 
 export type MarketSyncResult = {
   observationId: number;
@@ -20,8 +26,6 @@ export type MarketSyncResult = {
 
 export type SellParams = { priceReceiveCents: number };
 export type DelistParams = { listingId: string };
-
-const OPEN_STATUSES = "('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')";
 
 function mergeListings(into: MarketListing[], incoming: readonly MarketListing[]): void {
   for (const listing of incoming) {
@@ -47,11 +51,7 @@ export class MarketService {
    *   unless every listing it would end is accounted for (`emptyIsCorroborated`). A stale
    *   session returns exactly that shape, and believing it would delist a real portfolio.
    */
-  sync(accountId: AccountId, pageSize = 500): Promise<MarketSyncResult> {
-    return this.context.reads.run(`${accountId}:steam-market`, () => this.walk(accountId, pageSize));
-  }
-
-  private async walk(accountId: AccountId, pageSize: number): Promise<MarketSyncResult> {
+  async sync(accountId: AccountId, pageSize = 500): Promise<MarketSyncResult> {
     const { database } = this.context;
     const startedAt = this.context.now();
     const listings: MarketListing[] = [];
@@ -84,12 +84,10 @@ export class MarketService {
       error = errorMessage(caught);
     }
 
-    const previousOpen = database.raw()
-      .prepare(`SELECT COUNT(*) AS count FROM market_listing WHERE account_id=? AND status IN ${OPEN_STATUSES}`)
-      .get(accountId) as { count: number };
-    const observedCount = listings.length + holds.length + confirmations.length;
+    const previousOpen = new OrderStore(database).openSteamListings(accountId);
     const bucketsEmpty = listings.length === 0 && holds.length === 0 && confirmations.length === 0;
-    if (!error && totalExpected === 0 && bucketsEmpty && previousOpen.count > 0 && !this.emptyIsCorroborated(accountId)) {
+    if (!error && totalExpected === 0 && bucketsEmpty && previousOpen.length > 0 && !this.emptyIsCorroborated(accountId, previousOpen)
+      && !(await this.emptyFromSignedInSession(accountId, pageSize))) {
       error = 'suspicious-successful-empty-session';
     }
     const complete = !error && totalExpected !== null && this.listingWalkIsComplete({
@@ -107,14 +105,8 @@ export class MarketService {
         ...(totalExpected === null ? {} : { totalExpected }),
         ...(error === undefined ? {} : { error })
       });
+      // The walk's counts and its error are the observation's; no notice is written (D10).
       if (complete) this.persist(accountId, obs, listings, holds, confirmations, buyOrders);
-      database.addEvent(accountId, complete ? 'market-snapshot' : 'market-snapshot-incomplete', {
-        observationId: obs,
-        pagesWalked,
-        totalExpected,
-        observedCount,
-        error
-      }, this.context.now());
       return obs;
     });
 
@@ -147,11 +139,7 @@ export class MarketService {
     return input.listings.length === input.totalExpected;
   }
 
-  syncWallet(accountId: AccountId): Promise<number> {
-    return this.context.reads.run(`${accountId}:steam-wallet`, () => this.readWallet(accountId));
-  }
-
-  private async readWallet(accountId: AccountId): Promise<number> {
+  async syncWallet(accountId: AccountId): Promise<number> {
     const { database } = this.context;
     const startedAt = this.context.now();
     try {
@@ -187,34 +175,48 @@ export class MarketService {
     }
   }
 
-  queueSellListing(accountId: AccountId, localId: string, priceReceiveCents: number, basis = 'manual'): ActionRow {
+  queueSellListing(accountId: AccountId, localId: string, priceReceiveCents: number, commandId: string | null = null): ActionRow {
+    const params = this.sellParams(accountId, localId, priceReceiveCents);
+    return this.context.database.createDesiredAction({
+      accountId,
+      targetKind: 'sell-listing',
+      targetId: localId,
+      intent: 'LISTED_AT',
+      params,
+      commandId,
+      actionKind: 'CREATE_SELL_LISTING',
+      resourceKey: `item:${localId}`,
+      now: this.context.now()
+    });
+  }
+
+  /** The listing hop of a command: the same admission as `queueSellListing`, on the hop's action rather than a goal's (D3). */
+  queueSellListingStep(accountId: AccountId, localId: string, priceReceiveCents: number, stepId: string): ActionRow {
+    const params = this.sellParams(accountId, localId, priceReceiveCents);
+    return this.context.database.enqueueAction({ accountId, stepId, actionKind: 'CREATE_SELL_LISTING', targetId: localId, resourceKey: `item:${localId}`, params, now: this.context.now() });
+  }
+
+  private sellParams(accountId: AccountId, localId: string, priceReceiveCents: number): SellParams {
     const { database } = this.context;
     // sellitem takes integer cents the seller receives, not the buyer price (CLAUDE.md rule 4).
     if (!Number.isInteger(priceReceiveCents) || priceReceiveCents <= 0) {
       throw new Error('Seller-receives price must be positive integer cents');
     }
     const item = required(database.itemByLocalId(accountId, localId), `Unknown item ${localId}`);
-    if (item.location !== 'MAIN' || !item.current_asset_id) throw new Error('Item is not available in main inventory');
-    // Exclusivity is per item, not per venue (order-lifecycle.md D16). Asking `market_listing`
-    // asks only whether *Steam* holds it, which is the question that stops being sufficient
-    // the moment a second venue lists out of the same inventory.
+    if (item.location !== 'MAIN' || !item.asset_id) throw new Error('Item is not available in main inventory');
+    // Exclusivity is per item, not per venue (order-lifecycle.md D16): CSFloat's claim on the unit
+    // in its own words, then one question over the one table every venue's orders live in, by the
+    // holding's row and by its asset id (D5). With cross-venue protection switched off the question
+    // is Steam's own, and another venue's advertisement is left to the person who switched it off
+    // (XLIST-03). The venue's evidence being fresh is the send's question, not this one's (XLIST-04).
+    const claim = csfloatClaim(database, accountId, localId, 'steam-list');
+    if (claim) throw new Error(claim);
+    const everyVenue = new CsfloatStore(database).policy().preventDuplicates;
     const active = database.raw()
-      .prepare(`SELECT 1 FROM venue_order WHERE account_id=? AND local_id=? AND side='SELL' AND state NOT LIKE 'ENDED_%'
-        UNION ALL SELECT 1 FROM market_listing WHERE account_id=? AND local_id=? AND status IN ${OPEN_STATUSES}`)
-      .get(accountId, localId, accountId, localId);
+      .prepare(`SELECT 1 FROM item i WHERE i.account_id=? AND i.local_id=? AND ${committedSql('i', everyVenue ? undefined : 'steam')}`)
+      .get(accountId, localId);
     if (active) throw new Error('Item already has an open sell order');
-
-    return database.createDesiredAction({
-      accountId,
-      targetKind: 'sell-listing',
-      targetId: localId,
-      intent: 'LISTED_AT',
-      params: { priceReceiveCents } satisfies SellParams,
-      basis,
-      actionKind: 'CREATE_SELL_LISTING',
-      resourceKey: `item:${localId}`,
-      now: this.context.now()
-    });
+    return { priceReceiveCents };
   }
 
   /**
@@ -223,11 +225,7 @@ export class MarketService {
    * handle's location cannot answer this on its own.
    */
   listedAssets(accountId: AccountId): Set<string> {
-    const rows = this.context.database.raw().prepare(`
-      SELECT asset_id AS assetId FROM market_listing WHERE account_id=? AND status IN ${OPEN_STATUSES}
-      UNION SELECT json_extract(venue_detail_json,'$.assetId') FROM venue_order
-        WHERE account_id=? AND side='SELL' AND state NOT LIKE 'ENDED_%'`).all(accountId, accountId) as Array<{ assetId: string | null }>;
-    return new Set(rows.map((row) => row.assetId).filter((id): id is string => typeof id === 'string' && id.length > 0));
+    return new OrderStore(this.context.database).committedAssets(accountId);
   }
 
   async executeSellListing(actionId: string): Promise<MutationOutcome> {
@@ -235,40 +233,55 @@ export class MarketService {
     const action = required(database.action(actionId), `Unknown action ${actionId}`);
     const params = database.actionParams(action) as SellParams;
     const item = required(database.itemByLocalId(action.account_id, action.target_id), `Unknown item ${action.target_id}`);
-    if (item.location !== 'MAIN' || !item.current_asset_id) throw new Error('Item is not available in main inventory');
-    const assetId = required(item.current_asset_id ?? undefined, 'Item has no current Steam asset id');
+    if (item.location !== 'MAIN' || !item.asset_id) throw new Error('Item is not available in main inventory');
+    const assetId = required(item.asset_id ?? undefined, 'Item has no current Steam asset id');
     return executeMutation(this.context, action, () =>
       this.context.ports.market.createSellListing(action.account_id, assetId, params.priceReceiveCents), () => {
         requirePreconditions(evaluatePreconditions(database, action.account_id, action.target_id, PRECONDITIONS.CREATE_SELL_LISTING, this.context.ports.clock.now()));
-        if (database.itemByLocalId(action.account_id, action.target_id)?.current_asset_id !== assetId) throw new Error('Item asset changed before listing');
+        if (database.itemByLocalId(action.account_id, action.target_id)?.asset_id !== assetId) throw new Error('Item asset changed before listing');
       });
   }
 
-  queueDelist(accountId: AccountId, listingId: string, basis = 'manual'): ActionRow {
-    const { database } = this.context;
-    const listing = database.raw()
-      .prepare(`SELECT local_id FROM market_listing WHERE account_id=? AND listing_id=?`)
-      .get(accountId, listingId) as { local_id: string | null } | undefined;
-    if (!listing) throw new Error(`Unknown listing ${listingId}`);
-    return database.createDesiredAction({
-      accountId,
-      targetKind: 'sell-listing',
-      targetId: listing.local_id ?? listingId,
-      intent: 'DELISTED',
-      params: { listingId } satisfies DelistParams,
-      basis,
-      actionKind: 'REMOVE_SELL_LISTING',
-      resourceKey: listing.local_id ? `item:${listing.local_id}` : `listing:${listingId}`,
-      now: this.context.now()
+  /**
+   * A delist asked for by hand: a command of one hop (`DELIST`), admitted with its own id, whose
+   * action is the hop's (D3). The work panel reads it as any other hop; a reprice's own delist is
+   * its member's hop and never a command of its own.
+   */
+  queueDelist(accountId: AccountId, listingId: string): ActionRow {
+    const listing = this.listingToDelist(accountId, listingId);
+    const now = this.context.now();
+    const work = new WorkStore(this.context.database);
+    return this.context.database.transaction(() => {
+      const hop = work.lone('DELIST', { accountId, kind: 'DELIST', localId: listing.local_id, targetId: listingId, params: { listingId } satisfies DelistParams, now });
+      const action = this.queueDelistStep(accountId, listingId, hop.id);
+      work.attachAction(hop.id, action.id, now);
+      return action;
     });
+  }
+
+  /**
+   * The delist hop of a reprice or a delist-to-storage: the same admission as `queueDelist`, on the
+   * hop's action rather than a goal's (D3). A hand delist keeps its goal, and the work read tells
+   * the two apart by that: a chain's delist is reported through its member, never twice.
+   */
+  queueDelistStep(accountId: AccountId, listingId: string, stepId: string): ActionRow {
+    const listing = this.listingToDelist(accountId, listingId);
+    return this.context.database.enqueueAction({ accountId, stepId, actionKind: 'REMOVE_SELL_LISTING', targetId: listing.local_id ?? listingId,
+      resourceKey: listing.local_id ? `item:${listing.local_id}` : `listing:${listingId}`, params: { listingId } satisfies DelistParams, now: this.context.now() });
+  }
+
+  private listingToDelist(accountId: AccountId, listingId: string): { local_id: string | null } {
+    const listing = new OrderStore(this.context.database).steamListing(accountId, listingId);
+    if (!listing) throw new Error(`Unknown listing ${listingId}`);
+    return listing;
   }
 
   async executeDelist(actionId: string): Promise<MutationOutcome> {
     const { database } = this.context;
     const action = required(database.action(actionId), `Unknown action ${actionId}`);
     const params = database.desiredParams(action) as DelistParams;
-    return executeMutation(this.context, action, () =>
-      this.context.ports.market.removeListing(action.account_id, params.listingId));
+    return new WorkStore(database).send(action.id, () => executeMutation(this.context, action, () =>
+      this.context.ports.market.removeListing(action.account_id, params.listingId)), () => this.context.now());
   }
 
   /** Resolves sell-listing actions against one complete market observation. */
@@ -281,9 +294,8 @@ export class MarketService {
     const { database } = this.context;
     const after = attemptReturned(database, action);
     if (action.kind === 'CREATE_SELL_LISTING') {
-      const pending = database.raw().prepare(`SELECT 1 FROM market_listing WHERE account_id=? AND local_id=? AND price_receive_cents=? AND status='PENDING_CONFIRMATION'`)
-        .get(action.account_id, action.target_id, (database.actionParams(action) as SellParams).priceReceiveCents);
-      if (pending) return { kind: 'person', reason: 'Confirm the listing in the Steam mobile app' };
+      const pending = new OrderStore(database).openSteamListingAt(action.account_id, action.target_id, (database.actionParams(action) as SellParams).priceReceiveCents);
+      if (pending?.raw_bucket === 'PENDING_CONFIRMATION') return { kind: 'person', reason: 'Confirm the listing in the Steam mobile app' };
       return { kind: 'walks', walks: [{ ref: ACCOUNT_MARKET, startedAfter: after }] };
     }
     if (action.kind === 'REMOVE_SELL_LISTING') {
@@ -305,14 +317,13 @@ export class MarketService {
    * saboteur can read it as "Steam has not caught up yet", which is the belief that left a delist
    * waiting for ever.
    */
-  protected delistProvedNotApplied(listing: { status: string; last_seen_obs: number }, obs: ObservationRow): boolean {
-    return listing.status !== 'ABSENT' && listing.last_seen_obs === obs.id;
+  protected delistProvedNotApplied(listing: { gone_obs: number | null; last_seen_obs: number | null }, obs: ObservationRow): boolean {
+    return listing.gone_obs === null && listing.last_seen_obs === obs.id;
   }
 
   reconcile(accountId: AccountId, observationId: number): void {
     const { database } = this.context;
-    for (const action of database.actions(accountId, 'AWAITING_OBSERVATION')) {
-      if (!['CREATE_SELL_LISTING', 'REMOVE_SELL_LISTING'].includes(action.kind)) continue;
+    for (const action of database.awaitingActionsOfKinds(accountId, ['CREATE_SELL_LISTING', 'REMOVE_SELL_LISTING'])) {
       const obs = database.latestObservation(accountId, 'steam-market');
       const evidence = surfaceEvidence(database, accountId, ACCOUNT_MARKET, this.context.ports.clock.now());
       if (!obs || evidence.grade !== 'SATISFIED' || obs.id !== observationId) continue;
@@ -320,13 +331,11 @@ export class MarketService {
       if (action.kind === 'CREATE_SELL_LISTING') {
         // The walk binds a listing to the row holding its asset id — for a case exactly as for a
         // skin, since a round-trip keeps the id (rule 3) — so the action's target is the match.
-        const row = database.raw()
-          .prepare(`SELECT status, last_seen_obs FROM market_listing WHERE account_id=? AND local_id=? AND price_receive_cents=? AND status IN ${OPEN_STATUSES}`)
-          .get(accountId, action.target_id, (database.actionParams(action) as SellParams).priceReceiveCents) as { status: string; last_seen_obs: number } | undefined;
+        const row = new OrderStore(database).openSteamListingAt(accountId, action.target_id, (database.actionParams(action) as SellParams).priceReceiveCents);
         if (row && (row.last_seen_obs !== obs.id || !postAttempt(database, action, obs, false))) continue;
-        if (row?.status === 'ACTIVE' || row?.status === 'ON_HOLD') {
+        if (row?.raw_bucket === 'ACTIVE' || row?.raw_bucket === 'ON_HOLD') {
           database.resolveAction(action, obs.id, true, this.context.now());
-        } else if (row?.status === 'PENDING_CONFIRMATION') {
+        } else if (row?.raw_bucket === 'PENDING_CONFIRMATION') {
           database.raw().prepare(`UPDATE action SET resolved_by_obs=?, resolution='OBSERVED_APPLIED' WHERE id=?`).run(obs.id, action.id);
           // Still waiting on the user's phone. The transition event is emitted once, by
           // persist(); re-emitting here would grow the timeline on every sync.
@@ -334,10 +343,11 @@ export class MarketService {
         } else {
           if (!postAttempt(database, action, obs, true)) continue;
           const attempt = database.latestAttempt(action.id)!;
-          const everSeen = database.raw().prepare(`SELECT 1 FROM market_listing m JOIN observation o ON o.id=m.first_seen_obs
-            WHERE m.account_id=? AND m.local_id=? AND o.finished_at>=?`).get(accountId, action.target_id, attempt.started_at);
+          const everSeen = database.raw().prepare(`SELECT 1 FROM venue_order v JOIN observation o ON o.id=v.first_seen_obs
+            WHERE v.account_id=? AND v.local_id=? AND v.venue='steam' AND v.side='SELL' AND o.finished_at>=?`).get(accountId, action.target_id, attempt.started_at);
           if (everSeen || action.resolution === 'OBSERVED_APPLIED') {
-            database.suspendGoal(accountId, action.desired_id, LISTING_REVERSED, this.context.now());
+            // A goal is parked so nothing relists; a hop's listing is the hop's outcome, and the order lifecycle explains what ended it.
+            if (action.desired_id !== null) database.suspendGoal(accountId, action.desired_id, LISTING_REVERSED, this.context.now());
             database.resolveAction(action, obs.id, true, this.context.now());
           } else {
             // Never on the book in a complete walk begun after the attempt: the request did not
@@ -349,9 +359,7 @@ export class MarketService {
       } else {
         if (!postAttempt(database, action, obs, true)) continue;
         const params = database.desiredParams(action) as DelistParams;
-        const listing = database.raw()
-          .prepare(`SELECT status, local_id, asset_id, last_seen_obs FROM market_listing WHERE account_id=? AND listing_id=?`)
-          .get(accountId, params.listingId) as { status: string; local_id: string | null; asset_id: string; last_seen_obs: number } | undefined;
+        const listing = new OrderStore(database).steamListing(accountId, params.listingId);
         if (listing && this.delistProvedNotApplied(listing, obs)) {
           // Still on the book in a complete walk begun after the cancel returned: the cancel did
           // not take (order-lifecycle B1). This branch was missing, so a cancel whose request died
@@ -361,8 +369,9 @@ export class MarketService {
           settleNotApplied(this.context, action, obs.id, 'Steam still shows the listing', { policy: this.retryPolicyFor(action) });
           continue;
         }
-        if (listing?.status !== 'ABSENT') continue;
-        const item = listing.local_id ? database.itemByLocalId(accountId, listing.local_id) : database.itemByAssetId(accountId, listing.asset_id);
+        if (!listing || listing.gone_obs === null) continue;
+        const item = listing.local_id ? database.itemByLocalId(accountId, listing.local_id)
+          : listing.asset_id ? database.itemByAssetId(accountId, listing.asset_id) : undefined;
         const returned = item
           ? locationEvidence(database, accountId, item.local_id, 'MAIN', this.context.ports.clock.now(), action)
           : undefined;
@@ -390,81 +399,19 @@ export class MarketService {
     buyOrders: MarketBuyOrder[]
   ): void {
     const { database } = this.context;
-    // Retire only unseen rows before inserting replacements: a reprice must retain its walk.
-    const seenIds = new Set([...listings, ...holds, ...confirmations].map((listing) => listing.listingId));
-    const previous = database.raw().prepare(`SELECT listing_id FROM market_listing WHERE account_id=? AND status IN ${OPEN_STATUSES}`).all(accountId) as { listing_id: string }[];
-    for (const row of previous) {
-      if (seenIds.has(row.listing_id)) continue;
-      // The listing ended; where its item is stays the Game Coordinator's to say. A cancelled
-      // listing's item never left the inventory and a sold one's leaves it, and only the GC can
-      // tell those apart (`db/steam-listing.ts`), so this walk moves no item (rule 5).
-      database.raw().prepare(`UPDATE market_listing SET status='ABSENT', last_seen_obs=? WHERE account_id=? AND listing_id=?`).run(observationId, accountId, row.listing_id);
-    }
-    const priorStatus = database.raw().prepare(`SELECT status FROM market_listing WHERE account_id=? AND listing_id=?`);
-    const statement = database.raw().prepare(`
-      INSERT INTO market_listing(account_id, listing_id, local_id, asset_id, hash_name,
-        price_receive_cents, buyer_price_cents, status, hold_until, awaiting_confirmation, first_seen_obs, last_seen_obs)
-      VALUES (@accountId, @listingId, @localId, @assetId, @hashName,
-        @receive, @buyer, @status, @holdUntil, @confirm, @obs, @obs)
-      ON CONFLICT(account_id, listing_id) DO UPDATE SET
-        local_id=COALESCE(excluded.local_id, market_listing.local_id), asset_id=excluded.asset_id,
-        hash_name=excluded.hash_name, price_receive_cents=excluded.price_receive_cents,
-        buyer_price_cents=excluded.buyer_price_cents, status=excluded.status,
-        hold_until=excluded.hold_until, awaiting_confirmation=excluded.awaiting_confirmation,
-        last_seen_obs=excluded.last_seen_obs
-    `);
-
-    const write = (listing: MarketListing, status: string, confirm: boolean): void => {
-      const linked = database.raw().prepare(`SELECT local_id FROM venue_order WHERE account_id=? AND venue='steam'
-        AND json_extract(venue_detail_json,'$.assetId')=? AND state NOT LIKE 'ENDED_%'`).get(accountId, listing.asset.assetId) as { local_id: string | null } | undefined;
-      const item = database.itemByAssetId(accountId, listing.asset.assetId) ?? (linked?.local_id ? database.itemByLocalId(accountId, linked.local_id) : undefined);
-      const before = priorStatus.get(accountId, listing.listingId) as { status: string } | undefined;
-      statement.run({
-        accountId,
-        listingId: listing.listingId,
-        localId: item?.local_id ?? null,
-        assetId: listing.asset.assetId,
-        hashName: listing.asset.marketHashName,
-        receive: listing.priceReceiveCents,
-        buyer: listing.buyerPriceCents,
-        status,
-        holdUntil: listing.holdUntil ?? null,
-        confirm: confirm ? 1 : 0,
-        obs: observationId
-      });
-      // The listing names its row, and the row stays where the Game Coordinator holds it: listed
-      // is this open listing, not a location, so no allocation hands the unit out while it is
-      // open (`db/steam-listing.ts`). The id survives a cancel (rule 3).
-      // Emit on the transition only, so an unconfirmed listing does not append an event per sync.
-      if (status === 'PENDING_CONFIRMATION' && before?.status !== 'PENDING_CONFIRMATION') {
-        database.addEvent(accountId, 'listing-awaiting-phone-confirmation', {
-          listingId: listing.listingId,
-          localId: item?.local_id ?? null,
-          hashName: listing.asset.marketHashName
-        }, this.context.now());
-      }
-    };
-
     // Explicit bucket precedence: a pending confirmation is the most restrictive evidence.
-    const buckets = new Map<string, { listing: MarketListing; status: string; confirm: boolean }>();
-    for (const listing of listings) buckets.set(listing.listingId, { listing, status: 'ACTIVE', confirm: false });
-    for (const listing of holds) buckets.set(listing.listingId, { listing, status: 'ON_HOLD', confirm: false });
-    for (const listing of confirmations) buckets.set(listing.listingId, { listing, status: 'PENDING_CONFIRMATION', confirm: true });
-    for (const { listing, status, confirm } of buckets.values()) write(listing, status, confirm);
+    const buckets = new Map<string, SeenSteamListing>();
+    const bucket = (rows: readonly MarketListing[], name: SteamListingBucket): void => {
+      for (const listing of rows) buckets.set(listing.listingId, { listing, bucket: name });
+    };
+    bucket(listings, 'ACTIVE');
+    bucket(holds, 'ON_HOLD');
+    bucket(confirmations, 'PENDING_CONFIRMATION');
+    this.observeListings(accountId, observationId, [...buckets.values()]);
 
-    const orderStatement = database.raw().prepare(`
-      INSERT INTO buy_order(account_id, buy_order_id, hash_name, price_cents, quantity,
-        quantity_remaining, purchased, active, first_seen_obs, last_seen_obs)
-      VALUES (@accountId, @id, @hash, @price, @quantity, @remaining, @purchased, 1, @obs, @obs)
-      ON CONFLICT(account_id, buy_order_id) DO UPDATE SET quantity_remaining=excluded.quantity_remaining,
-        purchased=excluded.purchased, active=1, last_seen_obs=excluded.last_seen_obs
-    `);
-    const purchasedBefore = new Map((database.raw()
-      .prepare(`SELECT buy_order_id, purchased FROM buy_order WHERE account_id=?`)
-      .all(accountId) as Array<{ buy_order_id: string; purchased: number }>)
-      .map((row) => [row.buy_order_id, row.purchased]));
+    const store = new OrderStore(database);
+    const purchasedBefore = new Map(store.steamBuyOrders(accountId).map((row) => [row.venue_order_id!, row.filled]));
     const filled: string[] = [];
-    const mainItems = database.items(accountId).filter((item) => item.location === 'MAIN').map((item) => item.local_id);
     for (const order of buyOrders) {
       const purchased = order.quantity - order.quantityRemaining;
       const before = purchasedBefore.get(order.buyOrderId) ?? 0;
@@ -476,43 +423,74 @@ export class MarketService {
         // restart" means (BUY-04, N-BUY-01).
         new LedgerStore(database).recordBuyOrderFill({
           accountId, buyOrderId: order.buyOrderId, purchasedTotal: purchased, delta: purchased - before,
-          unitPriceCents: order.priceCents, candidates: mainItems, observationId, now: this.context.now()
+          unitPriceCents: order.priceCents, observationId, now: this.context.now()
         });
       }
-      orderStatement.run({
-        accountId,
-        id: order.buyOrderId,
-        hash: order.hashName,
-        price: order.priceCents,
-        quantity: order.quantity,
-        remaining: order.quantityRemaining,
-        purchased,
-        obs: observationId
-      });
     }
     this.filledSinceWalk = filled.length;
-    database.raw().prepare(`UPDATE buy_order SET active=0 WHERE account_id=? AND last_seen_obs<>? AND active=1`)
-      .run(accountId, observationId);
-    this.orders.observeMarket(accountId, observationId);
+    store.observeSteamBuyOrders(accountId, observationId, buyOrders, this.context.now());
   }
 
   /**
-   * An empty market is believable only when every listing it would end is accounted for: market
+   * The walk's write of what the book shows: every listing seen, bound to its holding by asset id,
+   * and every listing no longer shown marked gone (`OrderStore.observeSteamListings`). The listing
+   * names its row, and the row stays where the Game Coordinator holds it: listed is this open
+   * listing, not a location (`db/commitment.ts`), and the id survives a cancel (rule 3). Where a
+   * gone listing's item is stays the GC's to say, so this walk moves no item (rule 5).
+   */
+  protected observeListings(accountId: AccountId, observationId: number, seen: readonly SeenSteamListing[]): void {
+    new OrderStore(this.context.database).observeSteamListings(accountId, observationId, seen, this.context.now());
+  }
+
+  /**
+   * An empty market is believable when every listing it would end is accounted for: market
    * history names it cancelled or sold, or this app sent a cancel for it that Steam did not refuse.
+   * Failing that, it is believable when the session that read it is shown to be signed in
+   * (`emptyFromSignedInSession`).
    *
    * The inventory cannot vouch for it. The Game Coordinator keeps a listed item in main inventory
-   * (`db/steam-listing.ts`), so a live listing and a cancelled one look the same from there, and a
+   * (`db/commitment.ts`), so a live listing and a cancelled one look the same from there, and a
    * stale session's empty answer is exactly the shape that would make every one of them look
    * cancelled. A cancel of our own is different: it is a reason, recorded before the walk, for the
    * book to be empty, and the delist it belongs to is still graded by `reconcile` on its own proof.
    */
-  private emptyIsCorroborated(accountId: string): boolean {
+  /**
+   * The empty book that nothing in the record explains, read again by a session shown to be signed in.
+   *
+   * The guard above exists for one failure: a stale session answering `success` with every bucket
+   * empty, which believed would end a whole book. History cannot tell that apart from a real
+   * ending, because Steam's history names sales and purchases and never a cancellation (corpus
+   * `steamcommunity.market.myhistory`). So a book the person emptied on the website — their last
+   * listing cancelled there, or one never confirmed and withdrawn — read as stale for ever, and the
+   * account's market walk never completed again (L-04 and M-04, 2026-10-15).
+   *
+   * What does tell them apart is the session. The wallet comes from the market page, which carries
+   * it only for a signed-in session (corpus `steamcommunity.market.wallet-info`): a stale session
+   * fails the read and the walk stays suspicious (OBS-EMPTY). Read first and the book after it, so
+   * the empty answer believed is one given to a session already shown to be live. Believing the
+   * walk concludes nothing about why each listing went: `OrderService.reconcile` still ends one only
+   * on history, or on an inventory walk that still holds its item, and waits otherwise (OBS-EMPTY-02).
+   */
+  protected async emptyFromSignedInSession(accountId: AccountId, pageSize: number): Promise<boolean> {
+    const proof = this.context.database.observation(accountId, await this.syncWallet(accountId));
+    if (!proof?.complete) return false;
+    try {
+      const again = await this.context.ports.market.getMyListingsPage(accountId, 0, pageSize);
+      return again.start === 0 && again.totalCount === 0
+        && again.listings.length === 0 && again.listingsOnHold.length === 0 && again.listingsToConfirm.length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private emptyIsCorroborated(accountId: string, open: readonly SteamListingRow[]): boolean {
     const { database } = this.context;
-    const open = database.raw().prepare(`SELECT listing_id FROM market_listing WHERE account_id=? AND status IN ${OPEN_STATUSES}`).all(accountId) as { listing_id: string }[];
-    const cancelled = database.raw().prepare(`SELECT 1 FROM action a JOIN desired_state d ON d.id=a.desired_id JOIN attempt t ON t.action_id=a.id
-      WHERE a.account_id=? AND a.kind='REMOVE_SELL_LISTING' AND json_extract(d.params_json,'$.listingId')=?
+    // A cancel we sent for it, by hand (a goal's action) or as a chain's hop (a step's): both carry
+    // the listing id in the action's own params.
+    const cancelled = database.raw().prepare(`SELECT 1 FROM action a JOIN attempt t ON t.action_id=a.id
+      WHERE a.account_id=? AND a.kind='REMOVE_SELL_LISTING' AND json_extract(a.params_json,'$.listingId')=?
         AND IFNULL(t.outcome,'')<>'DEFINITIVELY_REJECTED' LIMIT 1`);
-    return open.every((listing) => this.orders.historyExplainsEmpty(accountId, listing.listing_id)
-      || Boolean(cancelled.get(accountId, listing.listing_id)));
+    return open.every((listing) => this.orders.historyExplainsEmpty(accountId, listing.venue_order_id!)
+      || Boolean(cancelled.get(accountId, listing.venue_order_id)));
   }
 }

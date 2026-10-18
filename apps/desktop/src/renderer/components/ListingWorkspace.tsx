@@ -5,9 +5,12 @@ import { Button, Caption, IconButton, Select, Thumbnail } from './ui.js';
 import { Icon, type IconName } from './Icon.js';
 import { VenueMark } from './VenueMark.js';
 import { useOutbox } from '../features/work/WorkIndicator.js';
-import { formatCents, formatFloat, wearTier } from '../lib/format.js';
-import { formatUsd, parseMoney, plural } from '../lib/labels.js';
-import type { OutboxOutcome } from '../features/work/outbox.js';
+import { formatFloat, wearTier } from '../lib/format.js';
+import { convert } from '@cslytics/market-data';
+import { parseMoney, plural } from '../lib/labels.js';
+import { useCurrency } from '../lib/currency.js';
+import { conversionNote, currencyCodeOf, formatAmount, formatConverted } from '../lib/money.js';
+import type { OutboxOutcome } from '../features/work/outbox.js';
 import type { Message } from './ui.js';
 
 export type Venue = 'steam' | 'csfloat';
@@ -191,7 +194,8 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
    * workspace rather than to start it over — so this opens a folded one instead of re-seeding it.
    */
   reveal: number;
-  accounts: ReadonlyArray<{ id: string; name: string }>;
+  /** Each account with its wallet currency, which every Steam figure here is in; CSFloat figures are USD. */
+  accounts: ReadonlyArray<{ id: string; name: string; currency?: number | null | undefined }>;
   /** The inspector's price field, so a figure typed on either side survives the other. */
   price?: string | undefined;
   onPrice?: ((next: string) => void) | undefined;
@@ -260,7 +264,18 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
     if (rows.length === 0) onDismiss();
   }, [rows.length]);
 
-  const sendable = useMemo(() => shown.filter((row) => priceOf(row) !== null), [shown]);
+  /**
+   * The currency a row's figures are in: USD on CSFloat everywhere, the account's wallet on Steam
+   * (portfolio and pricing plan §5.1). A typed price is in this currency and is sent as typed.
+   */
+  const currencyFor = (venue: Venue, accountId: string): number | null => (venue === 'csfloat' ? 1 : accounts.find((account) => account.id === accountId)?.currency ?? null);
+  const rowCurrency = (row: Staged<StagedEntry>): number | null => currencyFor(row.venue, row.entry.accountId);
+  /** One currency for rows on one venue, or none when accounts with different wallets are mixed in. */
+  const currencyOfRows = (venue: Venue, rows: ReadonlyArray<Staged<StagedEntry>>): number | null => {
+    const codes = new Set(rows.filter((row) => row.venue === venue).map((row) => currencyFor(venue, row.entry.accountId)));
+    return codes.size === 1 ? [...codes][0]! : null;
+  };
+  const sendable = useMemo(() => shown.filter((row) => priceOf(row, rowCurrency(row)) !== null), [shown, accounts]);
   const steamRows = sendable.filter((row) => row.venue === 'steam');
   const csfloatRows = sendable.filter((row) => row.venue === 'csfloat');
   const overCsfloatBatch = csfloatRows.length > CSFLOAT_BATCH;
@@ -285,7 +300,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
     setBulkPrice(next);
     setBulkBasis(basis);
     // The inspector's field only ever means what the seller receives.
-    onPrice?.(basis === 'receive' ? next : pricing(bulkVenue, next, basis).receiveText);
+    onPrice?.(basis === 'receive' ? next : pricing(bulkVenue, currencyOfRows(bulkVenue, shown), next, basis).receiveText);
     setRows((current) => current.map((row) => (
       row.ownPrice || row.state === 'handed' ? row : { ...row, price: next, basis }
     )));
@@ -331,7 +346,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
     onMessage(null);
     setRows((current) => current.map((row) => (keys.includes(row.key) ? { ...row, state: 'handed', detail: undefined } : row)));
     onSent?.(keys);
-    for (const batch of intent.batches(targets.map((row) => ({ entry: row.entry, venue: row.venue, cents: priceOf(row)! })))) {
+    for (const batch of intent.batches(targets.map((row) => ({ entry: row.entry, venue: row.venue, cents: priceOf(row, rowCurrency(row))! })))) {
       outbox.enqueue({
         kind: batch.kind,
         items: batch.keys.map((key) => {
@@ -342,7 +357,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
             name: row.entry.name,
             imageUrl: row.entry.imageUrl,
             localId: row.entry.localId ?? null,
-            receiveCents: pricingOf(row).quote?.receiveCents ?? null
+            receiveCents: pricingOf(row, rowCurrency(row)).quote?.receiveCents ?? null
           };
         }),
         send: batch.send,
@@ -372,13 +387,15 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
 
   if (shown.length === 0) return null;
 
-  const steamTotal = tally(steamRows);
-  const csfloatTotal = tally(csfloatRows);
+  const steamTotal = tally(steamRows, rowCurrency);
+  const csfloatTotal = tally(csfloatRows, rowCurrency);
+  const steamCurrency = currencyOfRows('steam', steamRows);
   // A standing listing still at its own price is priced, just not worth sending. Only a row with
   // no figure its venue would take is missing something.
-  const unchanged = shown.filter((row) => priceOf(row) === null && pricing(row.venue, row.price, row.basis).listCents !== null).length;
+  const unchanged = shown.filter((row) => priceOf(row, rowCurrency(row)) === null && pricing(row.venue, rowCurrency(row), row.price, row.basis).listCents !== null).length;
   const unpriced = shown.length - sendable.length - unchanged;
-  const bulk = pricing(bulkVenue, bulkPrice, bulkBasis);
+  const bulkCurrency = currencyOfRows(bulkVenue, shown);
+  const bulk = pricing(bulkVenue, bulkCurrency, bulkPrice, bulkBasis);
   // What the header says in one line, so the pill still reports the state of the work folded up.
   const summary = [
     `${plural(shown.length, intent.noun)} staged`,
@@ -460,7 +477,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
               <span className="kicker">For every row</span>
               {bulkOpen ? null : (
                 <span className="listing-bulk-summary">
-                  {bulk.quote ? <>receive <span className="num">{formatUsd(bulk.quote.receiveCents)}</span> · buyer pays <span className="num">{formatUsd(bulk.quote.buyerCents)}</span> · </> : null}
+                  {bulk.quote ? <>receive <span className="num">{formatAmount(bulk.quote.receiveCents, bulkCurrency)}</span> · buyer pays <span className="num">{formatAmount(bulk.quote.buyerCents, bulkCurrency)}</span> · </> : null}
                   {routable ? VENUE[bulkVenue].short : null}
                 </span>
               )}
@@ -468,7 +485,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
             {bulkOpen ? (
               <div className="listing-bulk-body" id={bulkId}>
                 <div className="listing-controls" data-bulk="true">
-                  <PriceFields subject="every row" venue={bulkVenue} priced={bulk} disabled={false} onChange={spreadPrice} />
+                  <PriceFields subject="every row" venue={bulkVenue} currency={bulkCurrency} priced={bulk} disabled={false} onChange={spreadPrice} />
                   {routable ? (
                     <label className="listing-control">
                       <span className="listing-control-label">Marketplace</span>
@@ -501,7 +518,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
           <ul className="listing-rows" aria-label="Staged for pricing">
             {shown.map((row) => {
               const { entry } = row;
-              const priced = pricingOf(row);
+              const priced = pricingOf(row, rowCurrency(row));
               const cents = priced.listCents;
               const tier = wearTier(entry.paintWear);
               return (
@@ -527,6 +544,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
 
                   <div className="listing-controls">
                     <PriceFields
+                      currency={rowCurrency(row)}
                       subject={entry.name}
                       venue={row.venue}
                       priced={priced}
@@ -591,14 +609,14 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
           <span className="listing-total quiet">
             {steamRows.length > 0 ? (
               <span className="listing-tally" title="Before anything is listed: what these would pay you, and what their buyers would pay">
-                <VenueMark venue="steam" size={12} />{plural(steamRows.length, 'item')} · you receive <span className="num">{formatUsd(steamTotal.receiveCents)}</span>
-                {' '}· buyers pay <span className="num">{formatUsd(steamTotal.buyerCents)}</span>
+                <VenueMark venue="steam" size={12} />{plural(steamRows.length, 'item')} · you receive <span className="num">{formatAmount(steamTotal.receiveCents, steamCurrency)}</span>
+                {' '}· buyers pay <span className="num">{formatAmount(steamTotal.buyerCents, steamCurrency)}</span>
               </span>
             ) : null}
             {csfloatRows.length > 0 ? (
               <span className="listing-tally" title="Before anything is listed: what these would pay you after CSFloat's fee, and what the listings would show">
-                <VenueMark venue="csfloat" size={12} />{plural(csfloatRows.length, 'item')} · you receive <span className="num">{formatUsd(csfloatTotal.receiveCents)}</span>
-                {' '}· buyers pay <span className="num">{formatUsd(csfloatTotal.buyerCents)}</span>
+                <VenueMark venue="csfloat" size={12} />{plural(csfloatRows.length, 'item')} · you receive <span className="num">{formatAmount(csfloatTotal.receiveCents, 1)}</span>
+                {' '}· buyers pay <span className="num">{formatAmount(csfloatTotal.buyerCents, 1)}</span>
               </span>
             ) : null}
             {unpriced > 0 ? (
@@ -626,8 +644,10 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
  * typed $ is harmless; the class is not called `money`, which this sheet already uses for the
  * cross-venue figure that carries its own currency.
  */
-function MoneyInput({ label, value, onChange, disabled, derived }: {
+function MoneyInput({ label, currency, value, onChange, disabled, derived }: {
   label: string;
+  /** What a typed figure is in; the mark beside the field says so. */
+  currency: number | null;
   value: string;
   onChange: (next: string) => void;
   disabled?: boolean | undefined;
@@ -636,10 +656,11 @@ function MoneyInput({ label, value, onChange, disabled, derived }: {
 }): React.JSX.Element {
   return (
     <span className="price-input">
-      <span className="price-input-mark" aria-hidden="true">$</span>
+      <span className="price-input-mark" aria-hidden="true">{currencyCodeOf(currency) || '¤'}</span>
       <input
         className="input input-sm input-money"
         aria-label={label}
+        data-currency={currencyCodeOf(currency) || undefined}
         inputMode="decimal"
         data-derived={derived || undefined}
         disabled={disabled}
@@ -657,21 +678,30 @@ function MoneyInput({ label, value, onChange, disabled, derived }: {
  * venue's fees and shown quieter. The fee total sits beside the *Buyer pays* label, and its
  * breakdown is in the tooltip, because the difference between the two fields is the whole point.
  */
-function PriceFields({ subject, venue, priced, disabled, onChange }: {
+function PriceFields({ subject, venue, currency, priced, disabled, onChange }: {
   /** "every row", or the item's name; it completes each field's accessible name. */
   subject: string;
   venue: Venue;
+  currency: number | null;
   priced: Pricing;
   disabled: boolean;
   onChange: (next: string, basis: PriceBasis) => void;
 }): React.JSX.Element {
   const fees = priced.quote ? priced.quote.buyerCents - priced.quote.receiveCents : null;
-  const breakdown = priced.quote?.fees.map((fee) => `${fee.name} ${formatUsd(fee.cents)}`).join(' + ') ?? '';
+  const breakdown = priced.quote?.fees.map((fee) => `${fee.name} ${formatAmount(fee.cents, currency)}`).join(' + ') ?? '';
+  // The typed figure stays in the account's own currency and is sent as typed (plan D9). With
+  // the account-pages toggle on and a rate held, its base-currency equivalent is shown beside
+  // it, read-only, so nobody mistakes a converted figure for the price to type.
+  const { settings, base, fx } = useCurrency();
+  const code = currencyCodeOf(currency);
+  const hint = settings.showAccountPagesInBase && priced.quote && code && code !== base ? convert(priced.quote.receiveCents, code, base, fx) : null;
   return (
     <>
+      {hint ? <span className="listing-control-hint cell-sub" data-testid="price-converted-hint" title={conversionNote(hint)}>you receive {formatConverted(hint)}</span> : null}
       <label className="listing-control">
         <span className="listing-control-label">You receive</span>
         <MoneyInput
+          currency={currency}
           label={`You receive for ${subject}`}
           value={priced.receiveText}
           derived={priced.basis !== 'receive'}
@@ -683,10 +713,11 @@ function PriceFields({ subject, venue, priced, disabled, onChange }: {
         <span className="listing-control-label">
           Buyer pays
           {fees !== null && fees > 0 ? (
-            <span className="listing-control-fee num" title={`${VENUE[venue].label}: ${breakdown}`}>+{formatUsd(fees)}</span>
+            <span className="listing-control-fee num" title={`${VENUE[venue].label}: ${breakdown}`}>+{formatAmount(fees, currency)}</span>
           ) : null}
         </span>
         <MoneyInput
+          currency={currency}
           label={`Buyer pays for ${subject}`}
           value={priced.buyerText}
           derived={priced.basis !== 'buyer'}
@@ -757,7 +788,7 @@ type Pricing = {
 };
 
 /** A typed figure, read through one venue's fees. Every price on this screen goes through here. */
-function pricing(venue: Venue, text: string, basis: PriceBasis): Pricing {
+function pricing(venue: Venue, currency: number | null, text: string, basis: PriceBasis): Pricing {
   const typed = parseMoney(text);
   const quote = typed === null ? null : basis === 'receive' ? quoteFromReceive(venue, typed) : quoteFromBuyer(venue, typed);
   const receiveText = basis === 'receive' ? text : quote ? dollars(quote.receiveCents) : '';
@@ -771,7 +802,7 @@ function pricing(venue: Venue, text: string, basis: PriceBasis): Pricing {
     const least = MARKETPLACE_FEES[venue].listPrice === 'receive' ? quoteFromReceive(venue, minimum) : quoteFromBuyer(venue, minimum);
     return {
       basis, quote, listCents: null, receiveText, buyerText,
-      note: { tone: 'warn', text: `The cheapest ${VENUE[venue].short} listing has the buyer pay ${formatUsd(least.buyerCents)}, which pays you ${formatUsd(least.receiveCents)}.` }
+      note: { tone: 'warn', text: `The cheapest ${VENUE[venue].short} listing has the buyer pay ${formatAmount(least.buyerCents, currency)}, which pays you ${formatAmount(least.receiveCents, currency)}.` }
     };
   }
   // Not every buyer price exists on a venue that adds its fees on top: 44¢ does not on Steam.
@@ -779,7 +810,7 @@ function pricing(venue: Venue, text: string, basis: PriceBasis): Pricing {
   const shown = basis === 'receive' ? quote.receiveCents : quote.buyerCents;
   const note = shown === typed
     ? null
-    : { tone: 'info' as const, text: `No ${VENUE[venue].short} listing has the buyer pay ${formatUsd(typed)}. The nearest below is ${formatUsd(quote.buyerCents)}, which pays you ${formatUsd(quote.receiveCents)}.` };
+    : { tone: 'info' as const, text: `No ${VENUE[venue].short} listing has the buyer pay ${formatAmount(typed, currency)}. The nearest below is ${formatAmount(quote.buyerCents, currency)}, which pays you ${formatAmount(quote.receiveCents, currency)}.` };
   return { basis, quote, listCents, receiveText, buyerText, note };
 }
 
@@ -788,26 +819,26 @@ function pricing(venue: Venue, text: string, basis: PriceBasis): Pricing {
  * already listed at. A figure that changes nothing is still a price, so both fields show it, but
  * it is not something to send.
  */
-function pricingOf(row: Staged<StagedEntry>): Pricing {
-  const priced = pricing(row.venue, row.price, row.basis);
+function pricingOf(row: Staged<StagedEntry>, currency: number | null): Pricing {
+  const priced = pricing(row.venue, currency, row.price, row.basis);
   if (priced.listCents === null || priced.listCents !== row.entry.currentListCents) return priced;
   return { ...priced, listCents: null, note: { tone: 'info', text: 'This is the price it is already listed at.' } };
 }
 
 /** A row's list price in integer cents, or `null` when it has none its venue would take. */
-function priceOf(row: Staged<StagedEntry>): number | null {
-  return pricingOf(row).listCents;
+function priceOf(row: Staged<StagedEntry>, currency: number | null): number | null {
+  return pricingOf(row, currency).listCents;
 }
 
 /** Both figures, summed over rows that each have a list price. */
-function tally(rows: ReadonlyArray<Staged<StagedEntry>>): { receiveCents: number; buyerCents: number } {
+function tally(rows: ReadonlyArray<Staged<StagedEntry>>, currencyOf: (row: Staged<StagedEntry>) => number | null): { receiveCents: number; buyerCents: number } {
   return rows.reduce((sum, row) => {
-    const quote = pricing(row.venue, row.price, row.basis).quote;
+    const quote = pricing(row.venue, currencyOf(row), row.price, row.basis).quote;
     return quote ? { receiveCents: sum.receiveCents + quote.receiveCents, buyerCents: sum.buyerCents + quote.buyerCents } : sum;
   }, { receiveCents: 0, buyerCents: 0 });
 }
 
 /** Cents as a money field holds them: no currency mark, always two places. */
 export function dollars(cents: number): string {
-  return formatCents(cents, null);
+  return `${cents < 0 ? '-' : ''}${(Math.abs(cents) / 100).toFixed(2)}`;
 }

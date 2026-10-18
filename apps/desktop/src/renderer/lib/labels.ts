@@ -1,4 +1,6 @@
+import { currencyById } from '@cslytics/market-data';
 import type { IconName } from '../components/Icon.js';
+import { formatAmount } from './money.js';
 
 /**
  * Words for codes.
@@ -76,18 +78,22 @@ export const LISTING_STATUS: Readonly<Record<string, StateLabel>> = {
   ABSENT: { label: 'Gone', tone: 'quiet', icon: 'x-circle' }
 };
 
+/** The order alphabet of `venue_order` (engine `db/alphabets.ts`), in a person's words. */
 export const ORDER_STATE: Readonly<Record<string, StateLabel>> = {
-  SUBMITTED: { label: 'Submitted', tone: 'accent', icon: 'upload' },
+  SUBMITTED: { label: 'Sent, not yet seen', tone: 'accent', icon: 'upload' },
   OPEN: { label: 'Open', tone: 'positive', icon: 'circle-dot' },
   OPEN_UNTRANSACTABLE: { label: 'Open, cannot transact', tone: 'warn', icon: 'alert-circle' },
-  PENDING_EXTERNAL: { label: 'Waiting on Steam', tone: 'accent', icon: 'hourglass' },
-  PENDING_CONFIRMATION: { label: 'Confirm on phone', tone: 'accent', icon: 'smartphone' },
-  ACTIVE: { label: 'Active', tone: 'positive', icon: 'circle-dot' },
+  PENDING_EXTERNAL: { label: 'Waiting on the venue', tone: 'accent', icon: 'hourglass' },
   UNEXPLAINED: { label: 'Unexplained', tone: 'warn', icon: 'alert-triangle' },
   QUARANTINED: { label: 'Quarantined', tone: 'warn', icon: 'ban' },
-  CLOSED: { label: 'Closed', tone: 'quiet', icon: 'check' },
-  SOLD: { label: 'Sold', tone: 'positive', icon: 'coins' },
-  CANCELLED: { label: 'Cancelled', tone: 'quiet', icon: 'x-circle' }
+  ENDED_FILLED: { label: 'Sold', tone: 'positive', icon: 'coins' },
+  ENDED_CANCELLED_BY_US: { label: 'Cancelled here', tone: 'quiet', icon: 'x-circle' },
+  ENDED_CANCELLED_EXTERNALLY: { label: 'Cancelled at the venue', tone: 'quiet', icon: 'x-circle' },
+  ENDED_LAPSED: { label: 'Never confirmed', tone: 'quiet', icon: 'x-circle' },
+  ENDED_EXPIRED: { label: 'Expired', tone: 'quiet', icon: 'x-circle' },
+  ENDED_VOIDED_BY_VENUE: { label: 'Voided by the venue', tone: 'warn', icon: 'ban' },
+  ENDED_LOST: { label: 'Lost', tone: 'warn', icon: 'alert-triangle' },
+  ENDED_NOT_APPLIED: { label: 'Never placed', tone: 'quiet', icon: 'x-circle' }
 };
 
 /** Steam's `market_history` event types, as the market walk records them. */
@@ -166,15 +172,12 @@ export const WORK_STATE: Readonly<Record<string, StateLabel>> = {
   UNSUBMITTED: { label: 'Waiting to submit', tone: 'quiet', icon: 'hourglass' },
   SUBMITTING: { label: 'Submitting', tone: 'accent', icon: 'loader' },
   REFUSED: { label: 'Refused', tone: 'negative', icon: 'ban' },
-  PREPARED: { label: 'Queued', tone: 'quiet', icon: 'hourglass' },
   QUEUED: { label: 'Queued', tone: 'quiet', icon: 'hourglass' },
   RUNNING: { label: 'Sending', tone: 'accent', icon: 'loader' },
-  SUBMITTED: { label: 'Sent, waiting for Steam to show it', tone: 'accent', icon: 'eye' },
   AWAITING_OBSERVATION: { label: 'Sent, waiting for Steam to show it', tone: 'accent', icon: 'eye' },
   // A complete walk showed the listing in `listings_to_confirm`: Steam has it, and waits on the
   // phone tap this app never makes. Still not confirmed, and the person is who it waits for.
   AWAITING_CONFIRMATION: { label: 'On Steam, waiting for your phone confirmation', tone: 'accent', icon: 'smartphone' },
-  IN_TRANSIT: { label: 'In transit', tone: 'accent', icon: 'send' },
   // A transfer batch retrieving a crated item before its offer goes: the hop is a casket move,
   // proved by a later complete walk, and the send waits on it.
   RETRIEVING: { label: 'Retrieving from storage', tone: 'accent', icon: 'archive' },
@@ -182,6 +185,15 @@ export const WORK_STATE: Readonly<Record<string, StateLabel>> = {
   // for the marketplace's own copy of the inventory to show it (CSF-32). `workStateLabel` names
   // the marketplace.
   AWAITING_VENUE: { label: 'Retrieved, waiting for Steam to see it', tone: 'accent', icon: 'eye' },
+  // An offer this app sent, by what Steam shows of it: live and waiting on the other account,
+  // accepted and held by Steam, accepted and waiting for both inventories to prove the move.
+  ACTIVE: { label: 'On Steam, waiting for the other account', tone: 'accent', icon: 'send' },
+  ESCROW: { label: 'Accepted, held by Steam', tone: 'accent', icon: 'lock' },
+  AWAITING_DELIVERY: { label: 'Accepted, waiting for both inventories', tone: 'accent', icon: 'eye' },
+  // A CSFloat sale's offer, by what Steam shows of it: with the buyer, or accepted and waiting on
+  // CSFloat's own verification.
+  AWAITING_BUYER: { label: 'On Steam, waiting for the buyer', tone: 'accent', icon: 'send' },
+  AWAITING_VERIFICATION: { label: 'Accepted, waiting for CSFloat to verify', tone: 'accent', icon: 'eye' },
   COMPLETE: { label: 'Completed', tone: 'positive', icon: 'check-circle' },
   DONE: { label: 'Completed', tone: 'positive', icon: 'check-circle' },
   REJECTED: { label: 'Refused', tone: 'negative', icon: 'ban' },
@@ -211,6 +223,52 @@ export function retryPhrase(
   return `${VENUE_NAME[venue ?? 'steam']} still shows it · ${when}${count}`;
 }
 
+/** How a command's members stand, counted in items, and the one reason its failures share when they share one. */
+export type CommandTally = { total: number; confirmed: number; open: number; failed: number; stopped: number; sold: number; sharedReason: string | null };
+
+const CONFIRMED_STATES: ReadonlySet<string> = new Set(['COMPLETE', 'DONE']);
+const FAILED_STATES: ReadonlySet<string> = new Set(['FAILED', 'REJECTED', 'REFUSED', 'BLOCKED']);
+
+export function tallyCommand(members: ReadonlyArray<{ memberState: string; quantity: number; reason: string | null }>): CommandTally {
+  const tally: CommandTally = { total: 0, confirmed: 0, open: 0, failed: 0, stopped: 0, sold: 0, sharedReason: null };
+  const reasons = new Set<string>();
+  for (const member of members) {
+    tally.total += member.quantity;
+    if (CONFIRMED_STATES.has(member.memberState)) tally.confirmed += member.quantity;
+    else if (FAILED_STATES.has(member.memberState)) { tally.failed += member.quantity; reasons.add(member.reason ?? ''); }
+    else if (member.memberState === 'STOPPED') tally.stopped += member.quantity;
+    else if (member.memberState === 'SOLD') tally.sold += member.quantity;
+    else tally.open += member.quantity;
+  }
+  const [only] = [...reasons];
+  tally.sharedReason = reasons.size === 1 && only ? only : null;
+  return tally;
+}
+
+/**
+ * A command's headline. While nothing is confirmed it says what is happening, "Storing 968 items";
+ * once an observation has confirmed some of it, how much, "Stored 567 of 968 items"; and when all
+ * of it is, "Stored 968 items". A command whose work has all settled never reads as still going:
+ * "Storing 968 items" over a batch that has stopped for good would say it is still going.
+ */
+export function commandHeadline(kind: Destination, tally: CommandTally): string {
+  const noun = kind.noun ?? 'item';
+  const done = kind.done ?? kind.verb;
+  if (tally.total > 0 && tally.confirmed === tally.total) return `${done} ${plural(tally.total, noun)}`;
+  if (tally.confirmed === 0 && tally.open > 0) return `${kind.verb} ${plural(tally.total, noun)}`;
+  return `${done} ${tally.confirmed.toLocaleString()} of ${plural(tally.total, noun)}`;
+}
+
+/** The counts beside the headline, the ones that are not zero: "3 in progress · 401 failed". */
+export function commandCounts(tally: CommandTally): string[] {
+  const parts: string[] = [];
+  if (tally.open > 0 && tally.confirmed > 0) parts.push(`${tally.open.toLocaleString()} in progress`);
+  if (tally.failed > 0) parts.push(`${tally.failed.toLocaleString()} failed`);
+  if (tally.stopped > 0) parts.push(`${tally.stopped.toLocaleString()} stopped`);
+  if (tally.sold > 0) parts.push(`${tally.sold.toLocaleString()} sold meanwhile`);
+  return parts;
+}
+
 /** m:ss, rounded up, so a countdown never reads 0:00 while there is still a wait. */
 export function formatCountdown(ms: number): string {
   const seconds = Math.max(0, Math.ceil(ms / 1_000));
@@ -225,48 +283,57 @@ export function formatCountdown(ms: number): string {
  * the same whichever marketplace they are on and a third one needs no new words. `joiner` is the
  * word between them when it is not *on*: an item is listed on a marketplace and delisted *from* it.
  * `noun` is what the work is counted in when it is not items: "Cancelling 1 buy order on Steam".
+ * `done` is the verb once an observation has confirmed some of it: "Stored 567 of 968 items".
  */
-export type Destination = { icon: IconName; verb: string; venue?: 'steam' | 'csfloat'; joiner?: string; noun?: string };
+export type Destination = { icon: IconName; verb: string; done?: string; venue?: 'steam' | 'csfloat'; joiner?: string; noun?: string };
 
 /** By command kind: the glyph the indicator travels toward. */
 export const DESTINATION: Readonly<Record<string, Destination>> = {
-  STORE: { icon: 'archive', verb: 'Storing' },
-  RETRIEVE: { icon: 'download', verb: 'Retrieving' },
-  TRANSFER: { icon: 'send', verb: 'Transferring' },
-  LIST: { icon: 'tag', verb: 'Listing', venue: 'steam' },
-  REPRICE: { icon: 'pencil', verb: 'Repricing', venue: 'steam' },
+  STORE: { icon: 'archive', verb: 'Storing', done: 'Stored' },
+  RETRIEVE: { icon: 'download', verb: 'Retrieving', done: 'Retrieved' },
+  TRANSFER: { icon: 'send', verb: 'Transferring', done: 'Transferred' },
+  // A send to another owned account: its members are read from the send hop of each source.
+  ACCOUNT_TRANSFER: { icon: 'send', verb: 'Transferring', done: 'Transferred' },
+  LIST: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'steam' },
+  REPRICE: { icon: 'pencil', verb: 'Repricing', done: 'Repriced', venue: 'steam' },
   // A delist asked for by hand. The engine has no such command: the work read names it.
-  DELIST: { icon: 'trash', verb: 'Delisting', venue: 'steam', joiner: 'from' },
-  DELIST_TO_STORE: { icon: 'undo', verb: 'Delisting', venue: 'steam', joiner: 'from' },
-  CSFLOAT_LIST: { icon: 'tag', verb: 'Listing', venue: 'csfloat' },
+  DELIST: { icon: 'trash', verb: 'Delisting', done: 'Delisted', venue: 'steam', joiner: 'from' },
+  DELIST_TO_STORE: { icon: 'undo', verb: 'Delisting', done: 'Delisted', venue: 'steam', joiner: 'from' },
+  CSFLOAT_LIST: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'csfloat' },
   // The engine's own name for the same work: `work.open` reports a CSFloat operation as
   // `CSFLOAT_<kind>`, and a create is what the outbox called `CSFLOAT_LIST`. Without this row the
   // listing read "Working on" and named no marketplace from the moment the engine admitted it.
-  CSFLOAT_CREATE: { icon: 'tag', verb: 'Listing', venue: 'csfloat' },
-  CSFLOAT_REPRICE: { icon: 'pencil', verb: 'Repricing', venue: 'csfloat' },
-  CSFLOAT_CANCEL: { icon: 'trash', verb: 'Delisting', venue: 'csfloat', joiner: 'from' },
-  CSFLOAT_DELIVER: { icon: 'send', verb: 'Delivering', venue: 'csfloat', joiner: 'sold on' },
+  CSFLOAT_CREATE: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'csfloat' },
+  CSFLOAT_REPRICE: { icon: 'pencil', verb: 'Repricing', done: 'Repriced', venue: 'csfloat' },
+  CSFLOAT_CANCEL: { icon: 'trash', verb: 'Delisting', done: 'Delisted', venue: 'csfloat', joiner: 'from' },
+  CSFLOAT_DELIVER: { icon: 'send', verb: 'Delivering', done: 'Delivered', venue: 'csfloat', joiner: 'sold on' },
+  // An in-game store purchase: its hops name the entries bought, not an item this app holds.
+  STORE_PURCHASE: { icon: 'shopping-cart', verb: 'Buying', done: 'Bought', venue: 'steam', joiner: 'from the store on', noun: 'store purchase' },
   // Work about a buy order, which names no item. The engine calls a Steam one by its action's
   // kind and a CSFloat one `CSFLOAT_<operation kind>`, as for a listing.
-  CREATE_BUY_ORDER: { icon: 'shopping-cart', verb: 'Placing', venue: 'steam', noun: 'buy order' },
-  CANCEL_BUY_ORDER: { icon: 'trash', verb: 'Cancelling', venue: 'steam', noun: 'buy order' },
-  CSFLOAT_BUY_ORDER_EDIT: { icon: 'pencil', verb: 'Changing', venue: 'csfloat', noun: 'buy order' },
-  CSFLOAT_BUY_ORDER_CANCEL: { icon: 'trash', verb: 'Cancelling', venue: 'csfloat', noun: 'buy order' }
+  BUY_ORDER_CREATE: { icon: 'shopping-cart', verb: 'Placing', done: 'Placed', venue: 'steam', noun: 'buy order' },
+  BUY_ORDER_CANCEL: { icon: 'trash', verb: 'Cancelling', done: 'Cancelled', venue: 'steam', noun: 'buy order' },
+  CSFLOAT_BUY_ORDER_EDIT: { icon: 'pencil', verb: 'Changing', done: 'Changed', venue: 'csfloat', noun: 'buy order' },
+  CSFLOAT_BUY_ORDER_CANCEL: { icon: 'trash', verb: 'Cancelling', done: 'Cancelled', venue: 'csfloat', noun: 'buy order' }
 };
 
 /** The hop an item is on now, so a chained command reads as two steps rather than one jump. */
 export const ACTION_DESTINATION: Readonly<Record<string, Destination>> = {
-  STORE_IN_CASKET: { icon: 'archive', verb: 'Storing' },
-  RETRIEVE_FROM_CASKET: { icon: 'download', verb: 'Retrieving' },
-  CREATE_SELL_LISTING: { icon: 'tag', verb: 'Listing', venue: 'steam' },
-  REMOVE_SELL_LISTING: { icon: 'undo', verb: 'Delisting', venue: 'steam', joiner: 'from' },
-  SEND_TRADE_OFFER: { icon: 'send', verb: 'Sending' },
-  ACCEPT_TRADE_OFFER: { icon: 'check', verb: 'Accepting' },
+  STORE_IN_CASKET: { icon: 'archive', verb: 'Storing', done: 'Stored' },
+  RETRIEVE_FROM_CASKET: { icon: 'download', verb: 'Retrieving', done: 'Retrieved' },
+  CREATE_SELL_LISTING: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'steam' },
+  REMOVE_SELL_LISTING: { icon: 'undo', verb: 'Delisting', done: 'Delisted', venue: 'steam', joiner: 'from' },
+  SEND_TRADE_OFFER: { icon: 'send', verb: 'Sending', done: 'Sent' },
+  ACCEPT_TRADE_OFFER: { icon: 'check', verb: 'Accepting', done: 'Accepted' },
+  // The hops of a transfer between owned accounts, by the kind of the action that carries each.
+  'trade.send': { icon: 'send', verb: 'Sending', done: 'Sent' },
+  'trade.accept': { icon: 'check', verb: 'Accepting', done: 'Accepted' },
+  'trade.cancel': { icon: 'undo', verb: 'Cancelling', done: 'Cancelled' },
   // A CSFloat operation's action. The second hop of a listing from a unit, and the only one of any
   // other CSFloat work.
-  CSFLOAT_CREATE: { icon: 'tag', verb: 'Listing', venue: 'csfloat' },
-  CSFLOAT_REPRICE: { icon: 'pencil', verb: 'Repricing', venue: 'csfloat' },
-  CSFLOAT_CANCEL: { icon: 'trash', verb: 'Delisting', venue: 'csfloat', joiner: 'from' }
+  CSFLOAT_CREATE: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'csfloat' },
+  CSFLOAT_REPRICE: { icon: 'pencil', verb: 'Repricing', done: 'Repriced', venue: 'csfloat' },
+  CSFLOAT_CANCEL: { icon: 'trash', verb: 'Delisting', done: 'Delisted', venue: 'csfloat', joiner: 'from' }
 };
 
 /** What a marketplace is called in a sentence. */
@@ -463,11 +530,9 @@ export function looksLikeDate(value: unknown): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value) && !Number.isNaN(new Date(value).getTime());
 }
 
-/** Steam currency codes this app has met, by symbol. */
-const CURRENCY_SYMBOL: Readonly<Record<number, string>> = { 1: '$', 2: '£', 3: '€', 21: 'A$', 5: '₽', 20: 'C$', 22: 'NZ$' };
-
+/** Valve's own symbol for a Steam currency id (`@cslytics/market-data`'s table), or nothing for an unknown one. */
 export function currencySymbol(currency: number | null | undefined): string {
-  return currency === null || currency === undefined ? '' : CURRENCY_SYMBOL[currency] ?? '';
+  return currencyById(currency)?.symbol ?? '';
 }
 
 /**
@@ -499,9 +564,9 @@ export function currencyCode(currency: number | null | undefined): string {
   return currency === null || currency === undefined ? '' : CURRENCY_CODE[currency] ?? `code ${currency}`;
 }
 
+/** A CSFloat figure: USD on every account, printed with its code like every other. */
 export function formatUsd(cents: number | null | undefined): string {
-  if (cents === null || cents === undefined) return '—';
-  return `$${(cents / 100).toFixed(2)}`;
+  return formatAmount(cents, 'USD');
 }
 
 /** Whole dollars and cents as typed in a money field, to integer cents; `null` when it is not a price. */

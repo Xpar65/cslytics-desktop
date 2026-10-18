@@ -14,19 +14,31 @@ import { surfaceName, type ProofNeed, type SurfaceRef } from '../kernel/evidence
  */
 
 /** One walk a waiting action needs, and since when it has been waiting. */
-export type ProofDemand = { ref: SurfaceRef; startedAfter: string; since: string };
+export type ProofDemand = { ref: SurfaceRef; startedAfter: string; since: string; actionId?: string };
 
 /** Whoever settles a kind of action answers what it needs walked. */
 export type ProofOwner = { needs(action: ActionRow): ProofNeed };
 
-/** Every walk the waiting actions of one account need, read from the database each time. */
-export function proofDemand(database: EngineDatabase, accountId: string, owners: Readonly<Partial<Record<string, ProofOwner>>>): ProofDemand[] {
+/**
+ * Whoever settles something no action of ours waits on answers what that needs walked: an order
+ * a walk stopped showing, which an inventory walk begun after it ends (`OrderService.standingNeeds`).
+ */
+export type StandingProofOwner = { standingNeeds(accountId: string): ProofDemand[] };
+
+/**
+ * Every walk the waiting actions and the standing owners of one account need, read from the database each time.
+ * `provedByDispatch` names the commands whose dispatch is running: each proves its own round, so their hops
+ * are left out before anyone is asked what they need (bulk storage plan D15).
+ */
+export function proofDemand(database: EngineDatabase, accountId: string, owners: Readonly<Partial<Record<string, ProofOwner>>>,
+  standing: readonly StandingProofOwner[] = [], provedByDispatch: readonly string[] = []): ProofDemand[] {
   const demand: ProofDemand[] = [];
-  for (const action of database.actions(accountId, 'AWAITING_OBSERVATION')) {
+  for (const action of database.awaitingActionsOutside(accountId, provedByDispatch)) {
     const need = owners[action.kind]?.needs(action);
     if (!need || need.kind !== 'walks') continue;
-    for (const walk of need.walks) demand.push({ ...walk, since: action.updated_at });
+    for (const walk of need.walks) demand.push({ ...walk, since: action.updated_at, actionId: action.id });
   }
+  for (const owner of standing) demand.push(...owner.standingNeeds(accountId));
   return demand;
 }
 

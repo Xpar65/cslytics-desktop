@@ -13,12 +13,12 @@
  * `UNKNOWN`, which is a value the ledger can carry, not a reason to guess.
  */
 
-export type OfferStatus =
-  | 'INVALID' | 'ACTIVE' | 'ACCEPTED' | 'COUNTERED' | 'EXPIRED' | 'CANCELLED' | 'DECLINED'
-  | 'INVALID_ITEMS' | 'PENDING_CONFIRMATION' | 'CANCELLED_BY_SECOND_FACTOR' | 'ESCROW' | 'UNKNOWN';
+import { EXECUTED_TRADE_STATUSES, TRADE_OFFER_STATUSES } from '../db/alphabets.js';
 
-export type TradeStatus =
-  | 'PENDING' | 'COMPLETE' | 'FAILED' | 'ROLLED_BACK' | 'REVERSED' | 'ESCROW' | 'UNKNOWN';
+/** The offer words: one alphabet with the record's CHECK (`db/alphabets.ts`). */
+export type OfferStatus = (typeof TRADE_OFFER_STATUSES)[number];
+/** The executed-trade words, likewise. */
+export type TradeStatus = (typeof EXECUTED_TRADE_STATUSES)[number];
 
 /** Valve's `ETradeOfferState`, applied to the captured `trade_offer_state` field. */
 const OFFER_STATES: Readonly<Record<number, OfferStatus>> = {

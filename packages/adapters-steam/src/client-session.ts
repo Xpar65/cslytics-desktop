@@ -59,6 +59,12 @@ type ClientRecord = {
 
 export const CLIENT_LOGON_TIMEOUT_MS = 60_000;
 
+/**
+ * How long closing waits for Steam to answer each logoff. The runtime is killed two seconds after
+ * main asks it to stop, so this leaves room to close the record after it.
+ */
+export const CLIENT_LOGOFF_TIMEOUT_MS = 1_500;
+
 function createSteamUser(): SteamClient {
   // One client per account owns the authenticated CM connection used by both web sessions
   // and the CS2 GC. A second steam-user login can replace the first session and, more
@@ -161,6 +167,24 @@ export class SteamClientSessionPool {
     try { record.user.logOff(); } catch { /* already disconnected */ }
   }
 
+  /**
+   * Logs every client off as the app closes, and resolves once Steam has answered each logoff or
+   * `timeoutMs` has passed.
+   *
+   * A process that simply exits never tells Steam its session is over, so Steam keeps it, CS2 still
+   * playing, until it notices the connection is gone; a launch on the same account inside that
+   * window can find its Game Coordinator taken "by another computer" that is this one, a moment
+   * ago. How long Steam keeps it is not measured (`cslytics-app-docs/steam/auth.md`, "Closing the
+   * app"); a logoff means the question never arises. Every record is retired first, so
+   * `autoRelogin` brings none back while the rest close. The refresh tokens stay in the vault: the
+   * next launch reconnects without a Guard code, as after `signOut`.
+   */
+  async closeAll(timeoutMs = CLIENT_LOGOFF_TIMEOUT_MS): Promise<void> {
+    const records = [...this.records.values()];
+    this.records.clear();
+    await Promise.all(records.map((record) => logOffAndWait(record, timeoutMs)));
+  }
+
   private createRecord(accountId: string, token: string): ClientRecord {
     const user = this.createUser();
     const record: ClientRecord = {
@@ -193,7 +217,12 @@ export class SteamClientSessionPool {
       void record.connection.catch(() => undefined);
     });
     user.on('error', () => {
+      // steam-user emits `error` only once the client is logged off for good, and a fatal logoff
+      // gets no `disconnected` and no autoRelogin. LoggedInElsewhere is one: another computer
+      // playing CS2 on this account kicks this client. Dropping the settled logon is what makes
+      // the next `connect` log on again instead of handing back a client that sends nothing.
       record.connected = false;
+      record.connection = undefined;
       record.web = undefined;
       record.webSession = undefined;
     });
@@ -281,6 +310,34 @@ export class SteamClientSessionPool {
     if (!record) throw new Error(`Steam client session for ${accountId} is not active`);
     return record;
   }
+}
+
+/**
+ * Retires one client and logs it off. A logged-on client is waited for: steam-user sends
+ * `ClientLogOff` and emits `disconnected` when Steam answers, or by itself after four seconds,
+ * longer than closing can wait. A client that never finished logging on has no session for Steam
+ * to end, and steam-user only closes its socket, so there is nothing to wait for.
+ */
+function logOffAndWait(record: ClientRecord, timeoutMs: number): Promise<void> {
+  const loggedOn = record.connected;
+  record.retired = true;
+  record.connected = false;
+  return new Promise<void>((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (): void => {
+      clearTimeout(timer);
+      record.user.removeListener('disconnected', done);
+      record.user.removeListener('error', done);
+      resolve();
+    };
+    if (loggedOn) {
+      record.user.once('disconnected', done);
+      record.user.once('error', done);
+      timer = setTimeout(done, timeoutMs);
+    }
+    try { record.user.logOff(); } catch { /* already disconnected */ }
+    if (!loggedOn) done();
+  });
 }
 
 async function withTimeout<T>(work: Promise<T>, timeoutMs: number, message: string): Promise<T> {

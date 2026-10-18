@@ -8,12 +8,13 @@ import { StorageService } from './surfaces/storage.js';
 import { MarketService, type MarketSyncResult } from './surfaces/market.js';
 import { BuyOrderService } from './surfaces/buy-orders.js';
 import { TradeService, type TradeSyncResult } from './surfaces/trades.js';
-import { EngineViews, type AccountHoldings, type MarketView, type PlannedAction, type TimelineEntry } from './read/views.js';
+import { EngineViews, type AccountHoldings, type MarketView, type PlannedAction } from './read/views.js';
 import { ListingPlanner } from './policy/listing-planner.js';
 import { ConvergenceService, type ConvergenceServices } from './orchestrate/convergence.js';
-import { RefreshService, type Observe, type RefreshNotice, type RefreshServices, type RefreshStatus } from './orchestrate/refresh.js';
+import { ReadBroker, type Reading, type ReadOutcome, type ReadServices, type RefreshNotice, type RefreshStatus } from './orchestrate/reads.js';
 import { SettleService, type SettleServices, type Settling, type WakeDrivers } from './orchestrate/settle.js';
 import { OrderService, STEAM_PROFILE, type VenueProfile } from './surfaces/orders.js';
+import type { VenueOrderRow } from './db/orders.js';
 import { SessionService } from './surfaces/session.js';
 import { CommandService, type CommandProgress, type CommandRequest, type CommandServices, type SelectionCaptureRequest, type SelectionSnapshot } from './orchestrate/command.js';
 import { TransferPlanner } from './policy/transfer-planner.js';
@@ -29,6 +30,7 @@ import { CsfloatDeliveryService, type CsfloatDeliveryServices } from './orchestr
 import { CsfloatStore } from './db/csfloat.js';
 import { HoldingsStore } from './db/holdings.js';
 import { AccountPurgeRefused, AccountPurgeStore, type PurgeResult } from './db/account-purge.js';
+import { RetentionStore, type SweepResult } from './db/retention.js';
 import { TransferService, type TransferServices } from './orchestrate/transfer.js';
 import { InGameStoreService, type StorePurchaseRequest } from './surfaces/in-game-store.js';
 import { pageStorePurchases, readStorePurchase, readStoreSheet } from './read/queries/in-game-store.js';
@@ -69,7 +71,8 @@ export type ServiceOverrides = {
   /** The venue's data, not a second copy of the reconciler (order-lifecycle.md §2.3). */
   profile?: VenueProfile;
   session?: (context: EngineContext) => SessionService;
-  refresh?: (context: EngineContext, services: RefreshServices) => RefreshService;
+  /** The one reader. A saboteur substitutes one that answers each need with its own walk, or starves the late one. */
+  reads?: (context: EngineContext, services: ReadServices) => ReadBroker;
   /** The one settler. A saboteur substitutes it to prove a reconciler it forgets is noticed. */
   settle?: (context: EngineContext, services: SettleServices, wake: WakeDrivers) => SettleService;
   command?: (context: EngineContext, services: CommandServices) => CommandService;
@@ -87,6 +90,8 @@ export type ServiceOverrides = {
   inGameStore?: (context: EngineContext) => InGameStoreService;
   /** The account purge. A saboteur substitutes one that leaves rows behind. */
   accountPurge?: (database: EngineDatabase) => AccountPurgeStore;
+  /** The retention sweep. A saboteur substitutes one that deletes by age alone. */
+  retention?: (database: EngineDatabase) => RetentionStore;
   /** The one resender. A saboteur substitutes one that never sends, to prove a retry is noticed. */
   retry?: (context: EngineContext, senders: RetrySenders) => RetryService;
 };
@@ -110,7 +115,7 @@ export class TradingEngine {
   readonly convergenceService: ConvergenceService;
   readonly sessions: SessionService;
   readonly commands: CommandService;
-  readonly refresh: RefreshService;
+  readonly reads: ReadBroker;
   readonly settler: SettleService;
   /**
    * Who answers what a waiting action of each Steam kind needs walked (plan D5). Public so the
@@ -129,6 +134,7 @@ export class TradingEngine {
   readonly csfloatDelivery: CsfloatDeliveryService;
   readonly inGameStore: InGameStoreService;
   readonly accountPurge: AccountPurgeStore;
+  readonly retention: RetentionStore;
 
   private readonly context: EngineContext;
 
@@ -141,8 +147,13 @@ export class TradingEngine {
       settled: (accountId) => this.settler.settled(accountId),
       hold: (accountId, work) => this.settler.hold(accountId, work)
     };
-    // Every automatic read goes through the refresh service's budget, built last as well.
-    const observe: Observe = (accountId, ref, options) => this.refresh.observe(accountId, ref, options);
+    // Every read is a need of the broker, built further down over services every bag below shares.
+    const reading: Reading = {
+      need: (accountId, need, signal) => this.reads.need(accountId, need, signal),
+      want: (accountId, need) => this.reads.want(accountId, need),
+      ensureFresh: (accountId, surfaces, priority) => this.reads.ensureFresh(accountId, surfaces, priority),
+      status: (accountId) => this.reads.status(accountId)
+    };
     this.inventoryService = overrides.inventory?.(this.context) ?? new InventoryService(this.context);
     this.storageService = overrides.storage?.(this.context) ?? new StorageService(this.context);
     const profile = overrides.profile ?? STEAM_PROFILE;
@@ -155,28 +166,26 @@ export class TradingEngine {
     this.csfloatInventory = overrides.csfloatInventory?.(this.context) ?? new CsfloatInventoryService(this.context);
     this.csfloatTrades = overrides.csfloatTrades?.(this.context) ?? new CsfloatTradeService(this.context);
     this.csfloatBuyOrders = overrides.csfloatBuyOrders?.(this.context) ?? new CsfloatBuyOrderService(this.context);
-    const buyingServices = { book: this.csfloatBuyOrders, settle: settling, observe };
+    const buyingServices = { book: this.csfloatBuyOrders, settle: settling, reads: reading };
     this.csfloatBuying = overrides.csfloatBuying?.(this.context,buyingServices) ?? new CsfloatBuyingService(this.context,buyingServices);
     const csfloatServices = { listings: this.csfloatListings, inventory: this.csfloatInventory, trades: this.csfloatTrades,
       csfloatAccount: this.csfloatAccount, steamInventory: this.inventoryService, steamMarket: this.marketService, steamTrades: this.tradeService,
-      policy: overrides.csfloatPolicy?.(this.context) ?? new CsfloatSellingPolicy(this.context), storage: this.storageService, settle: settling, observe,
-      // Resolved at call time: the refresh service is built further down, over services this one shares.
-      ensureFresh: (accountId: AccountId, surfaces: readonly import('./kernel/evidence.js').Surface[]) => this.refresh.ensureFresh(accountId, surfaces),
-      readNow: (accountId: AccountId, surface: import('./kernel/evidence.js').Surface) => this.refresh.readNow(accountId, surface) };
+      policy: overrides.csfloatPolicy?.(this.context) ?? new CsfloatSellingPolicy(this.context), storage: this.storageService, settle: settling, reads: reading };
     this.csfloatSelling = overrides.csfloatSelling?.(this.context,csfloatServices) ?? new CsfloatSellingService(this.context,csfloatServices);
-    const deliveryServices = { trades: this.csfloatTrades, steamTrades: this.tradeService, observe };
+    const deliveryServices = { trades: this.csfloatTrades, steamTrades: this.tradeService, reads: reading };
     this.csfloatDelivery = overrides.csfloatDelivery?.(this.context,deliveryServices) ?? new CsfloatDeliveryService(this.context,deliveryServices);
     this.inGameStore = overrides.inGameStore?.(this.context) ?? new InGameStoreService(this.context);
     this.accountPurge = overrides.accountPurge?.(database) ?? new AccountPurgeStore(database);
-    const transferServices = { planner: overrides.transferPlanner?.(this.context) ?? new TransferPlanner(this.context), trades:this.tradeService, inventory:this.inventoryService, storage:this.storageService, settle: settling, observe };
+    this.retention = overrides.retention?.(database) ?? new RetentionStore(database);
+    const transferServices = { planner: overrides.transferPlanner?.(this.context) ?? new TransferPlanner(this.context), trades:this.tradeService, inventory:this.inventoryService, storage:this.storageService, settle: settling, reads: reading };
     this.transfers = overrides.transfers?.(this.context,transferServices) ?? new TransferService(this.context,transferServices);
     const now = (): string => this.context.now();
     this.views = overrides.views?.(database, now) ?? new EngineViews(database, now);
     this.listingPlanner = overrides.planner?.(this.context) ?? new ListingPlanner(this.context);
-    const services = { planner: this.listingPlanner, inventory: this.inventoryService, storage: this.storageService, market: this.marketService, settle: settling, observe };
+    const services = { planner: this.listingPlanner, inventory: this.inventoryService, storage: this.storageService, market: this.marketService, settle: settling, reads: reading };
     this.convergenceService = overrides.convergence?.(this.context, services) ?? new ConvergenceService(this.context, services);
     this.sessions = overrides.session?.(this.context) ?? new SessionService(this.context);
-    const commandServices = { storage: this.storageService, inventory: this.inventoryService, planner: this.listingPlanner, convergence: this.convergenceService, trades: this.tradeService, market: this.marketService, settle: settling, observe };
+    const commandServices = { storage: this.storageService, inventory: this.inventoryService, trades: this.tradeService, market: this.marketService, settle: settling, reads: reading };
     this.commands = overrides.command?.(this.context, commandServices) ?? new CommandService(this.context, commandServices);
     const settleServices: SettleServices = { storage: this.storageService, market: this.marketService, buyOrders: this.buyOrderService, inGameStore: this.inGameStore,
       csfloat: { reconcileSelling: (accountId) => this.csfloatSelling.reconcile(accountId), reconcileBuying: (accountId) => this.csfloatBuying.reconcile(accountId) } };
@@ -189,7 +198,7 @@ export class TradingEngine {
       STORE_IN_CASKET: this.storageService, RETRIEVE_FROM_CASKET: this.storageService, RENAME_CASKET: this.storageService,
       CSFLOAT_CANCEL: this.csfloatSelling, CSFLOAT_REPRICE: this.csfloatSelling
     };
-    const demand = (accountId: AccountId) => proofDemand(this.database, accountId, proofOwners);
+    const demand = (accountId: AccountId, provedByDispatch: readonly string[]) => proofDemand(this.database, accountId, proofOwners, [this.marketService.orders], provedByDispatch);
     // One sender per kind whose `RETRY_POLICY` row names the service: the same executor the
     // first send used. `tests/unit/retry-coverage.test.ts` holds the table and this bag together.
     const retrySenders: RetrySenders = {
@@ -197,12 +206,14 @@ export class TradingEngine {
       CANCEL_BUY_ORDER: (actionId) => this.buyOrderService.executeCancel(actionId)
     };
     this.retry = overrides.retry?.(this.context, retrySenders) ?? new RetryService(this.context, retrySenders);
-    const refreshServices = { inventory: this.inventoryService, storage: this.storageService, market: this.marketService, trades: this.tradeService, session: this.sessions, settle: settling, demand,
+    const readServices: ReadServices = { inventory: this.inventoryService, storage: this.storageService, market: this.marketService, trades: this.tradeService, session: this.sessions, settle: settling, demand,
+      dispatching: () => this.commands.dispatchingCommands(),
+      retention: (accountId: AccountId) => this.retention.sweep(accountId, this.context.now()), inGameStore: this.inGameStore,
       ...(ports.csfloat ? { csfloatAccount: this.csfloatAccount, csfloatListings: this.csfloatListings, csfloatInventory: this.csfloatInventory, csfloatTrades: this.csfloatTrades, csfloatBuyOrders: this.csfloatBuyOrders } : {}) };
-    this.refresh = overrides.refresh?.(this.context, refreshServices) ?? new RefreshService(this.context, refreshServices);
+    this.reads = overrides.reads?.(this.context, readServices) ?? new ReadBroker(this.context, readServices);
     this.sessions.attachRuntime(this.inventoryService, (accountId) => {
       this.convergenceService.start(accountId);
-      this.refresh.start(accountId);
+      this.reads.start(accountId);
       // Work the last run queued and never sent. Convergence covers listing goals; a store or a
       // retrieve is only ever sent by `dispatch`, so without this a batch interrupted by a close
       // or a dead Game Coordinator sat queued forever with nothing looking at it. A CSFloat
@@ -212,7 +223,7 @@ export class TradingEngine {
       this.csfloatBuying.schedule(accountId);
       // A resend the last run was counting down to: its schedule is in the rows, so it resumes.
       this.retry.schedule(accountId);
-    }, (accountId) => this.refresh.start(accountId), (accountId) => { this.refresh.stopAccount(accountId); this.retry.stopAccount(accountId); });
+    }, (accountId) => this.reads.start(accountId), (accountId) => { this.reads.stopAccount(accountId); this.retry.stopAccount(accountId); });
     // Wake-ups that follow a session rather than a walk. The ones that follow a walk run after
     // the settle that walk earned (`wakeDrivers`), so no driver starts from unsettled state.
     this.context.signals.subscribe((signal) => {
@@ -244,9 +255,12 @@ export class TradingEngine {
     if (seen.some((surface) => ['gc-inventory', 'gc-casket', 'gc-event', 'csfloat-inventory'].includes(surface))) this.csfloatSelling.schedule(accountId);
     this.transfers.schedule(accountId);
     // A resend waits on a proof, and a proof is a settle: whatever this one decided, the resender
-    // looks once. A reprice or delist-to-store whose cancel it proved continues from here too.
+    // looks once. A command's chain whose hop it proved continues from here too: a reprice whose
+    // cancel landed, a transfer whose retrieve a unit walk showed, a store the walk showed done.
     this.retry.schedule(accountId);
-    if (seen.some((surface) => surface === 'steam-market' || surface === 'gc-inventory')) this.commands.advanceChains(accountId);
+    // A Game Coordinator item event too: a retrieve is proved by its own SO create, and the panel's
+    // hop must move when it lands rather than at the next walk (bulk storage plan D5, BULK-06).
+    if (seen.some((surface) => ['steam-market', 'steam-market-history', 'gc-inventory', 'gc-casket', 'gc-event'].includes(surface))) this.commands.advanceSteps(accountId);
     if (surfaces.has('gc-event') && this.database.currentGoals(accountId, 'sell-listing', 'LISTED_AT').length) {
       this.convergenceService.schedule(accountId);
     }
@@ -261,20 +275,27 @@ export class TradingEngine {
   }
 
   /**
-   * The window's read of one surface: through the read budget and the breaker, answered once it
-   * is settled (settling and read path plan D4). The `syncX` methods below skip both; they are
-   * the scenarios' direct reads, and the desktop may not call them (`tests/unit/read-path.test.ts`).
+   * The window's read of one surface: a person need of the broker, answered once it is settled
+   * with the walk that answers it, or with nothing when the broker refused (read broker plan D1,
+   * D12). Without `startedAfter` it is a walk begun now. The `syncX` methods below are the
+   * scenarios' direct reads, and the desktop may not call them (`tests/unit/read-path.test.ts`).
    */
-  observe(accountId: AccountId, surface: Surface, options: { scopeId?: string; startedAfter?: string } = {}): Promise<ObservationRow | undefined> {
+  async observe(accountId: AccountId, surface: Surface, options: { scopeId?: string; startedAfter?: string } = {}): Promise<ObservationRow | undefined> {
+    const outcome = await this.observeOutcome(accountId, surface, options);
+    return outcome.kind === 'observed' ? outcome.observation : undefined;
+  }
+
+  /** `observe` with the refusal kept: what a sync button is told when there was no walk to show. */
+  async observeOutcome(accountId: AccountId, surface: Surface, options: { scopeId?: string; startedAfter?: string } = {}): Promise<ReadOutcome> {
     const ref: SurfaceRef = options.scopeId === undefined
       ? { surface, scope: { kind: 'account' } }
       : { surface, scope: { kind: FRESHNESS[surface].scope, id: options.scopeId } };
-    return this.refresh.observe(accountId, ref, options.startedAfter === undefined ? {} : { startedAfter: options.startedAfter });
+    return this.reads.need(accountId, { ref, startedAfter: options.startedAfter ?? this.context.now(), priority: 'person' });
   }
 
   /**
-   * The window's storage read: the unit list, then every unit's contents, each through the read
-   * budget (plan D4). Answers with the observations it made, as `syncStorageUnits` does.
+   * The window's storage read: the unit list, then every unit's contents, each a person need.
+   * Answers with the observations it made, as `syncStorageUnits` does.
    */
   async observeStorage(accountId: AccountId): Promise<number[]> {
     const made: number[] = [];
@@ -344,7 +365,7 @@ export class TradingEngine {
   }
 
   private assertClearable(accountId: AccountId): void {
-    if (this.refresh.keptCurrent().length > 0) {
+    if (this.reads.keptCurrent().length > 0) {
       throw new Error('An account can only be removed or reset before any account is being kept current; the Engine Runtime does it as it starts.');
     }
     const refused = this.accountPurge.refusal(accountId);
@@ -353,11 +374,12 @@ export class TradingEngine {
 
   /** Stops background loops. Call before disposing the runtime. */
   shutdown(): void {
+    this.commands.shutdown();
     this.retry.stop();
     this.transfers.stop();
     this.csfloatSelling.stop();
     this.csfloatBuying.stop();
-    this.refresh.stop();
+    this.reads.stop();
     this.sessions.stopSupervising();
     this.convergenceService.stop();
     this.inventoryService.stopAllEventLoops();
@@ -367,46 +389,50 @@ export class TradingEngine {
 
   // --- Automatic freshness -------------------------------------------------
 
+  /** The daily sweep of evidence nothing cites (consolidation plan D22), on the engine's clock. */
+  sweepRetention(accountId: AccountId): SweepResult {
+    return this.retention.sweep(accountId, this.context.now());
+  }
+
   /**
-   * `Refresh now` for one account: every surface, past its due time but not past the budget.
-   *
-   * This is what the window's button became. It is no longer the only path to current data —
-   * `RefreshService` keeps every signed-in account current on its own — which is the whole point
+   * `Refresh now` for one account: a person need for every scope, past every hold but not past
+   * the budget. This is what the window's button became. It is no longer the only path to current
+   * data — the broker keeps every signed-in account current on its own — which is the whole point
    * of the continuous-freshness plan.
    */
   async refreshNow(accountId: AccountId) {
-    const surfaces = await this.refresh.refreshNow(accountId);
+    const surfaces = await this.reads.refreshNow(accountId);
     await this.settler.settled(accountId);
     return surfaces;
   }
 
   /**
    * The machine woke up: `Refresh now` for every account already being kept current, one at a
-   * time, and for nothing else (`RefreshService.keptCurrent`).
+   * time, and for nothing else (`ReadBroker.keptCurrent`).
    */
   async refreshResumed(): Promise<Record<AccountId, readonly Surface[]>> {
     const refreshed: Record<AccountId, readonly Surface[]> = {};
-    for (const accountId of this.refresh.keptCurrent()) refreshed[accountId] = await this.refreshNow(accountId);
+    for (const accountId of this.reads.keptCurrent()) refreshed[accountId] = await this.refreshNow(accountId);
     return refreshed;
   }
 
-  /** Reads the named surfaces unless they are already fresh, and waits. */
+  /** A person need for each named surface whose latest complete walk is older than its trust window, awaited and settled. */
   async ensureFresh(accountId: AccountId, surfaces: readonly import('./kernel/evidence.js').Surface[]) {
-    await this.refresh.ensureFresh(accountId, surfaces);
+    await this.reads.ensureFresh(accountId, surfaces, 'person');
     await this.settler.settled(accountId);
   }
 
   refreshStatus(accountId: AccountId): RefreshStatus {
-    return this.refresh.status(accountId);
+    return this.reads.refreshStatus(accountId);
   }
 
-  /** Tells the scheduler which account the window is showing; `null` is the all-accounts scope. */
+  /** Tells the broker which account the window is showing; `null` is the all-accounts scope. */
   setActiveAccount(accountId: AccountId | null): void {
-    this.refresh.setActiveAccount(accountId);
+    this.reads.setActiveAccount(accountId);
   }
 
   set onChanged(listener: ((notice: RefreshNotice) => void) | undefined) {
-    this.refresh.onChanged = listener;
+    this.reads.onChanged = listener;
   }
 
   // --- Inventory -----------------------------------------------------------
@@ -443,7 +469,7 @@ export class TradingEngine {
   }
 
   syncCasket(accountId: AccountId, casketId: string): Promise<number> {
-    return this.settledAfter(accountId, this.storageService.syncCasket(accountId, casketId));
+    return this.settledAfter(accountId, this.storageService.syncCasket(accountId, casketId).then((walk) => walk.observationId));
   }
 
   /** The unit list alone — labels and counts — without walking any unit's contents. */
@@ -451,16 +477,16 @@ export class TradingEngine {
     return this.settledAfter(accountId, this.storageService.syncUnits(accountId, false));
   }
 
-  queueRename(accountId: AccountId, casketId: string, name: string, basis = 'manual'): ActionRow {
-    return this.storageService.queueRename(accountId, casketId, name, basis);
+  queueRename(accountId: AccountId, casketId: string, name: string, commandId: string | null = null): ActionRow {
+    return this.storageService.queueRename(accountId, casketId, name, commandId);
   }
 
-  queueStore(accountId: AccountId, localId: string, casketId: string, basis = 'manual'): ActionRow {
-    return this.storageService.queueStore(accountId, localId, casketId, basis);
+  queueStore(accountId: AccountId, localId: string, casketId: string, commandId: string | null = null): ActionRow {
+    return this.storageService.queueStore(accountId, localId, casketId, commandId);
   }
 
-  queueRetrieve(accountId: AccountId, localId: string, casketId: string, basis = 'manual'): ActionRow {
-    return this.storageService.queueRetrieve(accountId, localId, casketId, basis);
+  queueRetrieve(accountId: AccountId, localId: string, casketId: string, commandId: string | null = null): ActionRow {
+    return this.storageService.queueRetrieve(accountId, localId, casketId, commandId);
   }
 
   executeCasketAction(actionId: string): Promise<MutationOutcome> {
@@ -477,8 +503,8 @@ export class TradingEngine {
 
   // --- Market --------------------------------------------------------------
 
-  setListingGoal(accountId: AccountId, localId: string, priceReceiveCents: number, basis = 'manual') {
-    return this.listingPlanner.setListingGoal(accountId, localId, priceReceiveCents, basis);
+  setListingGoal(accountId: AccountId, localId: string, priceReceiveCents: number, commandId: string | null = null) {
+    return this.listingPlanner.setListingGoal(accountId, localId, priceReceiveCents, commandId);
   }
 
   planListing(accountId: AccountId, localId: string) { return this.listingPlanner.next(accountId, localId); }
@@ -502,8 +528,10 @@ export class TradingEngine {
     return this.csfloatAccount.status(accountId);
   }
 
-  refreshMarketplaceStatus(accountId: AccountId): Promise<MarketplaceStatus> {
-    return this.csfloatAccount.refreshStatus(accountId);
+  /** Settings *Check now*: a person need for `/me`, then what the connection says. A refusal — no venue, a breaker — reads what is there. */
+  async refreshMarketplaceStatus(accountId: AccountId): Promise<MarketplaceStatus> {
+    await this.reads.need(accountId, { ref: { surface: 'csfloat-account-status', scope: { kind: 'account' } }, startedAfter: this.context.now(), priority: 'person' });
+    return this.csfloatAccount.status(accountId);
   }
 
   /** Changes the CSFloat stall's away or public setting; the answer is `/me` read back, not the request. */
@@ -520,29 +548,30 @@ export class TradingEngine {
     return this.settledAfter(accountId, this.csfloatBuyOrders.sync(accountId));
   }
   /**
-   * The Buy orders page's refresh: one venue's book read now, or both, through the read budget
-   * and the breaker like any other read (`RefreshService.readNow`), never past them.
+   * The Buy orders page's refresh: one venue's book begun now, or both, as person needs of the
+   * broker, through its budget and the breaker like any other read and never past them.
    *
-   * Steam's book is the market walk. The loop's own market read judges listings alone, so the
-   * buy-order reconciler runs here over the walk just made, as `syncMarket` runs it. CSFloat's
-   * is asked only of an account whose connection is live: a read the venue cannot answer would
-   * count against the surface as a failure and back it off on an account with no venue behind
-   * it. The account's `/me` is read beside the book, because its available balance is what the
-   * page warns an edit against, and a stale one warns wrongly. Each venue answers whether a book
-   * read was made at all, not whether it completed — the book itself says that (rule 5).
+   * Steam's book is the market walk; the settle that follows it runs the buy-order reconciler
+   * over the walk just made. CSFloat's is asked only of an account whose connection is live: the
+   * broker refuses a read the venue cannot answer rather than counting it against the surface.
+   * The account's `/me` is read beside the book, because its available balance is what the page
+   * warns an edit against, and a stale one warns wrongly. Each venue answers whether a book read
+   * was made at all, not whether it completed — the book itself says that (rule 5).
    */
   async refreshBuyOrders(accountId: AccountId, venue: BuyOrderVenue | null): Promise<Partial<Record<BuyOrderVenue, boolean>>> {
     const read: Partial<Record<BuyOrderVenue, boolean>> = {};
+    const now = (surface: Surface) => this.reads.need(accountId, { ref: { surface, scope: { kind: 'account' } }, startedAfter: this.context.now(), priority: 'person' })
+      .then((outcome) => outcome.kind === 'observed' || outcome.reason === 'incomplete');
     if (venue !== 'CSFLOAT') {
-      read.STEAM = await this.refresh.readNow(accountId, 'steam-market');
+      read.STEAM = await now('steam-market');
       await this.settler.settled(accountId);
     }
     if (venue !== 'STEAM') {
       const status = this.csfloatAccount.status(accountId).status;
       if (status === 'NOT_CONNECTED' || status === 'DISCONNECTED') read.CSFLOAT = false;
       else {
-        await this.refresh.readNow(accountId, 'csfloat-account-status');
-        read.CSFLOAT = await this.refresh.readNow(accountId, 'csfloat-buy-orders');
+        await now('csfloat-account-status');
+        read.CSFLOAT = await now('csfloat-buy-orders');
       }
     }
     return read;
@@ -573,7 +602,16 @@ export class TradingEngine {
   }
 
   // ---------------------------------------------------------------- in-game store
-  syncStorePriceSheet(accountId: AccountId): Promise<number> { return this.inGameStore.syncPriceSheet(accountId); }
+  /**
+   * The Store screen's refresh: a person need for the price sheet. Answers with the walk's
+   * observation id; a sheet that could not be read or parsed throws the surface's own words, as
+   * the surface itself does, and a refusal the broker made throws its reason.
+   */
+  async syncStorePriceSheet(accountId: AccountId): Promise<number> {
+    const outcome = await this.reads.need(accountId, { ref: { surface: 'gc-store-price-sheet', scope: { kind: 'account' } }, startedAfter: this.context.now(), priority: 'person' });
+    if (outcome.kind === 'observed') return outcome.observation.id;
+    throw new Error(outcome.detail ?? `Store price sheet not read: ${outcome.reason}`);
+  }
   queueStorePurchase(request: StorePurchaseRequest) { return this.inGameStore.queue(request); }
   advanceStorePurchase(purchaseId: string): Promise<void> { return this.inGameStore.advance(purchaseId); }
   cancelStorePurchase(purchaseId: string): Promise<void> { return this.inGameStore.cancel(purchaseId); }
@@ -582,16 +620,16 @@ export class TradingEngine {
   storePurchases(accountId: AccountId, cursor?: string) { return pageStorePurchases(this.database, accountId, cursor); }
   storePurchase(accountId: AccountId, id: string) { return readStorePurchase(this.database, accountId, id); }
 
-  queueSellListing(accountId: AccountId, localId: string, priceReceiveCents: number, basis = 'manual'): ActionRow {
-    return this.marketService.queueSellListing(accountId, localId, priceReceiveCents, basis);
+  queueSellListing(accountId: AccountId, localId: string, priceReceiveCents: number, commandId: string | null = null): ActionRow {
+    return this.marketService.queueSellListing(accountId, localId, priceReceiveCents, commandId);
   }
 
   executeSellListing(actionId: string): Promise<MutationOutcome> {
     return this.marketService.executeSellListing(actionId);
   }
 
-  queueDelist(accountId: AccountId, listingId: string, basis = 'manual'): ActionRow {
-    return this.marketService.queueDelist(accountId, listingId, basis);
+  queueDelist(accountId: AccountId, listingId: string): ActionRow {
+    return this.marketService.queueDelist(accountId, listingId);
   }
 
   executeDelist(actionId: string): Promise<MutationOutcome> {
@@ -600,16 +638,16 @@ export class TradingEngine {
 
   // --- Buy orders ----------------------------------------------------------
 
-  createBuyOrder(accountId: AccountId, request: BuyOrderRequest, basis = 'manual'): Promise<ActionRow> {
-    return this.buyOrderService.create(accountId, request, basis);
+  createBuyOrder(accountId: AccountId, request: BuyOrderRequest): Promise<ActionRow> {
+    return this.buyOrderService.create(accountId, request);
   }
 
   executeBuyOrder(actionId: string): Promise<MutationOutcome> {
     return this.buyOrderService.execute(actionId);
   }
 
-  queueCancelBuyOrder(accountId: AccountId, buyOrderId: string, basis = 'manual'): ActionRow {
-    return this.buyOrderService.queueCancel(accountId, buyOrderId, basis);
+  queueCancelBuyOrder(accountId: AccountId, buyOrderId: string): ActionRow {
+    return this.buyOrderService.queueCancel(accountId, buyOrderId);
   }
 
   executeCancelBuyOrder(actionId: string): Promise<MutationOutcome> {
@@ -618,6 +656,13 @@ export class TradingEngine {
 
   syncBuyOrderStatuses(accountId: AccountId): Promise<void> {
     return this.buyOrderService.syncStatuses(accountId);
+  }
+
+  // --- Orders --------------------------------------------------------------
+
+  /** A person's exit from an unexplained order (consolidation plan D7): closed as cancelled or sold, on their word, as a correction beside what was observed. */
+  closeOrder(accountId: AccountId, orderId: string, as: 'cancelled' | 'sold'): VenueOrderRow {
+    return this.marketService.orders.close(accountId, orderId, as);
   }
 
   // --- Trade observation ---------------------------------------------------
@@ -674,6 +719,10 @@ export class TradingEngine {
     return this.views.pageInventoryGroups(request);
   }
 
+  pageInventoryPositions(request: import('./read/queries/inventory.js').InventoryPositionsRequest) {
+    return this.views.pageInventoryPositions(request);
+  }
+
   pageHistory(request: import('./read/queries/records.js').HistoryPageRequest) {
     return this.views.pageHistory(request);
   }
@@ -718,10 +767,6 @@ export class TradingEngine {
 
   storageView(accountId: AccountId): unknown[] {
     return this.views.storage(accountId);
-  }
-
-  timeline(accountId: AccountId): TimelineEntry[] {
-    return this.views.timeline(accountId);
   }
 
   dryRunPlan(accountId: AccountId): PlannedAction[] {

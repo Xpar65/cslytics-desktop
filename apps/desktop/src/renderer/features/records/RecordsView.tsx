@@ -1,11 +1,11 @@
 import React, { useCallback, useState } from 'react';
 import type { PageEnvelope } from '@cslytics/engine';
 import { PagedRows } from '../../components/PagedRows.js';
-import { DetailView, Drawer, IconButton, Panel, SearchInput, Select, StatusBadge } from '../../components/ui.js';
+import { Button, DetailView, Drawer, IconButton, Panel, SearchInput, Select, StatusBadge } from '../../components/ui.js';
 import { PageHeader } from '../../components/PageHeader.js';
 import { Avatar } from '../../components/Avatar.js';
 import { Icon, type IconName } from '../../components/Icon.js';
-import { formatCents, formatObservedAmount } from '../../lib/format.js';
+import { formatAmount, formatObservedAmount } from '../../lib/money.js';
 import { HISTORY_EVENT, LEDGER_KIND, ORDER_SIDE, ORDER_STATE, TRADE_STATUS, formatDateTime, formatRelative, humanize, plural, stateLabel, type StateLabel } from '../../lib/labels.js';
 
 type Domain = 'orders' | 'history' | 'trades' | 'ledger';
@@ -16,6 +16,7 @@ type Row = {
   rowId?: string;
   offerId?: string | null;
   listingId?: string | null;
+  hashName?: string | null;
   state?: string;
   status?: string;
   kind?: string;
@@ -24,13 +25,12 @@ type Row = {
   openedAt?: string;
   settledAt?: string | null;
   eventType?: number;
-  priceReceiveCents?: number | null;
+  priceCents?: number | null;
   amountCents?: number | null;
   feeCents?: number | null;
   quantity?: number;
   lines?: number;
   amountBasis?: 'EVIDENCED' | 'UNKNOWN';
-  attribution?: string;
   currency?: number | null;
   counterparty?: string;
 };
@@ -42,7 +42,7 @@ const META: Record<Domain, { title: string; icon: IconName; subtitle: string; co
   ledger: { title: 'Ledger', icon: 'book', subtitle: 'Observed economic events. An amount that was never evidenced is shown as unknown, never as zero.', command: 'ledger.page', detail: 'ledger.detail', empty: 'The ledger fills in as sales, purchases and trades are observed.' }
 };
 
-const ORDER_FILTER = ['ACTIVE', 'PENDING_CONFIRMATION', 'UNEXPLAINED', 'CLOSED'];
+const ORDER_FILTER = ['OPEN', 'PENDING_EXTERNAL', 'SUBMITTED', 'UNEXPLAINED', 'QUARANTINED', 'ENDED_FILLED', 'ENDED_CANCELLED_BY_US', 'ENDED_CANCELLED_EXTERNALLY', 'ENDED_NOT_APPLIED'];
 const LEDGER_FILTER = ['MARKET_SALE', 'BUY_ORDER_FILL', 'EXTERNAL_PURCHASE', 'TRADE_RECEIPT', 'TRADE_DISPOSAL', 'UNEXPLAINED_MOVEMENT', 'CORRECTION'];
 const TRADE_FILTER = ['ACTIVE', 'ACCEPTED', 'ESCROW', 'COMPLETE', 'CANCELLED', 'DECLINED', 'EXPIRED', 'INVALID_ITEMS', 'FAILED', 'UNKNOWN', 'ROLLED_BACK'];
 
@@ -56,14 +56,14 @@ function describe(domain: Domain, row: Row): { icon: IconName; title: string; su
   if (domain === 'orders') {
     const state = stateLabel(ORDER_STATE, row.state);
     return { icon: row.side === 'BUY' ? 'shopping-cart' : 'tag', title: ORDER_SIDE[row.side ?? ''] ?? humanize(row.side ?? 'Order'), sub: date, state,
-      amount: row.priceReceiveCents === undefined || row.priceReceiveCents === null ? 'Amount unknown' : `${formatCents(row.priceReceiveCents, row.currency ?? null)} to receive`,
+      amount: row.priceCents === undefined || row.priceCents === null ? 'Amount unknown' : `${formatAmount(row.priceCents, row.currency ?? null)}${row.side === 'BUY' ? ' each' : ' to receive'}`,
       reference: row.orderId ? `Order #${row.orderId}` : '' };
   }
   if (domain === 'history') {
     const event = row.eventType !== undefined ? HISTORY_EVENT[row.eventType] ?? { label: `Event ${row.eventType}`, tone: 'neutral' as const } : null;
     return { icon: event?.icon ?? 'history', title: event?.label ?? 'Market event', sub: date, state: null,
-      amount: row.amountCents === null || row.amountCents === undefined ? '' : formatCents(row.amountCents, row.currency ?? null),
-      reference: row.listingId ? `Listing #${row.listingId}` : '' };
+      amount: row.amountCents === null || row.amountCents === undefined ? '' : formatAmount(row.amountCents, row.currency ?? null),
+      reference: [row.hashName, row.listingId ? `Listing #${row.listingId}` : ''].filter(Boolean).join(' · ') };
   }
   if (domain === 'trades') {
     const state = stateLabel(TRADE_STATUS, row.status);
@@ -75,7 +75,7 @@ function describe(domain: Domain, row: Row): { icon: IconName; title: string; su
   const kind = stateLabel(LEDGER_KIND, row.kind);
   return { icon: kind.icon ?? 'book', title: kind.label, sub: `${row.quantity ? `${plural(row.quantity, 'item')} · ` : ''}${date}`, state: null,
     amount: formatObservedAmount(row.amountCents, row.amountBasis, row.currency ?? null),
-    reference: row.attribution ? humanize(row.attribution) : '' };
+    reference: '' };
 }
 
 /**
@@ -89,6 +89,8 @@ export function RecordsView({ domain, accountIds, accounts = [] }: { domain: Dom
   const [search, setSearch] = useState('');
   const [state, setState] = useState('');
   const [detail, setDetail] = useState<{ row: Row; data: unknown; loading: boolean } | null>(null);
+  const [version, setVersion] = useState(0);
+  const [closing, setClosing] = useState(false);
   const scope = accountIds.join('\0');
   const meta = META[domain];
   const nameOf = (id: string): string => accounts.find((account) => account.id === id)?.name ?? id;
@@ -107,6 +109,18 @@ export function RecordsView({ domain, accountIds, accounts = [] }: { domain: Dom
       .catch(() => setDetail((current) => (current && rowId(current.row) === rowId(row) ? { row, data: null, loading: false } : current)));
   };
 
+  // A person's exit from an unexplained order: closed as cancelled or sold, on their word. The
+  // engine records a correction beside what it observed and never rewrites a posting.
+  const close = async (row: Row, as: 'cancelled' | 'sold'): Promise<void> => {
+    if (!row.orderId) return;
+    setClosing(true);
+    try {
+      await window.trading.invoke({ type: 'orders.close', accountId: row.accountId, orderId: row.orderId, as });
+      setDetail(null);
+      setVersion((current) => current + 1);
+    } finally { setClosing(false); }
+  };
+
   const filterTable = domain === 'orders' ? ORDER_STATE : domain === 'ledger' ? LEDGER_KIND : TRADE_STATUS;
   const filterOptions = domain === 'orders' ? ORDER_FILTER : domain === 'ledger' ? LEDGER_FILTER : domain === 'trades' ? TRADE_FILTER : [];
   const filterLabel = domain === 'orders' ? 'Order state' : domain === 'ledger' ? 'Ledger kind' : 'Trade status';
@@ -122,7 +136,7 @@ export function RecordsView({ domain, accountIds, accounts = [] }: { domain: Dom
         </Select>
       ) : null}
     </div>
-    <PagedRows load={load} rowKey={r => `${r.accountId}:${rowId(r)}`} emptyTitle={`No ${meta.title.toLowerCase()} yet`} emptyHint={meta.empty} render={row => {
+    <PagedRows key={version} load={load} rowKey={r => `${r.accountId}:${rowId(r)}`} emptyTitle={`No ${meta.title.toLowerCase()} yet`} emptyHint={meta.empty} render={row => {
       const shown = describe(domain, row);
       return (
         <div className="record-data-row group-row" onClick={() => open(row)}>
@@ -147,6 +161,12 @@ export function RecordsView({ domain, accountIds, accounts = [] }: { domain: Dom
       subtitle={detail ? `${nameOf(detail.row.accountId)}${describe(domain, detail.row).reference ? ` · ${describe(domain, detail.row).reference}` : ''}` : undefined}
       onClose={() => setDetail(null)}
     >
+      {domain === 'orders' && detail && !detail.loading && detail.row.state === 'UNEXPLAINED' ? (
+        <div className="toolbar" style={{ marginBottom: 12 }}>
+          <Button size="sm" icon="x-circle" loading={closing} onClick={() => { void close(detail.row, 'cancelled'); }}>Close as cancelled</Button>
+          <Button size="sm" icon="coins" loading={closing} onClick={() => { void close(detail.row, 'sold'); }}>Close as sold</Button>
+        </div>
+      ) : null}
       {detail?.loading ? <div className="empty"><span className="spinner"><Icon name="loader" size={18} /></span></div> : <DetailView data={detail?.data ?? detail?.row} />}
     </Drawer>
   </Panel>;

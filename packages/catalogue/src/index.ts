@@ -6,7 +6,7 @@ import { CatalogueStore, MemoryCatalogueStore, type CatalogueStoreLike, type Mis
 import { CATALOGUE_BASE, CATALOGUE_HOST, HttpCatalogueSource, OracleCatalogueSource, type CatalogueSource } from './source.js';
 import { CSFLOAT_SCHEMA_HOST, CSFLOAT_SCHEMA_TTL_MS, CSFLOAT_SCHEMA_URL, CsfloatKindIndex, CsfloatKinds, fetchCsfloatSchema, parseCsfloatSchema, type CsfloatItemClass, type CsfloatKindsData, type CsfloatKindsRefresh, type CsfloatSupport } from './csfloat-kinds.js';
 import { prepare, rank, score, SUGGEST_THRESHOLD, type Prepared } from './suggest.js';
-import { wearBandsFor, normWindow, MAX_BANDS, MAX_BAND_KEYS, EQUALITY_TOLERANCE, type NormPredicate, type WearBand } from './bands.js';
+import { wearBandsFor, normWindow, EQUALITY_TOLERANCE, type NormPredicate, type WearBand } from './bands.js';
 import { realToNorm, normToReal, type PaintRange } from './float.js';
 import type { CatalogueCollection, CatalogueEntry, MatchKey, Resolved, UnresolvedReason } from './types.js';
 
@@ -20,7 +20,7 @@ export {
   CatalogueStore, MemoryCatalogueStore,
   HttpCatalogueSource, OracleCatalogueSource, CATALOGUE_BASE, CATALOGUE_HOST,
   CsfloatKinds, CsfloatKindIndex, fetchCsfloatSchema, parseCsfloatSchema, CSFLOAT_SCHEMA_HOST, CSFLOAT_SCHEMA_URL, CSFLOAT_SCHEMA_TTL_MS,
-  prepare, rank, score, SUGGEST_THRESHOLD, wearBandsFor, normWindow, MAX_BANDS, MAX_BAND_KEYS, EQUALITY_TOLERANCE,
+  prepare, rank, score, SUGGEST_THRESHOLD, wearBandsFor, normWindow, EQUALITY_TOLERANCE,
   realToNorm, normToReal
 };
 export type { CatalogueSource, CatalogueStoreLike, Miss, StoredGeneration, Prepared, NormPredicate, WearBand, PaintRange, CsfloatItemClass, CsfloatKindsData, CsfloatKindsRefresh, CsfloatSupport };
@@ -30,6 +30,8 @@ export type * from './types.js';
 const MISS_BACKOFF_MS = [5 * 60_000, 30 * 60_000, 6 * 60 * 60_000, 24 * 60 * 60_000] as const;
 /** How many unknown keys one resolve pass will ask about. Bounds a cold cache's first scroll. */
 export const RESOLVE_BATCH = 40;
+/** How many of the best-scoring item names are reordered by what the user holds. */
+export const HOLDINGS_CANDIDATES = 200;
 
 export type SyncOutcome =
   | { kind: 'applied'; revision: string; entries: number }
@@ -45,7 +47,11 @@ export type SyncOutcome =
  * bar never offers a filter this generation cannot satisfy.
  */
 export type CatalogueSuggestions = {
-  items: Array<{ name: string; category: string; image: string | null; keys: number }>;
+  /**
+   * `owned` is present only when the caller passed holdings: how many of them the item's chip would
+   * match, which is what the list is ordered by.
+   */
+  items: Array<{ name: string; category: string; image: string | null; keys: number; owned?: number }>;
   collections: Array<{ id: string; name: string }>;
   keywords: Array<{ kind: 'item' | 'rarity'; text: string; label: string; rarityId?: string }>;
 };
@@ -191,7 +197,7 @@ export class Catalogue {
    * makes a search for something nobody owns display the entire inventory.
    */
   search(term: string, category?: string): MatchKey[] {
-    const needle = fold(term);
+    const needle = searchTerm(term);
     const wanted = category?.trim() ?? '';
     const out: MatchKey[] = [];
     for (const row of this.searchIndex) {
@@ -252,24 +258,55 @@ export class Catalogue {
    * round trip, no network. Items are deduplicated by their base name, because five wear tiers of
    * one skin are one thing a person meant to type, not five suggestions.
    */
-  suggest(text: string, limit = 8): CatalogueSuggestions {
+  suggest(text: string, limit = 8, holdings?: ReadonlyMap<MatchKey, number>): CatalogueSuggestions {
     const needle = text.trim();
     if (!needle) return { items: [], collections: [], keywords: [] };
     const bounded = Math.min(25, Math.max(1, Math.trunc(limit) || 8));
     this.rebuildSuggestIndex();
 
-    const items = rank(needle, this.nameIndex, bounded).map((row) => ({
-      name: row.name,
-      category: row.category,
-      image: row.image,
-      keys: row.keys
-    }));
+    const items = holdings
+      ? this.rankByHoldings(needle, bounded, holdings)
+      : rank(needle, this.nameIndex, bounded).map((row) => ({ name: row.name, category: row.category, image: row.image, keys: row.keys }));
     const collections = rank(needle, this.collectionIndex, Math.min(5, bounded));
     const keywords: CatalogueSuggestions['keywords'] = [
       ...rank(needle, this.categoryIndex, 3).map((category) => ({ kind: 'item' as const, text: category, label: category })),
       ...rank(needle, this.rarityIndex, 3).map((rarity) => ({ kind: 'rarity' as const, text: rarity.name, label: rarity.name, rarityId: rarity.id }))
     ];
     return { items, collections, keywords };
+  }
+
+  /**
+   * The item suggestions, the ones the user holds first.
+   *
+   * A suggestion's weight is how many of `holdings` its chip would match, so it is measured with
+   * the chip's own rule, `search`: the general `Galil AR` matches every Galil held and stays at the
+   * top, and `Galil AR | Chatterbox` counts the StatTrak and Souvenir copies too. Holding nothing
+   * that matches leaves today's order, which is also where unheld suggestions go.
+   *
+   * Only a real match is lifted: every word typed must appear in the name. Otherwise a sticker that
+   * happens to carry the typed letters in order would jump the skins the user meant, because the
+   * scorer admits scattered letters. The order is decided among the best `HOLDINGS_CANDIDATES` by
+   * score, which bounds the work per keystroke and keeps a one-letter needle from ranking noise.
+   */
+  private rankByHoldings(needle: string, limit: number, holdings: ReadonlyMap<MatchKey, number>): CatalogueSuggestions['items'] {
+    const words = fold(needle).split(/\s+/).filter(Boolean);
+    // A holding a candidate could match carries every word too, so the scan narrows here once.
+    const held = this.searchIndex.flatMap((row) => {
+      const quantity = holdings.get(row.key);
+      return quantity && words.every((word) => row.haystack.includes(word)) ? [{ haystack: row.haystack, quantity }] : [];
+    });
+    return rank(needle, this.nameIndex, HOLDINGS_CANDIDATES)
+      .map((row, position) => {
+        const name = fold(row.name);
+        const term = searchTerm(row.name);
+        const owned = words.every((word) => name.includes(word))
+          ? held.reduce((sum, holding) => (holding.haystack.includes(term) ? sum + holding.quantity : sum), 0)
+          : 0;
+        return { row, position, owned };
+      })
+      .sort((left, right) => right.owned - left.owned || left.position - right.position)
+      .slice(0, limit)
+      .map(({ row, owned }) => ({ name: row.name, category: row.category, image: row.image, keys: row.keys, owned }));
   }
 
   /**
@@ -389,5 +426,13 @@ export class Catalogue {
 /** Case- and accent-insensitive, so `stattrak` finds `StatTrak™` and `karambit` finds `Karambit`. */
 function fold(value: string): string {
   return value.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+}
+
+/**
+ * A name as `search` looks for it. A suggestion names a phase as `★ Karambit | Doppler — Phase 2`,
+ * and the index holds the phase after a space, so the dash goes or a chosen phase matches nothing.
+ */
+function searchTerm(value: string): string {
+  return fold(value).replace(/\s+—\s+/g, ' ');
 }
 export { STORE_DEF_INDEX_BY_NAME, STORE_NAMES_GENERATED_AT } from './store-names.generated.js';

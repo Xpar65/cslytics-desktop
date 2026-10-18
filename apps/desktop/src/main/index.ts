@@ -1,15 +1,21 @@
 import { join } from 'node:path';
 import { app, BrowserWindow, ipcMain, Menu, nativeTheme, powerMonitor, protocol, utilityProcess, type UtilityProcess } from 'electron';
 import { CATALOGUE_HOST, HttpCatalogueSource, IMAGE_SCHEME } from '@cslytics/catalogue';
+import { currencyById } from '@cslytics/market-data';
+import { MarketDataHost } from './market-data/host.js';
+import { marketFetch } from './market-data/fetch.js';
+import { itemCurve, itemHistory, itemPage, itemVariants, portfolioValuation } from './market-data/portfolio.js';
 import { ImageCache } from './images/cache.js';
 import { imageFetch } from './images/fetch.js';
 import { ElectronCredentialVault } from './credential-vault.js';
+import { answerCslytics, createCslyticsAccount } from './cslytics-account/index.js';
 import { trustInterceptedHostsUnpackaged } from './unpackaged-certificates.js';
-import { reapRuntimeLock } from './runtime/runtime-lock.js';
+import { reapRuntimeLock, reapRuntimeLockWhenGone } from './runtime/runtime-lock.js';
 import { purgeArgument, type PurgeOutcome, type PurgeRequest } from './runtime/account-clear.js';
 import { CHANGE_CHANNEL, engineCommandSchema } from '../shared/api.js';
 import { catalogueFetch, csfloatSchemaFetch } from './catalogue/fetch.js';
 import { CatalogueMediator } from './catalogue/mediator.js';
+import { HoldingCounts, type GroupPage } from './catalogue/holding-counts.js';
 import { openCheckout } from './checkout/checkout-window.js';
 import { enrichStoreSheet, resolveStoreLines } from './store-names.js';
 import { DESKTOP_PRELOAD_ENTRY } from '../shared/build-contract.js';
@@ -101,6 +107,12 @@ if (!acquiredLock) {
     const userData = app.getPath('userData');
     lockPath = join(userData, 'trading.sqlite.runtime.lock');
     const vault = new ElectronCredentialVault(join(userData, 'credentials.enc.json'));
+    // The optional CSlytics sign-in (CSlytics account sign-in plan §6). Read and verified beside the
+    // runtime, never ahead of it: nothing about Steam waits on the website.
+    const cslytics = createCslyticsAccount({ userData, vault, onChange: notifyCslyticsChanged });
+    const cslyticsReady = cslytics.start().catch(() => undefined);
+    void cslyticsReady.then(() => cslytics.verify()).catch(() => undefined);
+    setInterval(() => { void cslytics.verify().catch(() => undefined); }, 60 * 60_000);
     // Preferences, read before the window exists so its first frame is already in the chosen theme.
     const settings = new SettingsStore(join(userData, 'settings.json'));
     settings.load();
@@ -161,6 +173,20 @@ if (!acquiredLock) {
       .catch((error) => console.warn('Image cache unavailable; art will be fetched every time', error));
     const catalogue = new CatalogueMediator(userData, new HttpCatalogueSource('en', catalogueFetch, 45_000), csfloatSchemaFetch);
     const catalogueOpened = catalogue.open();
+    // Prices: the market-data cache, its scheduler and the FX refresh, composed here and never in
+    // the runtime (portfolio and pricing plan D3). A read, an absence, a stop or a rate change
+    // reaches the window as a `market` surface change, coalesced so a 4 rps fill is not 4 repaints.
+    const market = new MarketDataHost(userData, {
+      fetch: marketFetch,
+      userAgent: desktopUserAgent(),
+      log: (message, detail) => console.warn(message, detail ?? ''),
+      onEvent: (event) => {
+        if (event.kind === 'book' || event.kind === 'absent' || event.kind === 'fill-complete' || event.kind === 'stopped' || event.kind === 'rate') notifyMarketChanged();
+      }
+    });
+    marketHost = market;
+    market.start();
+    const marketDeps = { host: market, catalogue, settings: () => settings.current(), invoke: invokeRuntime };
     // CSFloat's own catalogue, which says why an item cannot go there (`csfloat-kinds.ts`): read at
     // start, then asked hourly and fetched once the copy held is four hours old. A failure keeps
     // the last copy; with none, rows carry no answer and the window says only what the read said.
@@ -213,6 +239,8 @@ if (!acquiredLock) {
         if (message?.kind === 'ready') {
           runtimeReady = true;
           console.info('Engine Runtime ready');
+          // The preference the engine steers by, applied before any page can ask it (consolidation plan D13).
+          void invokeRuntime({ type: 'csfloat.protection', enabled: settings.current().csfloat.protection }).catch(() => undefined);
           resolve((message.purge ?? null) as PurgeOutcome | null);
           return;
         }
@@ -242,7 +270,9 @@ if (!acquiredLock) {
           return;
         }
         if (message?.kind === 'changed') {
-          // Relayed, not interpreted. Main has no read model and must never grow one.
+          // Relayed, not interpreted. Main has no read model and must never grow one; the one thing
+          // it does with a notice is let go of the suggestion counts it kept for that account.
+          holdingCounts.forget(message.accountId);
           for (const open of BrowserWindow.getAllWindows()) {
             if (!open.isDestroyed()) open.webContents.send(CHANGE_CHANNEL, {
               kind: 'changed',
@@ -322,6 +352,11 @@ if (!acquiredLock) {
       if (refusal.refused) throw new Error(refusal.message);
       // This desktop's preferences: main's file, never the runtime's.
       if (command.type === 'settings.read') return settings.current();
+      if (command.type === 'csfloat.protection') {
+        // Kept here and passed on: the engine steers by it and persists nothing (consolidation plan D13).
+        settings.writeCsfloatProtection(command.enabled);
+        return invokeRuntime(command);
+      }
       if (command.type === 'settings.write') {
         const stored = settings.writeAppearance(command.appearance);
         followTheme(stored.appearance.theme);
@@ -329,12 +364,41 @@ if (!acquiredLock) {
         return stored;
       }
       if (command.type === 'settings.launch') return settings.writeLaunch(command.accountId, command.launch);
+      // The CSlytics account: main's, never the runtime's.
+      const cslyticsAnswer = answerCslytics(cslytics, cslyticsReady, command);
+      if (cslyticsAnswer) return cslyticsAnswer;
+      if (command.type === 'settings.currency') return settings.writeCurrency(command.currency);
+      // Prices, from main's own cache over the engine's reads; the runtime never sees one.
+      if (command.type === 'portfolio.valuation') return portfolioValuation(marketDeps, command.accountIds);
+      if (command.type === 'market.status') return market.status();
+      if (command.type === 'market.fx') return market.store.latestFx() ?? null;
+      if (command.type === 'portfolio.history') return market.store.valuationSnapshots(command.accountIds);
+      if (command.type === 'item.page') return itemPage(marketDeps, command.name, command.accountIds);
+      if (command.type === 'item.watch') return market.watch(command.name);
+      if (command.type === 'item.history') return itemHistory(marketDeps, command.name);
+      if (command.type === 'item.curve') return itemCurve(marketDeps, command.name, command.venue ?? 'steam');
+      if (command.type === 'item.variants') return itemVariants(marketDeps, command.name, command.accountIds);
+      if (command.type === 'portfolio.read') {
+        // The base currency defaults to the first account's wallet, pinned the first time one is
+        // observed (portfolio and pricing plan D9). Pinned once: a base already set, or chosen,
+        // is never moved by an account added or removed later.
+        const rows = await invokeRuntime(command) as Array<{ accountId: string; currency: number | null }>;
+        if (settings.current().currency.base === null && rows.some((row) => row.currency !== null)) {
+          const listed = await invokeRuntime({ type: 'accounts.list' }) as Array<{ id: string }>;
+          const byId = new Map(rows.map((row) => [row.accountId, row.currency]));
+          const first = listed.map((account) => byId.get(account.id) ?? null).find((currency) => currency !== null) ?? rows.find((row) => row.currency !== null)?.currency ?? null;
+          const code = currencyById(first)?.code;
+          if (code !== undefined) settings.pinBaseCurrency(code);
+        }
+        return rows;
+      }
       if (command.type === 'accounts.remove' || command.type === 'accounts.reset') {
         const mode = command.type === 'accounts.remove' ? 'remove' : 'reset';
         // A refusal throws before anything restarts. Past that point the outcome comes back either
         // way: the runtime has restarted, and the window has sessions to bring back even when the
         // purge rolled back.
         const outcome = await restartWithPurge({ accountId: command.accountId, mode });
+        holdingCounts.forget(command.accountId);
         // Its preferences are data about it on this computer too. Reset keeps them.
         if (outcome.ok && mode === 'remove') {
           try { settings.forgetAccount(command.accountId); } catch (error) { console.warn('Could not forget the removed account\'s settings', error); }
@@ -349,7 +413,13 @@ if (!acquiredLock) {
           collections: catalogue.collections()
         };
       }
-      if (command.type === 'catalogue.suggest') return catalogue.suggest(command.text, command.limit);
+      if (command.type === 'catalogue.suggest') {
+        if (!command.accountIds) return catalogue.suggest(command.text, command.limit);
+        // Counts still loading: the plain order now, and `pending` asks the bar to ask again.
+        const holdings = await holdingCounts.get(command.accountIds);
+        const answer = catalogue.suggest(command.text, command.limit, holdings.counts);
+        return holdings.pending ? { ...answer, pending: true } : answer;
+      }
       if (command.type === 'catalogue.accessories') return catalogue.accessories(command.family, command.text, command.limit);
       // The window is the only thing that knows which account it is showing, and the tier hooks
       // above fire without it. Remembering the last scope it named is what lets a focus event
@@ -410,9 +480,10 @@ if (!acquiredLock) {
         }
         return answer;
       }
-      if (command.type === 'inventory.groups' || command.type === 'inventory.page' || command.type === 'selection.matching') {
+      if (command.type === 'inventory.groups' || command.type === 'inventory.page' || command.type === 'selection.matching' || command.type === 'inventory.positions') {
         // The catalogue join the engine cannot do, in both directions: a name becomes identity
-        // keys here, and identity comes back wearing a name.
+        // keys here, and identity comes back wearing a name. A positions envelope is not a page:
+        // it goes back as the engine answered it, and `portfolioValuation` is what names its rows.
         const resolved = catalogue.resolveFilter(command.filter as Record<string, unknown> | undefined);
         const forwarded = { ...command, ...(resolved === undefined ? {} : { filter: resolved }) };
         if (resolved === undefined) delete (forwarded as { filter?: unknown }).filter;
@@ -513,9 +584,18 @@ if (!acquiredLock) {
     window.on('blur', () => tier(null));
     window.on('minimize', () => tier(null));
     window.on('restore', () => tier(focusedAccountId));
-    powerMonitor.on('suspend', () => tier(null));
+    // The price scheduler keeps its trickle while the window is shown and lets it go ten minutes
+    // after it is hidden (portfolio and pricing plan D13); a hidden renderer's timers are
+    // throttled, not stopped, so the hold is main's to apply, not the page's.
+    const marketVisible = (): void => market.setVisible(!window.isDestroyed() && window.isVisible() && !window.isMinimized());
+    window.on('show', marketVisible);
+    window.on('hide', marketVisible);
+    window.on('minimize', marketVisible);
+    window.on('restore', marketVisible);
+    powerMonitor.on('suspend', () => { tier(null); market.setVisible(false); });
     powerMonitor.on('resume', () => {
       tier(focusedAccountId);
+      marketVisible();
       // Only the accounts the runtime is already keeping current. Naming every account here would
       // sign in the ones their owner left signed out, because reading an account signs it in.
       void invokeRuntime({ type: 'refresh.resume' }).catch(() => undefined);
@@ -531,6 +611,11 @@ if (!acquiredLock) {
   app.on('window-all-closed', () => app.quit());
   app.on('before-quit', (event) => {
     quitting = true;
+    // The price cache closes with the app: its scheduler stops dispatching and the file is closed
+    // cleanly. Nothing waits on it; a read still in flight is dropped, and the store never evicts.
+    const market = marketHost;
+    marketHost = null;
+    if (market) void market.stop().catch(() => undefined);
     if (!runtime || shuttingDownRuntime) {
       if (lockPath) reapRuntimeLock(lockPath);
       return;
@@ -565,11 +650,13 @@ function stopRuntime(): Promise<void> {
       finished = true;
       clearTimeout(kill);
       if (giveUp) clearTimeout(giveUp);
-      if (lockPath) reapRuntimeLock(lockPath);
-      resolve();
+      // The runtime has exited or been killed; the lock goes once its pid is really gone.
+      if (lockPath) void reapRuntimeLockWhenGone(lockPath).finally(() => resolve());
+      else resolve();
     };
     child.once('exit', finish);
     const kill = setTimeout(() => {
+      console.warn('engine runtime: still running two seconds after being asked to stop; killing it');
       try { child.kill(); } catch { /* already gone */ }
       giveUp = setTimeout(finish, 2_000);
     }, 2_000);
@@ -597,6 +684,11 @@ async function resolvePendingAndNotify(catalogue: CatalogueMediator): Promise<vo
 
 /** The name order of the last tile walk, so turning its pages does not read the summary again. */
 let lastTileOrder: { key: string; order: string[] } | null = null;
+
+/** What each recently searched account set holds, so the filter bar can offer it first. */
+const holdingCounts = new HoldingCounts((accountIds, cursor) => invokeRuntime({
+  type: 'inventory.groups', accountIds, pageSize: 250, ...(cursor ? { cursor } : {})
+}) as Promise<GroupPage>);
 
 /**
  * Identity keys in name order, for a tile page sorted by name.
@@ -658,6 +750,19 @@ function notifyReleaseChanged(): void {
   }
 }
 
+/** The CSlytics account's status moved: the window re-reads `cslytics.status`. */
+function notifyCslyticsChanged(): void {
+  for (const open of BrowserWindow.getAllWindows()) {
+    if (open.isDestroyed()) continue;
+    open.webContents.send(CHANGE_CHANNEL, {
+      kind: 'changed',
+      accountId: 'cslytics',
+      surfaces: ['cslytics-account'],
+      at: new Date().toISOString()
+    });
+  }
+}
+
 function notifyCatalogueChanged(): void {
   for (const open of BrowserWindow.getAllWindows()) {
     if (open.isDestroyed()) continue;
@@ -668,6 +773,31 @@ function notifyCatalogueChanged(): void {
       at: new Date().toISOString()
     });
   }
+}
+
+/** The price cache, held at module level so quitting can close it (set once the app is ready). */
+let marketHost: MarketDataHost | null = null;
+let marketNotice: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Tells the window prices moved, the way a catalogue sync is announced: a `market` surface to
+ * re-read, never a figure. Coalesced to one notice per 1.5 s, because a fill reads four books a
+ * second and a portfolio recomputed four times a second is a window that never settles.
+ */
+function notifyMarketChanged(): void {
+  if (marketNotice !== null) return;
+  marketNotice = setTimeout(() => {
+    marketNotice = null;
+    for (const open of BrowserWindow.getAllWindows()) {
+      if (open.isDestroyed()) continue;
+      open.webContents.send(CHANGE_CHANNEL, {
+        kind: 'changed',
+        accountId: 'market',
+        surfaces: ['market'],
+        at: new Date().toISOString()
+      });
+    }
+  }, 1_500);
 }
 
 /** True when this Node needs `--experimental-sqlite` to expose `node:sqlite`. */

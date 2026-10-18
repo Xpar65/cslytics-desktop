@@ -283,7 +283,7 @@ export function describeOrigin(row: Pick<TradeListRow, 'origin' | 'csfloatCheck'
     case 'csfloat-sale':
     case 'csfloat-mixed': {
       const what = row.csfloatTrades > 1 ? plural(row.csfloatTrades, 'item') : names.itemName;
-      const price = row.csfloatPriceCents === null ? null : `${formatUsd(row.csfloatPriceCents)} USD`;
+      const price = row.csfloatPriceCents === null ? null : formatUsd(row.csfloatPriceCents);
       const owned = names.peer ? (row.origin === 'csfloat-purchase' ? `from ${names.peer}` : row.origin === 'csfloat-sale' ? `to ${names.peer}` : `with ${names.peer}`) : null;
       return { title: CSFLOAT_TITLE[row.origin], detail: [what, price, owned].filter(Boolean).join(' · ') || null, icon: 'shopping-cart', venue: 'csfloat' };
     }

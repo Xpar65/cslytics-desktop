@@ -1,8 +1,9 @@
-import type { AccountId, ExecutedTrade, TradeLine, TradeOffer } from '@cslytics/ports';
+import { steamId64FromAccountId, type AccountId, type ExecutedTrade, type TradeLine, type TradeOffer } from '@cslytics/ports';
 import type { EngineContext } from '../kernel/context.js';
 import { executeMutation } from '../kernel/context.js';
 import type { ActionRow } from '../db/database.js';
 import { TransferStore } from '../db/transfers.js';
+import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { HoldingsStore } from '../db/holdings.js';
 import type { TradeInventoryItem, SendOfferRequest } from '@cslytics/ports';
 import { errorMessage } from '../kernel/support.js';
@@ -63,16 +64,16 @@ type HistoryCheckpoint = { afterTimeSeconds: number; afterTradeId: string };
 export class TradeService {
   constructor(protected readonly context: EngineContext) {}
 
-  syncEligibility(accountId: string): Promise<number> {
-    return this.context.reads.run(`${accountId}:steam-trade-inventory`, async () => {
-      const store = new TransferStore(this.context.database);
+  /** The Community trade inventory: a broker scope (`steam-trade-inventory`), walked when the broker says, under its budget. */
+  async syncEligibility(accountId: string): Promise<number> {
+    {
+      const evidence = new AssetEvidenceStore(this.context.database);
       const startedAt = this.context.now();
       const items: TradeInventoryItem[] = [];
       let cursor: string | undefined, total: number | undefined, error: string | undefined, pages = 0;
       const cursors = new Set<string>();
       try {
         do {
-          await this.context.governors.admitRead(accountId, 'steam-trade-inventory');
           const page = await this.context.ports.trade.getTradeInventoryPage(accountId, cursor);
           pages += 1;
           if (total !== undefined && total !== page.total) throw new Error('Trade inventory changed during the walk');
@@ -87,24 +88,27 @@ export class TradeService {
       const obs = this.context.database.transaction(() => {
         const id = this.context.database.insertObservation({ accountId, surface: 'steam-trade-inventory', startedAt,
           finishedAt: this.context.now(), complete: !error, pagesWalked: pages, ...(error ? { error } : {}) });
-        if (!error) store.publishEligibility(accountId, items, id);
+        if (!error) evidence.observeCommunity(accountId, items, id);
         return id;
       });
       this.context.signals.emit({ kind: 'observed', accountId, surface: 'steam-trade-inventory', complete: !error, observationId: obs });
       return obs;
-    });
+    }
   }
 
+  /**
+   * The account's own trade link, and below it the hold a send to one owned account would meet.
+   * Neither is a surface the evidence table grades, so neither is a broker scope: a transfer reads
+   * them for itself, under the venue's budget (read broker plan D12).
+   */
   async syncTradeLink(accountId: string): Promise<void> {
     const startedAt = this.context.now();
-    await this.context.governors.admitRead(accountId, 'steam-trade-link');
+    await this.context.governors.admitRead(accountId, 'steam-web', 'steam-trade-link');
     const link = await this.context.ports.trade.getMyTradeUrl(accountId);
     if (this.context.database.listAccounts().find(a => a.id === accountId)?.steam_id64 !== link.steamId64) throw new Error('Trade link belongs to another account');
     this.context.database.transaction(() => {
       const id = this.context.database.insertObservation({ accountId, surface: 'steam-trade-link', startedAt, finishedAt: this.context.now(), complete: true });
-      this.context.database.raw().prepare(`INSERT INTO account_trade_link VALUES (?,?,?,?) ON CONFLICT(account_id)
-        DO UPDATE SET partner_account_id=excluded.partner_account_id,token=excluded.token,observation_id=excluded.observation_id`)
-        .run(accountId,link.partnerAccountId,link.token,id);
+      this.context.database.raw().prepare('UPDATE account SET trade_token=?, trade_token_obs=? WHERE id=?').run(link.token, id, accountId);
     });
   }
 
@@ -114,7 +118,7 @@ export class TradeService {
     const partner = this.context.database.listAccounts().find(a => a.id === destination);
     if (!link || !partner) throw new Error('Destination trade link is unknown');
     const startedAt = this.context.now();
-    await this.context.governors.admitRead(accountId, 'steam-trade-hold');
+    await this.context.governors.admitRead(accountId, 'steam-web', `steam-trade-hold:${destination}`);
     // A failed replacement cannot leave an old zero-hold claim authorising a send.
     this.context.database.raw().prepare('DELETE FROM transfer_hold WHERE account_id=? AND destination_account_id=?').run(accountId,destination);
     const hold = await this.context.ports.trade.getHoldDurations(accountId, partner.steam_id64, link.token);
@@ -144,11 +148,11 @@ export class TradeService {
   }
 
   syncOffers(accountId: AccountId): Promise<TradeSyncResult> {
-    return this.context.reads.run(`${accountId}:${TRADE_OFFERS_SURFACE}`, () => this.walkOffers(accountId));
+    return this.walkOffers(accountId);
   }
 
   syncHistory(accountId: AccountId, pageSize = HISTORY_PAGE_SIZE): Promise<TradeSyncResult> {
-    return this.context.reads.run(`${accountId}:${TRADE_HISTORY_SURFACE}`, () => this.walkHistory(accountId, pageSize));
+    return this.walkHistory(accountId, pageSize);
   }
 
   // --- offers --------------------------------------------------------------
@@ -261,9 +265,10 @@ export class TradeService {
       account_id: accountId,
       offer_id: offer.offerId,
       trade_id: offer.tradeId ?? null,
-      counterparty_id: offer.counterpartyId,
+      // Steam's API speaks the other party's account32; the record keeps a SteamID64 (D14).
+      counterparty_steam_id64: steamId64FromAccountId(offer.counterpartyId) ?? offer.counterpartyId,
       direction: offer.direction === 'sent' ? 'SENT' : 'RECEIVED',
-      raw_state: offer.state,
+      state_code: offer.state,
       status,
       confirmation_method: offer.confirmationMethod ?? null,
       escrow_until: offer.escrowUntil ?? null,
@@ -361,7 +366,7 @@ export class TradeService {
       trade_id: trade.tradeId,
       offer_id: offerId,
       counterparty_steam_id64: trade.counterpartySteamId64,
-      raw_status: trade.status,
+      status_code: trade.status,
       status,
       initiated_at: trade.initiatedAt,
       updated_at: trade.updatedAt ?? null,
@@ -392,8 +397,8 @@ export class TradeService {
   /** Finish deferred postings from stored history, even after its overlap window has passed. */
   postObservedDelivery(accountId: string, tradeId: string): void {
     const row=new TradeStore(this.context.database).executedTrade(accountId,tradeId);
-    if(!row || !settlesDelivery(tradeStatus(row.raw_status))) return;
-    const trade:ExecutedTrade={tradeId,counterpartySteamId64:row.counterparty_steam_id64,status:row.raw_status,
+    if(!row || !settlesDelivery(tradeStatus(row.status_code))) return;
+    const trade:ExecutedTrade={tradeId,counterpartySteamId64:row.counterparty_steam_id64,status:row.status_code,
       initiatedAt:row.initiated_at,...(row.updated_at?{updatedAt:row.updated_at}:{}),...(row.settled_at?{settledAt:row.settled_at}:{}),given:[],received:[],raw:{}};
     for(const line of new TradeStore(this.context.database).tradeLines(accountId,{tradeId})) {
       this.postTradeEffect(accountId,trade,line.side,{appId:line.app_id,contextId:line.context_id,assetId:line.asset_id,
@@ -406,7 +411,6 @@ export class TradeService {
       && (batch.account_id === accountId || batch.destination_account_id === accountId)
       && (JSON.parse(batch.assets_json) as Array<{assetId:string}>).some(asset => asset.assetId === line.assetId));
     if (pending) return; // Our transfers settle only after both complete GC inventories agree.
-    const candidates = this.candidatesFor(accountId, line);
     new LedgerStore(this.context.database).postEconomicEvent({
       accountId,
       sourceKey: sourceKey(trade.tradeId, side, line),
@@ -415,8 +419,6 @@ export class TradeService {
       quantity: line.quantity,
       // Steam names no price for a trade, and a trade is not a sale. Unknown stays unknown.
       amountCents: null,
-      ...(candidates.length === 1 ? { localId: candidates[0]! } : {}),
-      candidates,
       tradeId: trade.tradeId,
       observationId
     }, this.context.now());

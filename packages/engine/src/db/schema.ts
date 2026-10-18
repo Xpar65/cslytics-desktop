@@ -11,7 +11,9 @@
  * `ALTER` statements add them, so that a freshly created database and a migrated one have their
  * columns in the same positions. `tests/unit/migrations.test.ts` fails if they diverge.
  */
-export const SCHEMA_VERSION = 28;
+import { ACTION_STATES, COMMAND_MEMBER_STATES, COMMAND_STATES, EVIDENCE_SOURCES, EXECUTED_TRADE_STATUSES, ORDER_CONFIDENCES, ORDER_SIDES, ORDER_STATES, ORDER_VENUES, RESERVATION_STATES, STEAM_LISTING_BUCKETS, STORAGE_UNIT_STATES, STORE_SHEET_PARSE_STATES, TRADE_OFFER_STATUSES, TRADE_STATUS_EVENT_STATUSES, VENUE_CONNECTION_STATUSES, WORK_STEP_KINDS, WORK_STEP_STATES, sqlList } from './alphabets.js';
+
+export const SCHEMA_VERSION = 29;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migration (
@@ -29,7 +31,11 @@ CREATE TABLE IF NOT EXISTS account (
   -- No REFERENCES observation(id): account is created before observation.
   persona_name TEXT,
   avatar_hash TEXT,
-  persona_obs INTEGER
+  persona_obs INTEGER,
+  -- Appended by migration 29: the account's own trade token and the read that gave it (D14). The
+  -- partner id Steam's trade URL wants is the SteamID64 less the account32 offset, derived at use.
+  trade_token TEXT,
+  trade_token_obs INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS account_name_unique ON account(account_name COLLATE NOCASE);
 CREATE UNIQUE INDEX IF NOT EXISTS account_steam_id64_unique ON account(steam_id64);
@@ -57,10 +63,29 @@ CREATE TABLE IF NOT EXISTS observation (
 );
 CREATE INDEX IF NOT EXISTS observation_account_surface ON observation(account_id, surface, id DESC);
 
+-- One row per account, surface and scope of what the record keeps about its own reads of that
+-- surface (consolidation plan D9): a walk's committed coverage (cursor_json, covered_through, the
+-- observation that moved it and when), advanced only inside the write that recorded it; and the
+-- revision of a paged table, counted by the store that writes it in the same transaction, which
+-- a keyset cursor carries and is refused on when it moved. There is no trigger: the engine is the
+-- sole writer, and tests/unit/revision-sites.test.ts holds every write site to its count.
+CREATE TABLE IF NOT EXISTS surface_state (
+  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  surface TEXT NOT NULL,
+  scope_id TEXT NOT NULL DEFAULT '',
+  revision INTEGER NOT NULL DEFAULT 0,
+  cursor_json TEXT,
+  covered_through TEXT,
+  observation_id INTEGER REFERENCES observation(id),
+  updated_at TEXT,
+  PRIMARY KEY(account_id, surface, scope_id),
+  CHECK(revision > 0 OR cursor_json IS NOT NULL)
+) STRICT;
+
 -- An item's location is where the Game Coordinator holds it. A listing is not a place: the GC
 -- keeps a listed item in the inventory, so a listed unit is MAIN and "listed" is an open
--- market_listing row (db/steam-listing.ts). MARKET stays in the CHECK only because SQLite cannot
--- drop it without rebuilding the table; nothing writes it since migration 28.
+-- venue_order row the market walk wrote (db/commitment.ts). A walk writes the scope in one
+-- transaction (consolidation plan D8): a reader sees the rows a walk left whole, never a mix.
 CREATE TABLE IF NOT EXISTS item (
   local_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
@@ -70,8 +95,8 @@ CREATE TABLE IF NOT EXISTS item (
   paint_seed INTEGER,
   quality INTEGER NOT NULL,
   stable_key TEXT NOT NULL,
-  current_asset_id TEXT,
-  location TEXT NOT NULL CHECK(location IN ('MAIN', 'CASKET', 'MARKET', 'MISSING')),
+  asset_id TEXT,
+  location TEXT NOT NULL CHECK(location IN ('MAIN', 'CASKET', 'MISSING')),
   casket_id TEXT,
   tradable_after TEXT,
   trade_protected_until TEXT,
@@ -79,10 +104,8 @@ CREATE TABLE IF NOT EXISTS item (
   last_seen_obs INTEGER NOT NULL REFERENCES observation(id),
   location_obs INTEGER REFERENCES observation(id),
   location_generation INTEGER,
-  row_generation INTEGER NOT NULL DEFAULT 0,
-  -- Appended by migrations, in ALTER order: the fresh-create path and the upgrade path have to
-  -- converge column for column (migrations.test.ts). kit is the catalogue key's fourth field;
-  -- the six after it are the holdings plan (D2-D8): one row per unit, of either kind.
+  -- kit is the catalogue key's fourth field; the six after it are the holdings plan (D2-D8):
+  -- one row per unit, of either kind.
   kit TEXT NOT NULL DEFAULT '',
   unit_kind TEXT NOT NULL DEFAULT 'individual',
   group_key TEXT NOT NULL DEFAULT '',
@@ -93,8 +116,9 @@ CREATE TABLE IF NOT EXISTS item (
 );
 CREATE INDEX IF NOT EXISTS item_account_location ON item(account_id, location, local_id);
 CREATE INDEX IF NOT EXISTS item_account_local_id ON item(account_id, local_id);
-CREATE INDEX IF NOT EXISTS item_account_generation ON item(account_id, row_generation, location);
-CREATE UNIQUE INDEX IF NOT EXISTS item_current_asset ON item(account_id, current_asset_id) WHERE current_asset_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS item_asset ON item(account_id, asset_id) WHERE asset_id IS NOT NULL;
+-- A trade receipt names the given holding by asset id alone: it lives on whichever owned account gave it.
+CREATE INDEX IF NOT EXISTS item_asset_across_accounts ON item(asset_id);
 CREATE INDEX IF NOT EXISTS item_stable_lookup ON item(account_id, stable_key, location);
 -- Allocation takes N unreserved units of one group at one location; the group page lists them.
 CREATE INDEX IF NOT EXISTS item_group ON item(account_id, group_key, location, reserved_command);
@@ -112,6 +136,8 @@ CREATE TABLE IF NOT EXISTS item_lineage (
   PRIMARY KEY(account_id, from_local_id, to_local_id)
 );
 CREATE INDEX IF NOT EXISTS item_lineage_to ON item_lineage(account_id, to_local_id);
+-- A swept row asks whether a receipt carried it onward; the receipt may be the receiving account's.
+CREATE INDEX IF NOT EXISTS item_lineage_from ON item_lineage(from_local_id);
 
 -- What an owner applied to a carrier, one row per slot, derived from the row's attributes on
 -- every walk (holdings plan D6). A patch on an agent is a sticker slot; the host names the kit.
@@ -129,7 +155,6 @@ CREATE TABLE IF NOT EXISTS item_accessory (
   observation_id INTEGER NOT NULL REFERENCES observation(id),
   PRIMARY KEY(account_id, local_id, kind, slot)
 );
-CREATE INDEX IF NOT EXISTS item_accessory_kit ON item_accessory(account_id, kind, kit_id);
 
 CREATE TABLE IF NOT EXISTS storage_unit (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
@@ -137,7 +162,7 @@ CREATE TABLE IF NOT EXISTS storage_unit (
   label TEXT,
   contains_count INTEGER NOT NULL,
   contents_obs INTEGER REFERENCES observation(id),
-  state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'FULL', 'DISABLED')),
+  state TEXT NOT NULL CHECK(state IN (${sqlList(STORAGE_UNIT_STATES)})),
   -- Last on purpose: ALTER TABLE ADD COLUMN appends, and the fresh-create path
   -- and the upgrade path have to converge column for column (migrations.test.ts).
   -- A label is only as good as the observation that wrote it (rename plan §3).
@@ -145,43 +170,32 @@ CREATE TABLE IF NOT EXISTS storage_unit (
   PRIMARY KEY(account_id, casket_id)
 );
 
-CREATE TABLE IF NOT EXISTS market_listing (
+-- What a source other than the Game Coordinator says about an asset this account holds, one row
+-- per source (consolidation plan D11): Steam's Community description (tradable, marketable,
+-- quantity, name, class and instance) and CSFloat's inventory read (eligible, and the item as the
+-- venue described it, which the identity association reads whole). A row mirrors the source's
+-- last complete walk: first_seen_obs is the walk that first showed the asset, last_seen_obs the
+-- latest, and a walk sweeps the rows it did not show. A flag the source did not give is NULL:
+-- unknown, never "no". marketable is Steam's only answer to "can this be sold on the market at
+-- all"; no GC attribute gives it (holdings plan D7).
+CREATE TABLE IF NOT EXISTS asset_evidence (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  listing_id TEXT NOT NULL,
-  local_id TEXT REFERENCES item(local_id),
   asset_id TEXT NOT NULL,
-  hash_name TEXT NOT NULL,
-  price_receive_cents INTEGER NOT NULL,
-  buyer_price_cents INTEGER NOT NULL,
-  status TEXT NOT NULL,
-  hold_until TEXT,
-  awaiting_confirmation INTEGER NOT NULL DEFAULT 0 CHECK(awaiting_confirmation IN (0, 1)),
+  source TEXT NOT NULL CHECK(source IN (${sqlList(EVIDENCE_SOURCES)})),
+  tradable INTEGER CHECK(tradable IN (0, 1)),
+  marketable INTEGER CHECK(marketable IN (0, 1)),
+  quantity INTEGER CHECK(quantity > 0),
+  eligible INTEGER CHECK(eligible IN (0, 1)),
+  detail_json TEXT,
+  name TEXT,
+  class_id TEXT,
+  instance_id TEXT,
   first_seen_obs INTEGER NOT NULL REFERENCES observation(id),
   last_seen_obs INTEGER NOT NULL REFERENCES observation(id),
-  PRIMARY KEY(account_id, listing_id)
-);
--- Raw observations may contradict one another. Quarantine them instead of losing the walk.
-DROP INDEX IF EXISTS one_active_listing_per_item;
--- "Is this item listed?" is asked of every inventory row (db/steam-listing.ts), by bound row and
--- by asset id. Only open listings are ever asked, so only they are indexed.
-CREATE INDEX IF NOT EXISTS market_listing_open_local ON market_listing(account_id, local_id)
-  WHERE status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION');
-CREATE INDEX IF NOT EXISTS market_listing_open_asset ON market_listing(account_id, asset_id)
-  WHERE status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION');
-
-CREATE TABLE IF NOT EXISTS buy_order (
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  buy_order_id TEXT NOT NULL,
-  hash_name TEXT NOT NULL,
-  price_cents INTEGER NOT NULL,
-  quantity INTEGER NOT NULL,
-  quantity_remaining INTEGER NOT NULL,
-  purchased INTEGER NOT NULL,
-  active INTEGER NOT NULL CHECK(active IN (0, 1)),
-  first_seen_obs INTEGER NOT NULL REFERENCES observation(id),
-  last_seen_obs INTEGER NOT NULL REFERENCES observation(id),
-  PRIMARY KEY(account_id, buy_order_id)
-);
+  PRIMARY KEY(account_id, asset_id, source),
+  CHECK(source <> 'community' OR (tradable IS NOT NULL AND quantity IS NOT NULL AND name IS NOT NULL AND class_id IS NOT NULL AND instance_id IS NOT NULL)),
+  CHECK(source <> 'csfloat' OR detail_json IS NOT NULL)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS wallet_snapshot (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,13 +206,15 @@ CREATE TABLE IF NOT EXISTS wallet_snapshot (
   delayed_balance_cents INTEGER NOT NULL,
   currency INTEGER NOT NULL
 );
+-- The latest balance, asked once per listing row on three pages.
+CREATE INDEX IF NOT EXISTS wallet_latest ON wallet_snapshot(account_id, id);
 
 CREATE TABLE IF NOT EXISTS reservation (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   ref_kind TEXT NOT NULL,
   ref_id TEXT NOT NULL,
   amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
-  state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'SUBMITTED_UNOBSERVED', 'RELEASED', 'CONSUMED')),
+  state TEXT NOT NULL CHECK(state IN (${sqlList(RESERVATION_STATES)})),
   PRIMARY KEY(account_id, ref_kind, ref_id)
 );
 
@@ -210,7 +226,6 @@ CREATE TABLE IF NOT EXISTS desired_state (
   version INTEGER NOT NULL,
   intent TEXT NOT NULL,
   params_json TEXT NOT NULL,
-  basis TEXT NOT NULL,
   created_at TEXT NOT NULL,
   superseded_by TEXT REFERENCES desired_state(id),
   authority TEXT NOT NULL DEFAULT 'HUMAN',
@@ -218,27 +233,35 @@ CREATE TABLE IF NOT EXISTS desired_state (
   suspended_at TEXT,
   blocked_until TEXT,
   expires_at TEXT,
+  -- Appended by migration 29: the command that set the goal, when one did (consolidation plan D15).
+  command_id TEXT REFERENCES command(id),
   UNIQUE(account_id, target_kind, target_id, version)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS desired_current ON desired_state(account_id, target_kind, target_id)
   WHERE superseded_by IS NULL;
 
+-- An action carries a standing intent (desired_id) or one hop of a command (step_id), never both
+-- and never neither (consolidation plan D3). Migration 29 rebuilt the table to let desired_id be null.
 CREATE TABLE IF NOT EXISTS action (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   target_id TEXT NOT NULL,
-  desired_version INTEGER NOT NULL,
-  desired_id TEXT NOT NULL REFERENCES desired_state(id),
-  state TEXT NOT NULL CHECK(state IN ('READY', 'RUNNING', 'AWAITING_OBSERVATION', 'DONE', 'FAILED')),
+  desired_version INTEGER NOT NULL DEFAULT 0,
+  desired_id TEXT REFERENCES desired_state(id),
+  state TEXT NOT NULL CHECK(state IN (${sqlList(ACTION_STATES)})),
   resource_key TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   error TEXT,
   params_json TEXT,
   resolved_by_obs INTEGER REFERENCES observation(id),
-  resolution TEXT
+  resolution TEXT,
+  step_id TEXT REFERENCES work_step(id),
+  CHECK((step_id IS NULL) <> (desired_id IS NULL))
 );
+-- A goal's latest action: the member-state carrier join and the planners ask it per goal.
+CREATE INDEX IF NOT EXISTS action_goal ON action(desired_id, created_at) WHERE desired_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS action_ready ON action(account_id, state, created_at);
 CREATE INDEX IF NOT EXISTS observation_scope ON observation(account_id, scope_kind, scope_id, id DESC);
 
@@ -252,16 +275,6 @@ CREATE TABLE IF NOT EXISTS attempt (
   response_ref TEXT
 );
 
-CREATE TABLE IF NOT EXISTS raw_capture (
-  id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  endpoint TEXT NOT NULL,
-  status INTEGER,
-  latency_ms INTEGER,
-  captured_at TEXT NOT NULL,
-  body_ref TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS event (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
@@ -270,126 +283,183 @@ CREATE TABLE IF NOT EXISTS event (
   at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_page ON event(account_id, at, id);
+-- A write-once event is looked up by its kind before it is written (addEventOnce).
+CREATE INDEX IF NOT EXISTS event_kind ON event(account_id, kind, at);
 
 -- price_cents is the order LIMIT that was standing when the fill was observed. It is not a paid
 -- price and never becomes one (BUY-06): what was actually paid lives in actual_amount_cents, and
 -- amount_basis says whether anything evidenced it.
-CREATE TABLE IF NOT EXISTS acquisition (
-  id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  buy_order_id TEXT,
-  quantity INTEGER NOT NULL,
-  price_cents INTEGER NOT NULL,
-  attribution TEXT NOT NULL CHECK(attribution IN ('ATTRIBUTED', 'UNATTRIBUTED')),
-  candidates_json TEXT NOT NULL,
-  acquired_at TEXT NOT NULL,
-  actual_amount_cents INTEGER,
-  amount_basis TEXT NOT NULL DEFAULT 'UNKNOWN'
-);
 
-
+-- One row per order on any venue and either side, ours or the account owner's, from the request
+-- that opened it to the observation that explained its end (consolidation plan D4). It is the only
+-- row that binds a holding to a venue object, by its row and by its asset id, and the walk
+-- re-derives the binding from the asset id every time. What only one venue has is a satellite
+-- keyed like the parent (steam_order, csfloat_order). "Is this holding committed, or listed?" is
+-- asked of these rows by db/commitment.ts, by row through order_resource and by asset id through
+-- order_asset, and nowhere else.
 CREATE TABLE IF NOT EXISTS venue_order (
   account_id TEXT NOT NULL REFERENCES account(id),
   order_id TEXT NOT NULL,
-  venue TEXT NOT NULL,
-  side TEXT NOT NULL CHECK(side IN ('SELL','BUY')),
+  venue TEXT NOT NULL CHECK(venue IN (${sqlList(ORDER_VENUES)})),
+  side TEXT NOT NULL CHECK(side IN (${sqlList(ORDER_SIDES)})),
   local_id TEXT REFERENCES item(local_id),
+  asset_id TEXT,
   hash_name TEXT,
   venue_order_id TEXT,
-  price_receive_cents INTEGER,
-  opened_at TEXT NOT NULL,
-  opened_from_intent TEXT REFERENCES desired_state(id),
-  intent_version INTEGER,
-  action_id TEXT REFERENCES action(id),
-  managed INTEGER NOT NULL DEFAULT 0,
-  state TEXT NOT NULL,
-  first_open_obs INTEGER REFERENCES observation(id),
-  last_seen_obs INTEGER REFERENCES observation(id),
+  price_cents INTEGER,
+  currency INTEGER,
+  quantity INTEGER NOT NULL DEFAULT 1,
+  filled INTEGER,
+  state TEXT NOT NULL CHECK(state IN (${sqlList(ORDER_STATES)})),
+  confidence TEXT NOT NULL DEFAULT 'unknown' CHECK(confidence IN (${sqlList(ORDER_CONFIDENCES)})),
   transactable_after TEXT,
+  opened_at TEXT NOT NULL,
+  first_seen_obs INTEGER REFERENCES observation(id),
+  last_seen_obs INTEGER REFERENCES observation(id),
+  gone_obs INTEGER REFERENCES observation(id),
   ended_at TEXT,
   end_reason TEXT,
   end_evidence INTEGER REFERENCES observation(id),
-  confidence TEXT NOT NULL DEFAULT 'unknown',
-  venue_detail_json TEXT NOT NULL DEFAULT '{}',
+  action_id TEXT REFERENCES action(id),
   PRIMARY KEY(account_id, order_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS order_attempt ON venue_order(account_id, action_id) WHERE action_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS order_venue_id ON venue_order(account_id, venue, venue_order_id) WHERE venue_order_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS order_resource ON venue_order(account_id, local_id, state);
+CREATE INDEX IF NOT EXISTS order_asset ON venue_order(account_id, asset_id, state);
 
+-- What only Steam says about a listing: the price a buyer sees beside the seller-receives figure
+-- the parent keeps (rule 4), and the bucket of mylistings the listing was last seen in, which the
+-- parent's state is derived from and which a quarantine does not overwrite.
+CREATE TABLE IF NOT EXISTS steam_order (
+  account_id TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  buyer_price_cents INTEGER,
+  raw_bucket TEXT CHECK(raw_bucket IN (${sqlList(STEAM_LISTING_BUCKETS)})),
+  PRIMARY KEY(account_id, order_id),
+  FOREIGN KEY(account_id, order_id) REFERENCES venue_order(account_id, order_id) ON DELETE CASCADE
+) STRICT;
+
+-- What only CSFloat says about an order: a listing's kind and the venue's own word for its state
+-- (the parent's state is derived from it; a word this app has never seen is kept for a person to
+-- read), the item as the venue described it, verbatim, because the identity association reads the
+-- whole tuple; a buy order's constraints as sent; when the venue says it was created; and the read
+-- that last stated a listing, which an edit's admission and its proof are judged against.
+CREATE TABLE IF NOT EXISTS csfloat_order (
+  account_id TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  type TEXT,
+  state_word TEXT,
+  item_json TEXT,
+  properties_json TEXT,
+  created_at TEXT,
+  observation_id INTEGER REFERENCES observation(id),
+  PRIMARY KEY(account_id, order_id),
+  FOREIGN KEY(account_id, order_id) REFERENCES venue_order(account_id, order_id) ON DELETE CASCADE
+) STRICT;
+
+-- A command is one submission: a bulk Steam command, a CSFloat edit, a transfer, a store purchase,
+-- or a captured selection no kind has been chosen for yet (DRAFT). Its hops are work_step rows.
 CREATE TABLE IF NOT EXISTS command (
   id TEXT PRIMARY KEY,
   correlation_id TEXT NOT NULL,
   kind TEXT NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('REJECTED', 'ADMITTED', 'RUNNING', 'PARTIAL', 'COMPLETE', 'STOPPED')),
+  state TEXT NOT NULL CHECK(state IN (${sqlList(COMMAND_STATES)})),
   reject_reason TEXT,
   created_at TEXT NOT NULL,
   preparing INTEGER NOT NULL DEFAULT 0,
   manifest_token TEXT,
-  observed_completed INTEGER NOT NULL DEFAULT 0
+  observed_completed INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 1,
+  filter_json TEXT
 );
-CREATE INDEX IF NOT EXISTS command_manifest ON command(manifest_token, created_at);
 
+-- A member names the holding a command is about (local_id is its local id once a group member
+-- has been expanded into units), keeps the terms it was admitted with, and carries only the words
+-- no hop can say for it (db/alphabets.ts); what it is doing is its hops in work_step
+-- (consolidation plan §4.4). Migration 29 rebuilt it without action_id.
 CREATE TABLE IF NOT EXISTS command_member (
   command_id TEXT NOT NULL REFERENCES command(id) ON DELETE CASCADE,
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  member_id TEXT NOT NULL,
+  local_id TEXT NOT NULL,
   stack_key TEXT,
   quantity INTEGER NOT NULL DEFAULT 1,
   destination TEXT,
   price_receive_cents INTEGER,
-  state TEXT NOT NULL,
-  action_id TEXT,
+  state TEXT NOT NULL CHECK(state IN (${sqlList(COMMAND_MEMBER_STATES)})),
   input_json TEXT,
-  PRIMARY KEY(command_id, account_id, member_id)
+  PRIMARY KEY(command_id, account_id, local_id)
 );
+-- The resume after a restart and the purge ask for an account's members by state.
+CREATE INDEX IF NOT EXISTS command_member_account ON command_member(account_id, state);
 
-CREATE TABLE IF NOT EXISTS selection_manifest (
-  token TEXT PRIMARY KEY,
-  revision INTEGER NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('DRAFT', 'COMPLETE', 'RELEASED')),
-  account_ids_json TEXT NOT NULL,
-  filter_json TEXT NOT NULL,
+-- One row per hop of a command (consolidation plan D2): the holding or the remote object it is
+-- about, the one action that carries it when one exists, the observation that settled it, and the
+-- terms it was admitted with. Its state is the one work alphabet; what the venue shows meanwhile
+-- is read from the venue's rows and never copied here.
+CREATE TABLE IF NOT EXISTS work_step (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL REFERENCES command(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  local_id TEXT,
+  target_id TEXT,
+  offer_id TEXT,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN (${sqlList(WORK_STEP_KINDS)})),
+  state TEXT NOT NULL CHECK(state IN (${sqlList(WORK_STEP_STATES)})),
+  action_id TEXT REFERENCES action(id),
+  desired_id TEXT REFERENCES desired_state(id),
+  reason TEXT,
+  params_json TEXT,
+  observation_id INTEGER REFERENCES observation(id),
+  deadline_at TEXT,
   created_at TEXT NOT NULL,
-  handle_count INTEGER NOT NULL DEFAULT 0,
-  quantity_total INTEGER NOT NULL DEFAULT 0
-);
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS work_step_command ON work_step(command_id, ordinal);
+CREATE INDEX IF NOT EXISTS work_step_account_state ON work_step(account_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS work_step_account_local ON work_step(account_id, local_id);
+CREATE INDEX IF NOT EXISTS work_step_target ON work_step(account_id, kind, target_id);
+CREATE UNIQUE INDEX IF NOT EXISTS work_step_action ON work_step(action_id) WHERE action_id IS NOT NULL;
+-- A cursor into a page of work is bound to these marks (read/queries/paging.ts); a hop that moves
+-- invalidates it, as a transfer's row did before the hops.
 
-CREATE TABLE IF NOT EXISTS selection_member (
-  token TEXT NOT NULL REFERENCES selection_manifest(token) ON DELETE CASCADE,
-  revision INTEGER NOT NULL,
-  account_id TEXT NOT NULL,
-  member_id TEXT NOT NULL,
-  stack_key TEXT,
-  location TEXT,
-  casket_id TEXT,
-  quantity INTEGER NOT NULL,
-  PRIMARY KEY(token, revision, account_id, member_id)
-);
-CREATE INDEX IF NOT EXISTS selection_member_account ON selection_member(token, revision, account_id);
-
-CREATE TABLE IF NOT EXISTS inventory_publication (
+-- What only a transfer's send hop has (consolidation plan D2, §4.4): where it goes, what the
+-- destination held before it, when the offer was seen accepted, and the two walks that proved
+-- delivery. Keyed by the hop; the hop's own row says where the transfer is.
+CREATE TABLE IF NOT EXISTS transfer_detail (
+  step_id TEXT PRIMARY KEY REFERENCES work_step(id) ON DELETE CASCADE,
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  surface TEXT NOT NULL,
-  scope_id TEXT NOT NULL DEFAULT '',
-  published_generation INTEGER,
-  staging_generation INTEGER,
-  staging_state TEXT NOT NULL DEFAULT 'INACTIVE',
-  published_at TEXT,
-  PRIMARY KEY(account_id, surface, scope_id)
-);
+  destination_account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  destination_baseline_json TEXT NOT NULL,
+  accepted_at TEXT,
+  accepted_obs INTEGER REFERENCES observation(id),
+  completed_source_obs INTEGER REFERENCES observation(id),
+  completed_destination_obs INTEGER REFERENCES observation(id),
+  CHECK(account_id<>destination_account_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS transfer_detail_destination ON transfer_detail(destination_account_id);
 
-CREATE TABLE IF NOT EXISTS inventory_event_journal (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+-- The frozen lines of a store purchase, beside its init hop (consolidation plan D2, §4.4): entry
+-- key, def index, quantity, unit price, the main-inventory baseline at admission and what has been
+-- observed since. The baseline is what makes an id-less delivery countable.
+CREATE TABLE IF NOT EXISTS store_line (
+  step_id TEXT NOT NULL REFERENCES work_step(id) ON DELETE CASCADE,
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  surface TEXT NOT NULL,
-  scope_id TEXT NOT NULL DEFAULT '',
-  generation INTEGER NOT NULL,
-  payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS inventory_event_journal_scope ON inventory_event_journal(account_id, surface, scope_id, id);
+  line_index INTEGER NOT NULL,
+  entry_key TEXT NOT NULL,
+  def_index INTEGER NOT NULL,
+  quantity INTEGER NOT NULL CHECK(quantity >= 1),
+  unit_price_cents INTEGER NOT NULL CHECK(unit_price_cents >= 0),
+  baseline_quantity INTEGER NOT NULL DEFAULT 0,
+  observed_quantity INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(step_id, line_index)
+) STRICT;
 
+
+-- One row per myhistory event, deduplicated by Steam's event id, with what a read asks of it and
+-- no body (consolidation plan D15): the money an event named is the ledger row keyed by the
+-- event, and the name is what the venue called the item when its body said, else the order's.
 CREATE TABLE IF NOT EXISTS market_history (
   account_id TEXT NOT NULL REFERENCES account(id),
   event_id TEXT NOT NULL,
@@ -397,8 +467,8 @@ CREATE TABLE IF NOT EXISTS market_history (
   purchase_id TEXT,
   event_type INTEGER NOT NULL,
   occurred_at TEXT NOT NULL,
-  raw_json TEXT NOT NULL,
   observation_id INTEGER NOT NULL REFERENCES observation(id),
+  hash_name TEXT,
   PRIMARY KEY(account_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS market_history_page ON market_history(account_id, occurred_at, event_id);
@@ -408,125 +478,22 @@ CREATE INDEX IF NOT EXISTS item_identity_match ON item(account_id,(def_index || 
 -- The filter bar's float predicates (f > 0.15, nf < 0.01) range over paint_wear per account.
 -- Without this they are a scan of every item the account holds, on every keystroke.
 CREATE INDEX IF NOT EXISTS item_account_paint_wear ON item(account_id, paint_wear);
-CREATE INDEX IF NOT EXISTS item_group_contents ON item(account_id,group_key,location,casket_id,current_asset_id);
 CREATE INDEX IF NOT EXISTS history_listing_page ON market_history(account_id,listing_id,occurred_at,event_id);
 CREATE INDEX IF NOT EXISTS history_type_page ON market_history(account_id,event_type,occurred_at,event_id);
 CREATE INDEX IF NOT EXISTS order_state_page ON venue_order(account_id,state,opened_at,order_id);
-CREATE TABLE IF NOT EXISTS read_revision (
-  account_id TEXT NOT NULL,
-  surface TEXT NOT NULL,
-  revision INTEGER NOT NULL,
-  PRIMARY KEY(account_id,surface)
-);
-CREATE TRIGGER IF NOT EXISTS item_revision_insert AFTER INSERT ON item BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'item',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS item_revision_update AFTER UPDATE ON item BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'item',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS item_revision_delete AFTER DELETE ON item BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'item',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS storage_unit_revision_insert AFTER INSERT ON storage_unit BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'storage_unit',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS storage_unit_revision_update AFTER UPDATE ON storage_unit BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'storage_unit',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS storage_unit_revision_delete AFTER DELETE ON storage_unit BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'storage_unit',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS market_history_revision_insert AFTER INSERT ON market_history BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'market_history',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS market_history_revision_update AFTER UPDATE ON market_history BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'market_history',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS market_history_revision_delete AFTER DELETE ON market_history BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'market_history',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS venue_order_revision_insert AFTER INSERT ON venue_order BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'venue_order',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS venue_order_revision_update AFTER UPDATE ON venue_order BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'venue_order',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS venue_order_revision_delete AFTER DELETE ON venue_order BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'venue_order',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
 -- The cross-venue listings page is keyset-paged over both books at once, so a cursor has to stop
 -- being valid when either book changes. Without these, a walk that only moved a listing between
 -- buckets bumped no revision at all, and a half-turned page kept paging a set that had moved.
-CREATE TRIGGER IF NOT EXISTS market_listing_revision_insert AFTER INSERT ON market_listing BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'market_listing',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS market_listing_revision_update AFTER UPDATE ON market_listing BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'market_listing',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS market_listing_revision_delete AFTER DELETE ON market_listing BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'market_listing',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS csfloat_listing_revision_insert AFTER INSERT ON csfloat_listing BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'csfloat_listing',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS csfloat_listing_revision_update AFTER UPDATE ON csfloat_listing BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'csfloat_listing',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS csfloat_listing_revision_delete AFTER DELETE ON csfloat_listing BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'csfloat_listing',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS event_revision_insert AFTER INSERT ON event BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'event',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS event_revision_update AFTER UPDATE ON event BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'event',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS event_revision_delete AFTER DELETE ON event BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'event',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS command_member_revision_insert AFTER INSERT ON command_member BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'command_member',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS command_member_revision_update AFTER UPDATE ON command_member BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'command_member',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS command_member_revision_delete AFTER DELETE ON command_member BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'command_member',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
 -- Trade observation and the ledger (requirements §3.7, §4.1, §4.2). Trade *actions* are
 -- deferred; these rows only ever record what was observed.
 CREATE TABLE IF NOT EXISTS trade_offer (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   offer_id TEXT NOT NULL,
   trade_id TEXT,
-  counterparty_id TEXT NOT NULL,
+  counterparty_steam_id64 TEXT NOT NULL,
   direction TEXT NOT NULL CHECK(direction IN ('SENT', 'RECEIVED')),
-  raw_state INTEGER NOT NULL,
-  status TEXT NOT NULL,
+  state_code INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (${sqlList(TRADE_OFFER_STATUSES)})),
   confirmation_method INTEGER,
   escrow_until TEXT,
   expires_at TEXT,
@@ -545,8 +512,8 @@ CREATE TABLE IF NOT EXISTS trade_status_event (
   event_key TEXT NOT NULL,
   offer_id TEXT,
   trade_id TEXT,
-  raw_state INTEGER NOT NULL,
-  status TEXT NOT NULL,
+  state_code INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (${sqlList(TRADE_STATUS_EVENT_STATUSES)})),
   occurred_at TEXT NOT NULL,
   observation_id INTEGER NOT NULL REFERENCES observation(id),
   PRIMARY KEY(account_id, event_key)
@@ -557,8 +524,8 @@ CREATE TABLE IF NOT EXISTS executed_trade (
   trade_id TEXT NOT NULL,
   offer_id TEXT,
   counterparty_steam_id64 TEXT NOT NULL,
-  raw_status INTEGER NOT NULL,
-  status TEXT NOT NULL,
+  status_code INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK(status IN (${sqlList(EXECUTED_TRADE_STATUSES)})),
   initiated_at TEXT NOT NULL,
   updated_at TEXT,
   settled_at TEXT,
@@ -589,17 +556,6 @@ CREATE TABLE IF NOT EXISTS trade_line (
   PRIMARY KEY(account_id, line_key)
 );
 
-CREATE TABLE IF NOT EXISTS observation_checkpoint (
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  surface TEXT NOT NULL,
-  scope_id TEXT NOT NULL DEFAULT '',
-  cursor_json TEXT NOT NULL,
-  covered_through TEXT,
-  observation_id INTEGER REFERENCES observation(id),
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY(account_id, surface, scope_id)
-);
-
 CREATE TABLE IF NOT EXISTS economic_event (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   source_key TEXT NOT NULL,
@@ -611,9 +567,6 @@ CREATE TABLE IF NOT EXISTS economic_event (
   fee_cents INTEGER,
   currency INTEGER,
   amount_basis TEXT NOT NULL CHECK(amount_basis IN ('EVIDENCED', 'UNKNOWN')),
-  attribution TEXT NOT NULL CHECK(attribution IN ('ATTRIBUTED', 'UNATTRIBUTED')),
-  local_id TEXT,
-  candidates_json TEXT NOT NULL DEFAULT '[]',
   order_id TEXT,
   trade_id TEXT,
   offer_id TEXT,
@@ -632,98 +585,14 @@ CREATE INDEX IF NOT EXISTS trade_offer_open ON trade_offer(account_id, status, o
 CREATE INDEX IF NOT EXISTS executed_trade_page ON executed_trade(account_id, initiated_at, trade_id);
 CREATE INDEX IF NOT EXISTS trade_line_trade ON trade_line(account_id, trade_id, side, line_key);
 CREATE INDEX IF NOT EXISTS trade_line_offer ON trade_line(account_id, offer_id, side, line_key);
-CREATE INDEX IF NOT EXISTS trade_line_asset ON trade_line(account_id, asset_id);
+-- A new holding asks for its receipt by the asset it became (holdings.upsertUnit).
+CREATE INDEX IF NOT EXISTS trade_line_new_asset ON trade_line(new_asset_id);
 -- An offer and the executed trade it became are one trade, joined on the trade id the offer carries
 -- (trades page, read/queries/trades.ts), and the history walk asks the same question per trade.
 CREATE INDEX IF NOT EXISTS trade_offer_trade ON trade_offer(account_id, trade_id);
 CREATE INDEX IF NOT EXISTS trade_status_event_offer ON trade_status_event(account_id, offer_id, occurred_at);
-CREATE TRIGGER IF NOT EXISTS trade_offer_revision_insert AFTER INSERT ON trade_offer BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'trade_offer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS trade_offer_revision_update AFTER UPDATE ON trade_offer BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'trade_offer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS trade_offer_revision_delete AFTER DELETE ON trade_offer BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'trade_offer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS executed_trade_revision_insert AFTER INSERT ON executed_trade BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'executed_trade',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS executed_trade_revision_update AFTER UPDATE ON executed_trade BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'executed_trade',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS executed_trade_revision_delete AFTER DELETE ON executed_trade BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'executed_trade',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS economic_event_revision_insert AFTER INSERT ON economic_event BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'economic_event',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS economic_event_revision_update AFTER UPDATE ON economic_event BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'economic_event',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS economic_event_revision_delete AFTER DELETE ON economic_event BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'economic_event',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
+CREATE INDEX IF NOT EXISTS trade_status_event_trade ON trade_status_event(account_id, trade_id, occurred_at);
 
-CREATE TABLE IF NOT EXISTS inventory_backup_item (
-  local_id TEXT PRIMARY KEY,
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  def_index INTEGER NOT NULL,
-  paint_index INTEGER,
-  paint_wear REAL,
-  paint_seed INTEGER,
-  quality INTEGER NOT NULL,
-  stable_key TEXT NOT NULL,
-  current_asset_id TEXT,
-  location TEXT NOT NULL CHECK(location IN ('MAIN', 'CASKET', 'MARKET', 'MISSING')),
-  casket_id TEXT,
-  tradable_after TEXT,
-  trade_protected_until TEXT,
-  first_seen_obs INTEGER NOT NULL REFERENCES observation(id),
-  last_seen_obs INTEGER NOT NULL REFERENCES observation(id),
-  location_obs INTEGER REFERENCES observation(id),
-  location_generation INTEGER,
-  row_generation INTEGER NOT NULL DEFAULT 0,
-  -- Appended by migrations, in ALTER order, mirroring item exactly: beginStaging copies with
-  -- SELECT *, which matches by position (migrations.test.ts).
-  kit TEXT NOT NULL DEFAULT '',
-  unit_kind TEXT NOT NULL DEFAULT 'individual',
-  group_key TEXT NOT NULL DEFAULT '',
-  quantity INTEGER NOT NULL DEFAULT 1,
-  reserved_command TEXT,
-  attributes_json TEXT NOT NULL DEFAULT '{}',
-  end_reason TEXT
-);
-
-CREATE TABLE IF NOT EXISTS account_trade_link (
-  account_id TEXT PRIMARY KEY REFERENCES account(id),
-  partner_account_id TEXT NOT NULL,
-  token TEXT NOT NULL,
-  observation_id INTEGER NOT NULL REFERENCES observation(id)
-);
-CREATE TABLE IF NOT EXISTS trade_inventory_item (
-  account_id TEXT NOT NULL REFERENCES account(id),
-  asset_id TEXT NOT NULL,
-  quantity INTEGER NOT NULL CHECK(quantity>0),
-  tradable INTEGER NOT NULL CHECK(tradable IN (0,1)),
-  name TEXT NOT NULL,
-  class_id TEXT NOT NULL,
-  instance_id TEXT NOT NULL,
-  observation_id INTEGER NOT NULL REFERENCES observation(id),
-  -- Appended by migration 25. Steam's own answer to "can this be sold on the market at all",
-  -- which no GC attribute gives (holdings plan D7). NULL is unknown, never "no".
-  marketable INTEGER CHECK(marketable IN (0,1)),
-  PRIMARY KEY(account_id,asset_id)
-);
 CREATE TABLE IF NOT EXISTS transfer_hold (
   account_id TEXT NOT NULL REFERENCES account(id),
   destination_account_id TEXT NOT NULL REFERENCES account(id),
@@ -732,50 +601,7 @@ CREATE TABLE IF NOT EXISTS transfer_hold (
   observation_id INTEGER NOT NULL REFERENCES observation(id),
   PRIMARY KEY(account_id,destination_account_id)
 );
-CREATE TABLE IF NOT EXISTS transfer_batch (
-  command_id TEXT NOT NULL REFERENCES command(id),
-  account_id TEXT NOT NULL REFERENCES account(id),
-  destination_account_id TEXT NOT NULL REFERENCES account(id),
-  send_action_id TEXT NOT NULL UNIQUE REFERENCES action(id),
-  accept_action_id TEXT REFERENCES action(id),
-  cancel_action_id TEXT REFERENCES action(id),
-  offer_id TEXT,
-  state TEXT NOT NULL,
-  reason TEXT,
-  assets_json TEXT NOT NULL,
-  destination_baseline_json TEXT NOT NULL,
-  accepted_at TEXT,
-  accepted_obs INTEGER REFERENCES observation(id),
-  completed_source_obs INTEGER REFERENCES observation(id),
-  completed_destination_obs INTEGER REFERENCES observation(id),
-  retrieve_action_ids_json TEXT NOT NULL DEFAULT '[]',
-  PRIMARY KEY(command_id,account_id),
-  UNIQUE(account_id,offer_id),
-  CHECK(account_id<>destination_account_id)
-);
-CREATE INDEX IF NOT EXISTS transfer_batch_destination ON transfer_batch(destination_account_id,state);
-CREATE TRIGGER IF NOT EXISTS transfer_revision_insert AFTER INSERT ON transfer_batch BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'transfer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.destination_account_id,'transfer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS transfer_revision_update AFTER UPDATE ON transfer_batch BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'transfer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.destination_account_id,'transfer',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS trade_inventory_revision_insert AFTER INSERT ON trade_inventory_item BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'trade_inventory',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS trade_inventory_revision_delete AFTER DELETE ON trade_inventory_item BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (OLD.account_id,'trade_inventory',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-
-CREATE TABLE IF NOT EXISTS marketplace_connection (
+CREATE TABLE IF NOT EXISTS venue_connection (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   venue TEXT NOT NULL,
   remote_steam_id TEXT,
@@ -787,15 +613,14 @@ CREATE TABLE IF NOT EXISTS marketplace_connection (
   connected_at TEXT,
   checked_at TEXT,
   PRIMARY KEY(account_id, venue),
-  CHECK(status IN ('CONNECTED','CHECKING','INVALID_KEY','RESTRICTED','THROTTLED','UNAVAILABLE','DISCONNECTED'))
+  CHECK(status IN (${sqlList(VENUE_CONNECTION_STATUSES)}))
 );
-CREATE INDEX IF NOT EXISTS marketplace_connection_venue ON marketplace_connection(venue, status);
+CREATE INDEX IF NOT EXISTS venue_connection_venue ON venue_connection(venue, status);
 
 CREATE TABLE IF NOT EXISTS csfloat_account_status (
   account_id TEXT NOT NULL PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE,
-  observation_id INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
+  observation_id INTEGER NOT NULL REFERENCES observation(id),
   observed_at TEXT NOT NULL,
-  generation INTEGER NOT NULL,
   remote_steam_id TEXT NOT NULL,
   available_cents INTEGER,
   pending_cents INTEGER,
@@ -806,131 +631,32 @@ CREATE TABLE IF NOT EXISTS csfloat_account_status (
 -- about the key (CSF-29). restrictions_json is the venue's recent list, raw category and time.
 CREATE TABLE IF NOT EXISTS csfloat_account_standing (
   account_id TEXT NOT NULL PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE,
-  observation_id INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
+  observation_id INTEGER NOT NULL REFERENCES observation(id),
   observed_at TEXT NOT NULL,
-  generation INTEGER NOT NULL,
   standing TEXT NOT NULL,
   penalty_progress REAL,
   restrictions_json TEXT NOT NULL
 );
-CREATE TRIGGER IF NOT EXISTS marketplace_connection_revision AFTER UPDATE ON marketplace_connection BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'marketplace',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
-CREATE TRIGGER IF NOT EXISTS marketplace_connection_revision_insert AFTER INSERT ON marketplace_connection BEGIN
-  INSERT INTO read_revision(account_id,surface,revision) VALUES (NEW.account_id,'marketplace',1)
-  ON CONFLICT(account_id,surface) DO UPDATE SET revision=revision+1;
-END;
 
-CREATE TABLE IF NOT EXISTS csfloat_listing (
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  listing_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  type TEXT NOT NULL,
-  state TEXT NOT NULL,
-  price_cents INTEGER NOT NULL,
-  asset_id TEXT NOT NULL,
-  def_index INTEGER NOT NULL,
-  hash_name TEXT NOT NULL,
-  paint_index INTEGER,
-  paint_seed INTEGER,
-  paint_wear REAL,
-  quality INTEGER,
-  stattrak INTEGER,
-  tradable INTEGER,
-  created_at TEXT,
-  first_seen_obs INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
-  last_seen_obs INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
-  PRIMARY KEY(account_id, listing_id)
-);
-CREATE INDEX IF NOT EXISTS csfloat_listing_asset ON csfloat_listing(account_id, asset_id);
-CREATE INDEX IF NOT EXISTS csfloat_listing_state ON csfloat_listing(account_id, state);
-
-CREATE TABLE IF NOT EXISTS csfloat_buy_order (
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  order_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  hash_name TEXT NOT NULL,
-  price_cents INTEGER NOT NULL,
-  quantity INTEGER NOT NULL,
-  bought INTEGER,
-  properties_json TEXT,
-  created_at TEXT,
-  first_seen_obs INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
-  last_seen_obs INTEGER NOT NULL REFERENCES observation(id) ON DELETE CASCADE,
-  PRIMARY KEY(account_id, order_id)
-);
-
-CREATE TABLE IF NOT EXISTS marketplace_policy (
-  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-  prevent_duplicates INTEGER NOT NULL DEFAULT 1 CHECK(prevent_duplicates IN (0,1)),
-  version INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS csfloat_inventory (
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  asset_id TEXT NOT NULL,
-  item_json TEXT NOT NULL,
-  observation_id INTEGER NOT NULL REFERENCES observation(id),
-  PRIMARY KEY(account_id,asset_id)
-);
-CREATE TABLE IF NOT EXISTS csfloat_contract (
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  listing_id TEXT NOT NULL,
-  asset_id TEXT NOT NULL,
-  local_id TEXT,
-  state TEXT NOT NULL,
-  price_cents INTEGER NOT NULL,
-  item_json TEXT NOT NULL,
-  type TEXT NOT NULL,
-  observation_id INTEGER NOT NULL REFERENCES observation(id),
-  PRIMARY KEY(account_id,listing_id)
-);
-CREATE INDEX IF NOT EXISTS csfloat_contract_asset ON csfloat_contract(account_id,asset_id,state);
-CREATE INDEX IF NOT EXISTS csfloat_contract_local ON csfloat_contract(account_id,local_id,state);
 CREATE TABLE IF NOT EXISTS csfloat_trade (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   trade_id TEXT NOT NULL,
   listing_id TEXT NOT NULL,
   asset_id TEXT NOT NULL,
   local_id TEXT,
-  state TEXT NOT NULL,
+  -- The venue's own word for the trade's state, as csfloat_order keeps a listing's (D14).
+  state_word TEXT NOT NULL,
   seller_steam_id TEXT NOT NULL,
   data_json TEXT NOT NULL,
   observation_id INTEGER NOT NULL REFERENCES observation(id),
+  -- The Steam offer the trade is carried by, as the venue reports it (§4.5).
+  offer_id TEXT,
   PRIMARY KEY(account_id,trade_id)
 );
-CREATE INDEX IF NOT EXISTS csfloat_trade_asset ON csfloat_trade(account_id,asset_id,state);
--- Which CSFloat trade a Steam offer carried. The expression must be spelled exactly as a query uses it.
-CREATE INDEX IF NOT EXISTS csfloat_trade_offer ON csfloat_trade(account_id,json_extract(data_json,'$.offerId'));
-CREATE TABLE IF NOT EXISTS csfloat_operation (
-  id TEXT PRIMARY KEY,
-  command_id TEXT NOT NULL,
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  local_id TEXT,
-  asset_id TEXT,
-  listing_id TEXT,
-  trade_id TEXT,
-  price_cents INTEGER,
-  generation INTEGER NOT NULL,
-  policy_version INTEGER NOT NULL,
-  state TEXT NOT NULL,
-  action_id TEXT REFERENCES action(id),
-  offer_id TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  error TEXT,
-  retrieve_action_id TEXT REFERENCES action(id),
-  loose_obs INTEGER REFERENCES observation(id),
-  visibility_deadline_at TEXT,
-  order_id TEXT,
-  quantity INTEGER
-);
-CREATE INDEX IF NOT EXISTS csfloat_operation_account ON csfloat_operation(account_id,state);
-CREATE INDEX IF NOT EXISTS csfloat_operation_item ON csfloat_operation(account_id,local_id,state);
-CREATE INDEX IF NOT EXISTS csfloat_operation_command ON csfloat_operation(command_id);
-CREATE TABLE IF NOT EXISTS marketplace_conflict (
+CREATE INDEX IF NOT EXISTS csfloat_trade_asset ON csfloat_trade(account_id,asset_id,state_word);
+-- Which CSFloat trade a Steam offer carried.
+CREATE INDEX IF NOT EXISTS csfloat_trade_offer ON csfloat_trade(account_id,offer_id);
+CREATE TABLE IF NOT EXISTS venue_conflict (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
   conflict_key TEXT NOT NULL,
   reason TEXT NOT NULL,
@@ -946,7 +672,7 @@ CREATE TABLE IF NOT EXISTS store_price_sheet (
   currency_label TEXT NOT NULL,
   observed_at TEXT NOT NULL,
   entry_count INTEGER NOT NULL,
-  parse_state TEXT NOT NULL CHECK(parse_state IN ('PARSED', 'UNPARSEABLE'))
+  parse_state TEXT NOT NULL CHECK(parse_state IN (${sqlList(STORE_SHEET_PARSE_STATES)}))
 );
 CREATE TABLE IF NOT EXISTS store_price_entry (
   account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
@@ -956,38 +682,5 @@ CREATE TABLE IF NOT EXISTS store_price_entry (
   price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
   sale_price_cents INTEGER,
   PRIMARY KEY(account_id, entry_key)
-);
-CREATE TABLE IF NOT EXISTS store_purchase (
-  id TEXT PRIMARY KEY,
-  command_id TEXT NOT NULL,
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  state TEXT NOT NULL CHECK(state IN ('ADMITTED', 'INITIALISING', 'AWAITING_APPROVAL', 'FINALISING', 'AWAITING_OBSERVATION',
-    'COMPLETED', 'REJECTED', 'CANCELLING', 'CANCELLED', 'UNRESOLVED')),
-  currency INTEGER NOT NULL,
-  requested_total_cents INTEGER NOT NULL CHECK(requested_total_cents >= 0),
-  sheet_version INTEGER NOT NULL,
-  txn_id TEXT,
-  init_action_id TEXT REFERENCES action(id),
-  finalize_action_id TEXT REFERENCES action(id),
-  cancel_action_id TEXT REFERENCES action(id),
-  item_ids_json TEXT NOT NULL DEFAULT '[]',
-  resolved_by_obs INTEGER REFERENCES observation(id),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  error TEXT
-);
-CREATE INDEX IF NOT EXISTS store_purchase_account ON store_purchase(account_id, state, created_at);
-CREATE INDEX IF NOT EXISTS store_purchase_command ON store_purchase(command_id);
-CREATE TABLE IF NOT EXISTS store_purchase_line (
-  purchase_id TEXT NOT NULL REFERENCES store_purchase(id) ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
-  line_index INTEGER NOT NULL,
-  entry_key TEXT NOT NULL,
-  def_index INTEGER NOT NULL,
-  quantity INTEGER NOT NULL CHECK(quantity >= 1),
-  unit_price_cents INTEGER NOT NULL CHECK(unit_price_cents >= 0),
-  baseline_quantity INTEGER NOT NULL DEFAULT 0,
-  observed_quantity INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY(purchase_id, line_index)
 );
 `;

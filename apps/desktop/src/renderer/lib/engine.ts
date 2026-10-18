@@ -1,4 +1,5 @@
 import type { ChangeNotification, EngineCommand } from '../../shared/api.js';
+import type { CslyticsStatus } from '@cslytics/cslytics-account';
 import { RESPONSE_DEADLINE_MS, type QrState } from '../features/accounts/login-machine.js';
 import type {
   AccountConnection,
@@ -118,6 +119,12 @@ export const engine = {
   releaseStatus: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.status' }),
   checkForUpdate: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.check' }),
   installUpdate: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.install' }),
+  // The optional CSlytics sign-in, answered by main. Each answers with the account's status, never a token.
+  cslyticsStatus: () => invoke<CslyticsStatus>({ type: 'cslytics.status' }),
+  cslyticsSignIn: () => invoke<CslyticsStatus>({ type: 'cslytics.signIn' }),
+  cslyticsCancelSignIn: () => invoke<CslyticsStatus>({ type: 'cslytics.cancelSignIn' }),
+  cslyticsVerify: () => invoke<CslyticsStatus>({ type: 'cslytics.verify' }),
+  cslyticsSignOut: () => invoke<CslyticsStatus>({ type: 'cslytics.signOut' }),
   // This desktop's preferences, answered by main from `settings.json`.
   settings: () => invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.read' }),
   writeAppearance: (appearance: import('../../shared/api.js').AppearanceSettings) =>
@@ -125,6 +132,33 @@ export const engine = {
   /** What this desktop does with one account when it opens; answers with the settings as stored. */
   writeLaunch: (accountId: string, launch: import('../../shared/api.js').AccountLaunch) =>
     invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.launch', accountId, launch }),
+  /** The currency section whole: the base code and the account-pages toggle. */
+  writeCurrency: (currency: import('../../shared/api.js').CurrencySettings) =>
+    invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.currency', currency }),
+  // Prices, answered by main from its own cache (portfolio and pricing plan §3). The window
+  // formats these figures and computes none of them.
+  readValuation: (accountIds: readonly string[]) =>
+    invoke<import('../../shared/market.js').PortfolioValuation>({ type: 'portfolio.valuation', accountIds: [...accountIds] }),
+  marketStatus: () => invoke<import('@cslytics/market-data').SchedulerStatus>({ type: 'market.status' }),
+  marketFx: () => invoke<import('@cslytics/market-data').FxRates | null>({ type: 'market.fx' }),
+  portfolioHistory: (accountIds: readonly string[]) =>
+    invoke<import('../../shared/market.js').MarketHistoryRow[]>({ type: 'portfolio.history', accountIds: [...accountIds] }),
+  itemPage: (name: string, accountIds: readonly string[]) =>
+    invoke<import('../../shared/market.js').ItemPage>({ type: 'item.page', name, accountIds: [...accountIds] }),
+  /** The open item page's poll: asks for the name and returns the newest book held. */
+  itemWatch: (name: string) => invoke<import('@cslytics/market-data').StoredBook | null>({ type: 'item.watch', name }),
+  /** Steam's price series for a name; may wait on a fetch the first time, so the page asks it on its own. */
+  itemHistory: (name: string) => invoke<import('../../shared/market.js').ItemHistory>({ type: 'item.history', name }),
+  /** The published float curve for a name on Steam or CSFloat, or a recorded absence. */
+  itemCurve: (name: string, venue: 'steam' | 'csfloat' = 'steam') => invoke<import('../../shared/market.js').ItemCurve>({ type: 'item.curve', name, venue }),
+  /** The market names one item is sold under, each with the units the scope holds. */
+  itemVariants: (name: string, accountIds: readonly string[]) =>
+    invoke<import('../../shared/market.js').ItemVariants>({ type: 'item.variants', name, accountIds: [...accountIds] }),
+  /** The catalogue's item names for a typed text, held ones first when a scope is named. */
+  suggestItems: (text: string, accountIds?: readonly string[]) =>
+    invoke<{ items?: Array<{ name: string; category: string; image?: string | null; owned?: number }>; pending?: boolean }>(
+      { type: 'catalogue.suggest', text, limit: 1, ...(accountIds && accountIds.length > 0 ? { accountIds: [...accountIds] } : {}) }
+    ),
   beginQrLogin: () =>
     withDeadline(invoke<{ challengeUrl: string; sessionHandle: string; expiresAtMs: number }>(
       { type: 'auth.beginQr' }

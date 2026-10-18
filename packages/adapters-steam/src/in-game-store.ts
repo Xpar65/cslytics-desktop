@@ -46,10 +46,10 @@ export interface CheckoutHost {
 }
 
 /**
- * `purchase_type` on each line item. 1 is the working hypothesis the purchase probe confirms
- * or corrects `[H]`.
+ * `purchase_type` on each line item: 0, an ordinary purchase. An init carrying 1 was refused
+ * with `Fail` and no transaction (captured 2026-10-16, cslytics-app-docs/steam/in-game-store.md).
  */
-export const STORE_PURCHASE_TYPE = 1;
+export const STORE_PURCHASE_TYPE = 0;
 
 /**
  * The CS2 in-game store over the account's existing GC session.

@@ -5,7 +5,7 @@ for a moment in the top-right of the window, and it is kept behind the bell besi
 indicator until the user opens the bell. Adding a new one is one registry entry and one producer.
 
 This directory is the small, shipped core of the
-[notifications plan](../../../../../../cslytics-app-docs/plans/notifications-plan.md). The plan is the
+[notifications plan](../../../../../../cslytics-app-docs/plans/completed/notifications-plan.md). The plan is the
 fuller design; this README is what is actually in the tree and how to extend it.
 
 ## Vocabulary
@@ -102,7 +102,7 @@ error; at runtime the reducer throws with the fix in the message.
 Each of these is designed in the plan and was left out to keep the first cut legible. The plan
 section is where to start when one is wanted. Every fact the app already knows and could raise,
 ranked by what it costs not to, is the
-[notifications plan §12](../../../../../../cslytics-app-docs/plans/notifications-plan.md#12-what-to-hook-up-to-the-bell).
+[notifications plan §12](../../../../../../cslytics-app-docs/plans/completed/notifications-plan.md#12-what-to-hook-up-to-the-bell).
 
 | Not here | Plan |
 |---|---|

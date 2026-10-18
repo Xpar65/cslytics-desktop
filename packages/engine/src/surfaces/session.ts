@@ -15,7 +15,7 @@ import { BackoffLedger, BLOCKED_ELSEWHERE_RETRY_MS } from '../policy/backoff.js'
 import type { InventoryService } from './inventory.js';
 
 /** How often a supervised account has its local GC state re-read. Reaches no network. */
-const SUPERVISE_TICK_MS = 10_000;
+export const SUPERVISE_TICK_MS = 10_000;
 /** The backoff ledger key for reconnect attempts; not a surface, so it cannot collide. */
 const RECONNECT = 'session:reconnect';
 
@@ -86,6 +86,8 @@ export class SessionService {
   private readonly attempts = new Map<string, Attempt>();
   private readonly lastError = new Map<AccountId, string | null>();
   private readonly connecting = new Set<AccountId>();
+  /** Each account's connect in flight, settled once its Steam session and CS2 handshake have been tried. */
+  private readonly handshakes = new Map<AccountId, Promise<void>>();
   private readonly everConnected = new Set<AccountId>();
   /** Accounts a supervisor loop is watching, and the last GC state each was seen in. */
   private readonly supervised = new Map<AccountId, { stop: boolean; lastState: GcConnectionState | null }>();
@@ -123,6 +125,15 @@ export class SessionService {
    * reconnected. False for an account that was only ever signed in to Steam — on purpose, or
    * because the Game Coordinator refused it — which is a thing nobody is fixing on their own.
    */
+  /**
+   * The connect under way for this account, settled once its Steam session and its CS2 handshake
+   * have been tried, whatever came of them; undefined when none is. Bounded by the handshake's own
+   * timeout, so a caller may simply wait for it.
+   */
+  handshake(accountId: AccountId): Promise<void> | undefined {
+    return this.handshakes.get(accountId);
+  }
+
   supervises(accountId: AccountId): boolean {
     return this.supervised.has(accountId);
   }
@@ -268,6 +279,9 @@ export class SessionService {
     // An explicit connect withdraws a previous sign-out; the supervisor may resume from here.
     this.signedOut.delete(accountId);
     this.connecting.add(accountId);
+    let handshakeTried!: () => void;
+    const handshake = new Promise<void>((resolve) => { handshakeTried = resolve; });
+    this.handshakes.set(accountId, handshake);
     try {
       try {
         if (await this.context.ports.auth.hasStoredCredential(accountId)) {
@@ -291,6 +305,8 @@ export class SessionService {
       } catch { /* no Steam session to keep current */ }
     } finally {
       this.connecting.delete(accountId);
+      if (this.handshakes.get(accountId) === handshake) this.handshakes.delete(accountId);
+      handshakeTried();
     }
     const report = await this.connection(accountId);
     if (report.phase === 'CONNECTED') {
@@ -382,11 +398,7 @@ export class SessionService {
    * (rule 1). A timeout or empty answer records an incomplete observation and also
    * leaves the previous row alone.
    */
-  syncPersona(accountId: AccountId): Promise<number> {
-    return this.context.reads.run(`${accountId}:steam-persona`, () => this.readPersona(accountId));
-  }
-
-  private async readPersona(accountId: AccountId): Promise<number> {
+  async syncPersona(accountId: AccountId): Promise<number> {
     const { database } = this.context;
     const startedAt = this.context.now();
     const account = database.account(accountId);

@@ -69,9 +69,20 @@ export const light: Theme = {
     '--wear-bs': '#D04E4A',
 
     '--cs-hold-wallet': '#4C7FE6',
+    '--cs-hold-csfloat': '#E07B39',
+    '--cs-hold-inventory': '#5E9E58',
     '--cs-hold-listed': '#2F9E8C',
     '--cs-hold-unconfirmed': '#9A6DD6',
     '--cs-hold-hatch': 'rgba(255, 255, 255, 0.55)',
+
+    '--cs-series-1': '#4C7FE6',
+    '--cs-series-2': '#2F9E8C',
+    '--cs-series-3': '#9A6DD6',
+    '--cs-series-4': '#E07B39',
+    '--cs-series-5': '#B39A5E',
+    '--cs-series-6': '#D04E4A',
+    '--cs-series-7': '#0EA5E9',
+    '--cs-series-8': '#7A8699',
 
     '--cs-avatar-bg-sl': '42% 88%',
     '--cs-avatar-ring-sl': '32% 74%',

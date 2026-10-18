@@ -1,6 +1,6 @@
 {
   "name": "@cslytics/desktop",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "./out/main/index.js",
@@ -22,7 +22,9 @@
     "@cslytics/adapters-csfloat": "workspace:*",
     "@cslytics/adapters-steam": "workspace:*",
     "@cslytics/catalogue": "workspace:*",
+    "@cslytics/cslytics-account": "workspace:*",
     "@cslytics/engine": "workspace:*",
+    "@cslytics/market-data": "workspace:*",
     "@cslytics/ports": "workspace:*",
     "@types/qrcode": "^1.5.5",
     "@types/react": "^19.1.12",

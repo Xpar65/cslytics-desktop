@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import type { AccountConnection, AccountHoldings } from '../../lib/types.js';
 import { describeConnection, type ConnectionTone } from '../../lib/connection.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { freshness, heldCounts } from '../../lib/portfolio.js';
 import type { Tone } from '../../lib/labels.js';
 import { Avatar } from '../../components/Avatar.js';
@@ -159,10 +159,14 @@ function AccountCardView({
       {holding ? (
         <div className="account-card-stats">
           <div className="account-card-stat">
-            <div className="account-card-stat-label">Wallet</div>
+            <div className="account-card-stat-label">Steam wallet</div>
             <div className="account-card-stat-value" data-tone={age.tone} title={holding.wallet ? `observed ${age.label}` : undefined}>
-              {formatCents(holding.wallet?.balanceCents ?? null, holding.currency)}
+              {formatAmount(holding.wallet?.balanceCents ?? null, holding.currency)}
             </div>
+            {/* A second venue's balance, under the first and never added to it: it is another currency's money. */}
+            {holding.csfloatWallet ? (
+              <div className="account-card-stat-sub">CSFloat {formatAmount(holding.csfloatWallet.availableCents, holding.csfloatWallet.currency)}</div>
+            ) : null}
           </div>
           <div className="account-card-stat">
             <div className="account-card-stat-label">Items</div>

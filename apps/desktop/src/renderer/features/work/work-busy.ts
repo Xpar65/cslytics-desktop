@@ -11,12 +11,28 @@
 // left, so it is as free as a rejected member's.
 const TERMINAL: ReadonlySet<string> = new Set(['COMPLETE', 'DONE', 'REJECTED', 'FAILED', 'BLOCKED', 'STOPPED', 'REFUSED']);
 
+/**
+ * Member states in which the app has nothing to do but wait: for Steam to show a send, for a phone,
+ * for the other account, for the marketplace to see a retrieve. The indicator shows the hourglass
+ * for these, and the arrow only for a member it is moving.
+ */
+export const WAITING_STATES: ReadonlySet<string> = new Set([
+  'AWAITING_OBSERVATION', 'RETRYING', 'AWAITING_CONFIRMATION', 'AWAITING_VENUE', 'ACTIVE', 'ESCROW', 'AWAITING_DELIVERY', 'AWAITING_BUYER', 'AWAITING_VERIFICATION'
+]);
+
 export type BusyWorkRow = {
   accountId: string;
   memberState: string;
   localId?: string | null;
   stackKey?: string | null;
 };
+
+/**
+ * Member states with a hop not yet sent, which is all Stop can halt: queued, held on a reason, not
+ * yet prepared, or retrieving ahead of a hop still queued. A member whose hops are all out (a
+ * transfer waiting on the phone, a store waiting for its walk) has nothing for Stop to take back.
+ */
+export const UNSENT_STATES: ReadonlySet<string> = new Set(['PREPARED', 'QUEUED', 'BLOCKED', 'RETRIEVING']);
 
 export function isOpenWork(row: Pick<BusyWorkRow, 'memberState'>): boolean {
   return !TERMINAL.has(row.memberState);

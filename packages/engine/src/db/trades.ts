@@ -1,8 +1,9 @@
 import type { EngineDatabase } from './database.js';
+import { OPEN_STEP_STATES_SQL } from './work.js';
 
 export type TradeOfferRow = {
-  account_id: string; offer_id: string; trade_id: string | null; counterparty_id: string;
-  direction: 'SENT' | 'RECEIVED'; raw_state: number; status: string; confirmation_method: number | null;
+  account_id: string; offer_id: string; trade_id: string | null; counterparty_steam_id64: string;
+  direction: 'SENT' | 'RECEIVED'; state_code: number; status: string; confirmation_method: number | null;
   escrow_until: string | null; expires_at: string | null; created_at: string; updated_at: string;
   first_seen_obs: number; last_seen_obs: number;
   /** Steam's `settlement_date`: for a trade-protected trade, when its reversal period ends. */
@@ -11,7 +12,7 @@ export type TradeOfferRow = {
 
 export type ExecutedTradeRow = {
   account_id: string; trade_id: string; offer_id: string | null; counterparty_steam_id64: string;
-  raw_status: number; status: string; initiated_at: string; updated_at: string | null;
+  status_code: number; status: string; initiated_at: string; updated_at: string | null;
   settled_at: string | null; reverses_trade_id: string | null; first_seen_obs: number; last_seen_obs: number;
 };
 
@@ -38,62 +39,64 @@ export class TradeStore {
    * (TRD-05, DATA-02) while a genuine change always gets one.
    */
   upsertTradeOffer(row: Omit<TradeOfferRow, 'first_seen_obs' | 'last_seen_obs' | 'settlement_date'> & { observation_id: number; settlement_date?: string | null }): { changed: boolean } {
-    const previous = this.db.raw().prepare(`SELECT raw_state, updated_at FROM trade_offer WHERE account_id=? AND offer_id=?`)
-      .get(row.account_id, row.offer_id) as { raw_state: number; updated_at: string } | undefined;
+    const previous = this.db.raw().prepare(`SELECT state_code, updated_at FROM trade_offer WHERE account_id=? AND offer_id=?`)
+      .get(row.account_id, row.offer_id) as { state_code: number; updated_at: string } | undefined;
     this.db.raw().prepare(`
-      INSERT INTO trade_offer(account_id, offer_id, trade_id, counterparty_id, direction, raw_state, status,
+      INSERT INTO trade_offer(account_id, offer_id, trade_id, counterparty_steam_id64, direction, state_code, status,
         confirmation_method, escrow_until, expires_at, created_at, updated_at, first_seen_obs, last_seen_obs, settlement_date)
-      VALUES (@account, @offer, @trade, @counterparty, @direction, @rawState, @status,
+      VALUES (@account, @offer, @trade, @counterparty, @direction, @stateCode, @status,
         @confirmation, @escrow, @expires, @created, @updated, @obs, @obs, @settlement)
       ON CONFLICT(account_id, offer_id) DO UPDATE SET
-        trade_id=COALESCE(excluded.trade_id, trade_offer.trade_id), counterparty_id=excluded.counterparty_id,
-        direction=excluded.direction, raw_state=excluded.raw_state, status=excluded.status,
+        trade_id=COALESCE(excluded.trade_id, trade_offer.trade_id), counterparty_steam_id64=excluded.counterparty_steam_id64,
+        direction=excluded.direction, state_code=excluded.state_code, status=excluded.status,
         confirmation_method=excluded.confirmation_method, escrow_until=excluded.escrow_until,
         expires_at=excluded.expires_at, updated_at=excluded.updated_at, last_seen_obs=excluded.last_seen_obs,
         settlement_date=COALESCE(excluded.settlement_date, trade_offer.settlement_date)
     `).run({
-      account: row.account_id, offer: row.offer_id, trade: row.trade_id, counterparty: row.counterparty_id,
-      direction: row.direction, rawState: row.raw_state, status: row.status,
+      account: row.account_id, offer: row.offer_id, trade: row.trade_id, counterparty: row.counterparty_steam_id64,
+      direction: row.direction, stateCode: row.state_code, status: row.status,
       confirmation: row.confirmation_method, escrow: row.escrow_until, expires: row.expires_at,
       created: row.created_at, updated: row.updated_at, obs: row.observation_id, settlement: row.settlement_date ?? null
     });
-    const changed = !previous || previous.raw_state !== row.raw_state || previous.updated_at !== row.updated_at;
+    this.db.touch(row.account_id, 'trade_offer');
+    const changed = !previous || previous.state_code !== row.state_code || previous.updated_at !== row.updated_at;
     if (changed) {
       this.db.raw().prepare(`
-        INSERT INTO trade_status_event(account_id, event_key, offer_id, trade_id, raw_state, status, occurred_at, observation_id)
+        INSERT INTO trade_status_event(account_id, event_key, offer_id, trade_id, state_code, status, occurred_at, observation_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_id, event_key) DO NOTHING
-      `).run(row.account_id, `offer:${row.offer_id}:${row.raw_state}:${row.updated_at}`, row.offer_id, row.trade_id,
-        row.raw_state, row.status, row.updated_at, row.observation_id);
+      `).run(row.account_id, `offer:${row.offer_id}:${row.state_code}:${row.updated_at}`, row.offer_id, row.trade_id,
+        row.state_code, row.status, row.updated_at, row.observation_id);
     }
     return { changed };
   }
 
   /** Same shape for an executed trade: the row, plus one journal entry per observed status. */
   upsertExecutedTrade(row: Omit<ExecutedTradeRow, 'first_seen_obs' | 'last_seen_obs'> & { observation_id: number }): { changed: boolean } {
-    const previous = this.db.raw().prepare(`SELECT raw_status FROM executed_trade WHERE account_id=? AND trade_id=?`)
-      .get(row.account_id, row.trade_id) as { raw_status: number } | undefined;
+    const previous = this.db.raw().prepare(`SELECT status_code FROM executed_trade WHERE account_id=? AND trade_id=?`)
+      .get(row.account_id, row.trade_id) as { status_code: number } | undefined;
     this.db.raw().prepare(`
-      INSERT INTO executed_trade(account_id, trade_id, offer_id, counterparty_steam_id64, raw_status, status,
+      INSERT INTO executed_trade(account_id, trade_id, offer_id, counterparty_steam_id64, status_code, status,
         initiated_at, updated_at, settled_at, reverses_trade_id, first_seen_obs, last_seen_obs)
-      VALUES (@account, @trade, @offer, @counterparty, @rawStatus, @status, @initiated, @updated, @settled, @reverses, @obs, @obs)
+      VALUES (@account, @trade, @offer, @counterparty, @statusCode, @status, @initiated, @updated, @settled, @reverses, @obs, @obs)
       ON CONFLICT(account_id, trade_id) DO UPDATE SET
-        offer_id=COALESCE(excluded.offer_id, executed_trade.offer_id), raw_status=excluded.raw_status,
+        offer_id=COALESCE(excluded.offer_id, executed_trade.offer_id), status_code=excluded.status_code,
         status=excluded.status, updated_at=COALESCE(excluded.updated_at, executed_trade.updated_at),
         settled_at=COALESCE(excluded.settled_at, executed_trade.settled_at),
         reverses_trade_id=COALESCE(excluded.reverses_trade_id, executed_trade.reverses_trade_id),
         last_seen_obs=excluded.last_seen_obs
     `).run({
       account: row.account_id, trade: row.trade_id, offer: row.offer_id, counterparty: row.counterparty_steam_id64,
-      rawStatus: row.raw_status, status: row.status, initiated: row.initiated_at, updated: row.updated_at,
+      statusCode: row.status_code, status: row.status, initiated: row.initiated_at, updated: row.updated_at,
       settled: row.settled_at, reverses: row.reverses_trade_id, obs: row.observation_id
     });
-    const changed = !previous || previous.raw_status !== row.raw_status;
+    this.db.touch(row.account_id, 'executed_trade');
+    const changed = !previous || previous.status_code !== row.status_code;
     if (changed) {
       this.db.raw().prepare(`
-        INSERT INTO trade_status_event(account_id, event_key, offer_id, trade_id, raw_state, status, occurred_at, observation_id)
+        INSERT INTO trade_status_event(account_id, event_key, offer_id, trade_id, state_code, status, occurred_at, observation_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_id, event_key) DO NOTHING
-      `).run(row.account_id, `trade:${row.trade_id}:${row.raw_status}`, row.offer_id, row.trade_id,
-        row.raw_status, row.status, row.updated_at ?? row.initiated_at, row.observation_id);
+      `).run(row.account_id, `trade:${row.trade_id}:${row.status_code}`, row.offer_id, row.trade_id,
+        row.status_code, row.status, row.updated_at ?? row.initiated_at, row.observation_id);
     }
     return { changed };
   }
@@ -166,14 +169,14 @@ export class TradeStore {
       SELECT line.asset_id, offer.offer_id, offer.status FROM trade_line line
       JOIN trade_offer offer ON offer.account_id=line.account_id AND offer.offer_id=line.offer_id
       WHERE line.account_id=? AND line.side='GIVE' AND offer.status IN (${openStatuses.map(() => '?').join(',')})
-      AND NOT EXISTS (SELECT 1 FROM transfer_batch b WHERE b.account_id=offer.account_id AND b.offer_id=offer.offer_id AND b.state='DONE')
+      AND NOT EXISTS (SELECT 1 FROM work_step s WHERE s.account_id=offer.account_id AND s.kind='SEND' AND s.offer_id=offer.offer_id AND s.state='DONE')
     `).all(accountId, ...openStatuses) as Array<{ asset_id: string; offer_id: string; status: string }>;
     // Before Steam supplies an offer id, the durable command is the pledge. An ambiguous
     // send must still exclude these assets from every other mutation, including after restart.
-    const pending = this.db.raw().prepare(`SELECT json_extract(asset.value,'$.assetId') AS asset_id,
-      'command:' || batch.command_id AS offer_id, batch.state AS status
-      FROM transfer_batch batch, json_each(batch.assets_json) asset
-      WHERE batch.account_id=? AND batch.state NOT IN ('DONE','ENDED','FAILED')`).all(accountId) as typeof observed;
+    const pending = this.db.raw().prepare(`SELECT json_extract(m.input_json,'$.assetId') AS asset_id,
+      'command:' || s.command_id AS offer_id, s.state AS status
+      FROM work_step s JOIN command_member m ON m.command_id=s.command_id AND m.account_id=s.account_id
+      WHERE s.account_id=? AND s.kind='SEND' AND s.state IN ${OPEN_STEP_STATES_SQL}`).all(accountId) as typeof observed;
     return [...observed,...pending];
   }
 }

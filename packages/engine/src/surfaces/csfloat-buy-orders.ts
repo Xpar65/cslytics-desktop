@@ -2,6 +2,7 @@ import type { AccountId, CsfloatBuyOrder, CsfloatReadResult } from '@cslytics/po
 import { CSFLOAT_VENUE, MarketplaceStore } from '../db/marketplace.js';
 import type { EngineContext } from '../kernel/context.js';
 import { errorMessage } from '../kernel/support.js';
+import { CsfloatStore } from '../db/csfloat.js';
 
 export const CSFLOAT_BUY_ORDER_SURFACE = 'csfloat-buy-orders';
 /** Rows asked for per page. The route's default is 50; a smaller page is a slower walk, not a different book. */
@@ -48,7 +49,7 @@ export class CsfloatBuyOrderService {
   }
 
   sync(accountId: AccountId): Promise<BuyOrderBookSyncResult> {
-    return this.context.reads.run(`${accountId}:${CSFLOAT_BUY_ORDER_SURFACE}`, () => this.walk(accountId));
+    return this.walk(accountId);
   }
 
   protected async walk(accountId: AccountId): Promise<BuyOrderBookSyncResult> {
@@ -119,23 +120,9 @@ export class CsfloatBuyOrderService {
         accountId, surface: CSFLOAT_BUY_ORDER_SURFACE, generation, startedAt,
         finishedAt: this.context.now(), complete: true, pagesWalked: pages, totalExpected: count
       });
-      const upsert = database.raw().prepare(`
-        INSERT INTO csfloat_buy_order(account_id, order_id, generation, hash_name, price_cents, quantity, bought,
-          properties_json, created_at, first_seen_obs, last_seen_obs)
-        VALUES (@account, @order, @generation, @hash, @price, @quantity, @bought, @properties, @createdAt, @obs, @obs)
-        ON CONFLICT(account_id, order_id) DO UPDATE SET generation=excluded.generation, hash_name=excluded.hash_name,
-          price_cents=excluded.price_cents, quantity=excluded.quantity, bought=excluded.bought,
-          properties_json=excluded.properties_json, created_at=excluded.created_at, last_seen_obs=excluded.last_seen_obs
-      `);
-      for (const order of orders) {
-        upsert.run({
-          account: accountId, order: order.orderId, generation, hash: order.marketHashName, price: order.priceCents,
-          quantity: order.quantity, bought: order.bought, properties: order.properties === null ? null : JSON.stringify(order.properties),
-          createdAt: order.createdAt || null, obs: id
-        });
-      }
-      // Only a complete walk may conclude absence, and this one statement is how it does.
-      database.raw().prepare('DELETE FROM csfloat_buy_order WHERE account_id=? AND last_seen_obs<>?').run(accountId, id);
+      // Only a complete walk may conclude absence, and this one write is how it does: every order
+      // shown is on the book, every order not shown is gone and ended on what the book said.
+      new CsfloatStore(database).observeBuyOrders(accountId, id, orders, this.context.now());
       return id;
     });
     this.context.signals.emit({ kind: 'observed', accountId, surface: CSFLOAT_BUY_ORDER_SURFACE, complete: true, observationId });

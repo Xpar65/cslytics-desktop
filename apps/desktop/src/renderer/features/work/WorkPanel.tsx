@@ -1,18 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import type { StoragePageRow } from '@cslytics/engine';
-import { Badge, Button, Drawer, Empty, Segmented, Thumbnail } from '../../components/ui.js';
+import { Badge, Button, Drawer, Empty, ProgressBar, Segmented, Thumbnail } from '../../components/ui.js';
 import { Icon } from '../../components/Icon.js';
 import { VenueMark } from '../../components/VenueMark.js';
 import { WaitingList } from './Waiting.js';
 import { isOpenWork, useOutbox, type WorkRow } from './WorkIndicator.js';
+import { UNSENT_STATES } from './work-busy.js';
 import type { WaitingState } from './use-waiting.js';
-import { ACTION_DESTINATION, DESTINATION, VENUE_NAME, destinationOf, formatRelative, formatUsd, plural, retryPhrase, workStateLabel, type Destination } from '../../lib/labels.js';
+import { ACTION_DESTINATION, DESTINATION, VENUE_NAME, commandCounts, commandHeadline, destinationOf, formatRelative, formatUsd, plural, retryPhrase, tallyCommand, workStateLabel, type Destination } from '../../lib/labels.js';
 
 /** Which half of the drawer is showing. The app's work, or the person's. */
 export type WorkTab = 'work' | 'waiting';
 
 /** Work the engine reports under a bare action's kind: there is no command for Stop to halt. */
-const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'CREATE_BUY_ORDER', 'CANCEL_BUY_ORDER']);
+const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL']);
 
 /**
  * Everything queued, in flight and waiting to be observed — and, beside it, everything waiting
@@ -25,6 +26,11 @@ const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'CREATE_BUY_ORDER', 
  *
  * Grouped by command, newest first, because a command is what a person pressed: "Storing 3 items"
  * is the unit they remember, and three separate rows saying "Storing" is the same fact told badly.
+ *
+ * **The headline counts what is confirmed.** "Storing 968 items" while nothing is, "Stored 567 of 968
+ * items · 401 failed" once a walk has proved some and the rest have settled, and the failures' reason
+ * once above the rows when they share one. A batch that has stopped for good must not read as still
+ * going (`commandHeadline`).
  *
  * Every state is shown in observation-honest words (`WORK_STATE`). The one that matters is
  * *Sent, waiting for Steam to show it*: it is the state a less careful panel would call "Done",
@@ -140,21 +146,28 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
         const first = members[0]!;
         const kind = DESTINATION[first.commandKind] ?? { icon: 'package' as const, verb: 'Working on' };
         const quantity = members.reduce((sum, member) => sum + member.quantity, 0);
-        // Stop halts a command's unsent members. A CSFloat operation, a delist asked for by hand, a
-        // Steam buy-order action and a send still in the outbox have no command behind them, so
-        // there is nothing for it to stop.
-        const stoppable = !first.outbox && members.some(isOpenWork) && !first.commandKind.startsWith('CSFLOAT_') && !COMMANDLESS.has(first.commandKind);
+        const tally = tallyCommand(members);
+        const counts = first.outbox ? [] : commandCounts(tally);
+        // Said once above the rows when every failure has it; each row then shows only a different one.
+        const sharedReason = !first.outbox && tally.failed > 1 ? tally.sharedReason : null;
+        // Stop halts a command's unsent members, so it is offered only while one is unsent: a
+        // transfer already waiting on the phone has nothing left to remove. A CSFloat operation, a
+        // delist asked for by hand, a Steam buy-order action and a send still in the outbox have no
+        // command behind them, so there is nothing for it to stop.
+        const stoppable = !first.outbox && members.some((member) => UNSENT_STATES.has(member.memberState)) && !first.commandKind.startsWith('CSFLOAT_') && !COMMANDLESS.has(first.commandKind);
         const dismissable = first.outbox && first.memberState === 'REFUSED';
         return (
           <section className="work-command" key={commandId}>
             <header className="work-command-head">
               <span className="panel-icon"><Icon name={kind.icon} size={14} /></span>
               <span className="grow">
-                <span className="work-command-title">{kind.verb} {plural(quantity, kind.noun ?? 'item')}<Venue of={kind} /></span>
+                <span className="work-command-title">{first.outbox ? `${kind.verb} ${plural(quantity, kind.noun ?? 'item')}` : commandHeadline(kind, tally)}<Venue of={kind} /></span>
                 <span className="work-command-meta quiet">
                   {formatRelative(first.submittedAt)}
                   {accountIds.length > 1 ? <> · {first.accountId}</> : null}
+                  {counts.map((part) => <React.Fragment key={part}> · {part}</React.Fragment>)}
                 </span>
+                {sharedReason ? <span className="work-command-reason caption" data-tone="warn">{sharedReason}</span> : null}
               </span>
               {stoppable ? (
                 <Button size="sm" variant="ghost" icon="pause" loading={stopping === commandId} onClick={() => void stop(commandId)}>Remove all queued</Button>
@@ -163,6 +176,9 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
                 <Button size="sm" variant="ghost" icon="x" onClick={() => outbox.dismiss(commandId)}>Dismiss</Button>
               ) : null}
             </header>
+            {!first.outbox && tally.total > 1 ? (
+              <ProgressBar value={tally.confirmed} max={tally.total} tone={tally.open > 0 ? 'accent' : 'positive'} label={`${tally.confirmed} of ${tally.total} confirmed`} />
+            ) : null}
             {members.map((member) => {
               const hop = destinationOf(member.commandKind, member.actionKind);
               // The command's marketplace when the hop has none: a CSFloat listing waiting on its
@@ -189,12 +205,13 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
                       </span>
                     ) : (
                       <span className="work-row-meta quiet">
-                        {hop.verb}<Venue of={hop} />
+                        {/* A confirmed row says what happened, not what was under way: "Stored · into Storage Unit 1". */}
+                        {member.memberState === 'COMPLETE' ? hop.done ?? hop.verb : hop.verb}<Venue of={hop} />
                         {member.destinationCasketId ? <> · into {unitLabel(member.accountId, member.destinationCasketId)}</> : null}
                         {member.priceReceiveCents !== null ? <> · {formatUsd(member.priceReceiveCents)}</> : null}
                       </span>
                     )}
-                    {member.reason && (member.memberState === 'BLOCKED' || member.memberState === 'FAILED' || member.memberState === 'REFUSED') ? (
+                    {member.reason && member.reason !== sharedReason && (member.memberState === 'BLOCKED' || member.memberState === 'FAILED' || member.memberState === 'REFUSED') ? (
                       // The engine's reason, verbatim. A refusal the panel shows as a bare badge is
                       // a recorded reason no read returns, which OP-08 says does not count.
                       <span className="work-row-meta caption" data-tone="warn">{member.reason}</span>

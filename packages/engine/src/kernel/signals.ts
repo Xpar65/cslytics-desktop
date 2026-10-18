@@ -42,8 +42,8 @@ export type EngineSignal =
   | { kind: 'gc-item'; accountId: AccountId; change: 'added' | 'updated' | 'removed'; casketId?: string }
   /** The CS2 Game Coordinator session changed state for this account. */
   | { kind: 'gc-session'; accountId: AccountId; state: GcConnectionState; detail?: string }
-  /** One external mutation returned. The outcome is about the *attempt*, never the effect. */
-  | { kind: 'mutation-settled'; accountId: AccountId; actionKind: string; outcome: MutationOutcome['kind'] }
+  /** One external mutation returned. The outcome is about the *attempt*, never the effect. `targetId` is the action's target. */
+  | { kind: 'mutation-settled'; accountId: AccountId; actionKind: string; outcome: MutationOutcome['kind']; targetId?: string }
   /** An order's observed lifecycle state moved — a sale, a fill, a cancellation, a hold. */
   | { kind: 'order-changed'; accountId: AccountId; side: 'SELL' | 'BUY'; state: string };
 

@@ -1,12 +1,30 @@
 import type { EngineDatabase } from './database.js';
+import { WorkStore, isSettled, type StoreLineRow, type WorkStepRow } from './work.js';
 
 /**
- * The in-game store's rows: the last parsed price sheet per account, and each purchase with
- * its frozen lines. Every row is account-keyed (rule 8) and every price is integer minor units
+ * The in-game store's rows: the last parsed price sheet per account, and each purchase as the
+ * hops of its command (consolidation plan D2) with its frozen lines beside the first hop
+ * (`store_line`). Every row is account-keyed (rule 8) and every price is integer minor units
  * in the account's own wallet currency; the sheet's other 36 currencies are not stored, because
  * a price in a currency this account cannot pay in is not a fact a purchase can use.
  */
 
+/** The command kind of a purchase; its id is the purchase's id. */
+export const STORE_PURCHASE = 'STORE_PURCHASE';
+
+/** The hops of a purchase, in the order they are reached; a cancel is appended when asked for. */
+export const STORE_HOPS = ['STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL'] as const;
+export type StoreHop = (typeof STORE_HOPS)[number];
+
+/** The id of one hop of a purchase. */
+export function storeHopId(purchaseId: string, hop: StoreHop): string {
+  return `${purchaseId}:${hop}`;
+}
+
+/**
+ * A purchase's state in its own words, read from its hops: what the person sees and what
+ * `InGameStoreService.advance` dispatches on. Derived, never stored (`InGameStoreStore.purchase`).
+ */
 export type StorePurchaseState =
   | 'ADMITTED' | 'INITIALISING' | 'AWAITING_APPROVAL' | 'FINALISING' | 'AWAITING_OBSERVATION'
   | 'COMPLETED' | 'REJECTED' | 'CANCELLING' | 'CANCELLED' | 'UNRESOLVED';
@@ -24,6 +42,13 @@ export type StoreEntryRow = {
   account_id: string; entry_key: string; version: number; category_tags: string; price_cents: number; sale_price_cents: number | null;
 };
 
+/** The frozen terms of a purchase, on its first hop; `txnId` is that hop's `target_id` once Steam names one. */
+export type StorePurchaseParams = { purchaseId: string; currency: number; requestedTotalCents: number; sheetVersion: number; hashName: string };
+
+/**
+ * One purchase as one thing: its id is its command's, its hops' actions are named so the crash
+ * matrix and the saboteurs can reach them, and `state` is the reading of the hops.
+ */
 export type StorePurchaseRow = {
   id: string; command_id: string; account_id: string; state: StorePurchaseState; currency: number;
   requested_total_cents: number; sheet_version: number; txn_id: string | null;
@@ -31,10 +56,7 @@ export type StorePurchaseRow = {
   item_ids_json: string; resolved_by_obs: number | null; created_at: string; updated_at: string; error: string | null;
 };
 
-export type StorePurchaseLineRow = {
-  purchase_id: string; account_id: string; line_index: number; entry_key: string; def_index: number;
-  quantity: number; unit_price_cents: number; baseline_quantity: number; observed_quantity: number;
-};
+export type StorePurchaseLineRow = StoreLineRow;
 
 export type StoreSheetPublication = {
   observationId: number;
@@ -46,7 +68,8 @@ export type StoreSheetPublication = {
 };
 
 export class InGameStoreStore {
-  constructor(readonly db: EngineDatabase) {}
+  readonly work: WorkStore;
+  constructor(readonly db: EngineDatabase) { this.work = new WorkStore(db); }
 
   sheet(accountId: string): StoreSheetRow | undefined {
     return this.db.raw().prepare('SELECT * FROM store_price_sheet WHERE account_id=?').get(accountId) as StoreSheetRow | undefined;
@@ -88,50 +111,86 @@ export class InGameStoreStore {
       VALUES (?,?,0,0,'',?,0,'UNPARSEABLE')`).run(accountId, observationId, observedAt);
   }
 
+  // ---------------------------------------------------------------- purchases, read from their hops
+
+  hop(purchaseId: string, kind: StoreHop): WorkStepRow | undefined {
+    return this.work.step(storeHopId(purchaseId, kind));
+  }
+
   purchase(id: string): StorePurchaseRow | undefined {
-    return this.db.raw().prepare('SELECT * FROM store_purchase WHERE id=?').get(id) as StorePurchaseRow | undefined;
+    const init = this.hop(id, 'STORE_INIT');
+    if (!init) return undefined;
+    const command = this.db.command(id);
+    if (command?.kind !== STORE_PURCHASE) return undefined;
+    const approve = this.hop(id, 'STORE_APPROVE'), finalize = this.hop(id, 'STORE_FINALIZE'), cancel = this.hop(id, 'STORE_CANCEL');
+    const params = this.work.params<StorePurchaseParams>(init);
+    const itemIds = finalize ? (this.work.params<{ itemIds?: string[] } | null>(finalize)?.itemIds ?? []) : [];
+    const { state, error } = this.words(id, init, approve, finalize, cancel);
+    const hops = [init, approve, finalize, cancel].filter((hop): hop is WorkStepRow => hop !== undefined);
+    const settled = hops.find((hop) => hop.state === 'DONE' && hop.observation_id !== null);
+    return {
+      id, command_id: id, account_id: init.account_id, state, currency: params.currency, requested_total_cents: params.requestedTotalCents,
+      sheet_version: params.sheetVersion, txn_id: init.target_id, init_action_id: init.action_id, finalize_action_id: finalize?.action_id ?? null,
+      cancel_action_id: cancel?.action_id ?? null, item_ids_json: JSON.stringify(itemIds),
+      resolved_by_obs: state === 'COMPLETED' || state === 'CANCELLED' || state === 'REJECTED' ? (finalize?.observation_id ?? cancel?.observation_id ?? init.observation_id ?? settled?.observation_id ?? null) : null,
+      created_at: init.created_at, updated_at: hops.map((hop) => hop.updated_at).sort().at(-1)!, error
+    };
+  }
+
+  /**
+   * The reading. A finalize proved by the inventory is a completed purchase; a cancel proved by
+   * the inventory and the wallet is a cancelled one; a cancel in flight is cancelling; an init
+   * that failed is a refusal when its money came back and an unresolved purchase when it did
+   * not; any other failed hop is unresolved and waits for the person; otherwise the latest hop
+   * says where the purchase is.
+   */
+  private words(id: string, init: WorkStepRow, approve: WorkStepRow | undefined, finalize: WorkStepRow | undefined, cancel: WorkStepRow | undefined): { state: StorePurchaseState; error: string | null } {
+    if (finalize?.state === 'DONE') return { state: 'COMPLETED', error: null };
+    if (cancel?.state === 'DONE') return { state: 'CANCELLED', error: null };
+    if (cancel && !isSettled(cancel)) return { state: 'CANCELLING', error: cancel.reason };
+    if (init.state === 'FAILED') return { state: this.reservationState(id) === 'RELEASED' ? 'REJECTED' : 'UNRESOLVED', error: init.reason };
+    const failed = [cancel, finalize, approve].find((hop) => hop?.state === 'FAILED');
+    if (failed) return { state: 'UNRESOLVED', error: failed.reason };
+    if (finalize) {
+      if (finalize.state === 'AWAITING_OBSERVATION') return { state: 'AWAITING_OBSERVATION', error: finalize.reason };
+      return { state: finalize.reason && finalize.state === 'QUEUED' ? 'UNRESOLVED' : 'FINALISING', error: finalize.reason };
+    }
+    if (approve) {
+      if (approve.state === 'DONE') return { state: 'FINALISING', error: null };
+      return { state: 'AWAITING_APPROVAL', error: approve.reason };
+    }
+    if (init.state === 'QUEUED') return { state: init.reason ? 'UNRESOLVED' : 'ADMITTED', error: init.reason };
+    if (init.state === 'SENT') return { state: 'INITIALISING', error: null };
+    if (init.state === 'STOPPED') return { state: 'CANCELLED', error: init.reason };
+    return { state: 'AWAITING_OBSERVATION', error: init.reason };
   }
 
   purchases(accountId: string): StorePurchaseRow[] {
-    return this.db.raw().prepare('SELECT * FROM store_purchase WHERE account_id=? ORDER BY created_at,id').all(accountId) as StorePurchaseRow[];
+    const ids = this.db.raw().prepare(`SELECT c.id FROM command c JOIN work_step s ON s.id=c.id || ':STORE_INIT'
+      WHERE c.kind=? AND s.account_id=? ORDER BY c.created_at, c.id`).all(STORE_PURCHASE, accountId) as Array<{ id: string }>;
+    return ids.map((row) => this.purchase(row.id)).filter((row): row is StorePurchaseRow => row !== undefined);
   }
 
   purchasesByCommand(commandId: string): StorePurchaseRow[] {
-    return this.db.raw().prepare('SELECT * FROM store_purchase WHERE command_id=? ORDER BY id').all(commandId) as StorePurchaseRow[];
+    const row = this.purchase(commandId);
+    return row ? [row] : [];
   }
 
+  /** Purchases with a hop still open or failed and no verdict yet: what reconciliation looks at. */
   openPurchases(accountId: string): StorePurchaseRow[] {
-    const marks = STORE_PURCHASE_OPEN_STATES.map(() => '?').join(',');
-    return this.db.raw().prepare(`SELECT * FROM store_purchase WHERE account_id=? AND state IN (${marks}) ORDER BY created_at,id`)
-      .all(accountId, ...STORE_PURCHASE_OPEN_STATES) as StorePurchaseRow[];
+    const ids = this.db.raw().prepare(`SELECT DISTINCT s.command_id AS id FROM work_step s JOIN command c ON c.id=s.command_id
+      WHERE s.account_id=? AND c.kind=? AND s.state IN ('QUEUED','SENT','AWAITING_OBSERVATION','RETRYING','FAILED') ORDER BY s.created_at, s.command_id`)
+      .all(accountId, STORE_PURCHASE) as Array<{ id: string }>;
+    return ids.map((row) => this.purchase(row.id))
+      .filter((row): row is StorePurchaseRow => row !== undefined && (STORE_PURCHASE_OPEN_STATES as readonly string[]).includes(row.state));
   }
 
   lines(purchaseId: string): StorePurchaseLineRow[] {
-    return this.db.raw().prepare('SELECT * FROM store_purchase_line WHERE purchase_id=? ORDER BY line_index').all(purchaseId) as StorePurchaseLineRow[];
-  }
-
-  insertPurchase(row: Omit<StorePurchaseRow, 'updated_at'>): void {
-    this.db.raw().prepare(`INSERT INTO store_purchase(id,command_id,account_id,state,currency,requested_total_cents,sheet_version,txn_id,
-      init_action_id,finalize_action_id,cancel_action_id,item_ids_json,resolved_by_obs,created_at,updated_at,error)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(row.id, row.command_id, row.account_id, row.state, row.currency, row.requested_total_cents, row.sheet_version, row.txn_id,
-        row.init_action_id, row.finalize_action_id, row.cancel_action_id, row.item_ids_json, row.resolved_by_obs, row.created_at, row.created_at, row.error);
-  }
-
-  insertLine(row: StorePurchaseLineRow): void {
-    this.db.raw().prepare(`INSERT INTO store_purchase_line(purchase_id,account_id,line_index,entry_key,def_index,quantity,unit_price_cents,baseline_quantity,observed_quantity)
-      VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(row.purchase_id, row.account_id, row.line_index, row.entry_key, row.def_index, row.quantity, row.unit_price_cents, row.baseline_quantity, row.observed_quantity);
-  }
-
-  update(id: string, patch: Partial<Pick<StorePurchaseRow, 'state' | 'txn_id' | 'init_action_id' | 'finalize_action_id' | 'cancel_action_id' | 'item_ids_json' | 'resolved_by_obs' | 'error'>>, now: string): void {
-    const columns = Object.keys(patch) as Array<keyof typeof patch>;
-    const sets = [...columns.map((column) => `${column}=?`), 'updated_at=?'];
-    this.db.raw().prepare(`UPDATE store_purchase SET ${sets.join(',')} WHERE id=?`).run(...columns.map((column) => patch[column] ?? null), now, id);
+    return this.work.storeLines(storeHopId(purchaseId, 'STORE_INIT'));
   }
 
   setObservedQuantity(purchaseId: string, lineIndex: number, quantity: number): void {
-    this.db.raw().prepare('UPDATE store_purchase_line SET observed_quantity=? WHERE purchase_id=? AND line_index=?').run(quantity, purchaseId, lineIndex);
+    this.work.setObservedQuantity(storeHopId(purchaseId, 'STORE_INIT'), lineIndex, quantity);
   }
 
   /** Units of one def index in main inventory, of either kind, by quantity. */
@@ -143,7 +202,7 @@ export class InGameStoreStore {
 
   /** Where one asset id is now, and the observation that last saw it there. */
   assetSeen(accountId: string, assetId: string): { defIndex: number; location: string; lastSeenObs: number } | undefined {
-    const item = this.db.raw().prepare('SELECT def_index, location, last_seen_obs FROM item WHERE account_id=? AND current_asset_id=?')
+    const item = this.db.raw().prepare('SELECT def_index, location, last_seen_obs FROM item WHERE account_id=? AND asset_id=?')
       .get(accountId, assetId) as { def_index: number; location: string; last_seen_obs: number } | undefined;
     return item ? { defIndex: item.def_index, location: item.location, lastSeenObs: item.last_seen_obs } : undefined;
   }

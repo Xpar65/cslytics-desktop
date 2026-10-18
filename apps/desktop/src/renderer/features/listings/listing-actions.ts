@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { ListingVenue } from '@cslytics/engine';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { dollars, type PricedEntry, type StagedEntry, type WorkspaceIntent } from '../../components/ListingWorkspace.js';
 import { listingKey, listingTitle, type NamedListing } from './listing-parts.js';
 import { VENUE_ID } from '../../lib/marketplaces.js';
@@ -64,7 +64,7 @@ export function stageListing(row: NamedListing): StagedListing {
     imageUrl: row.imageUrl,
     paintWear: row.paintWear,
     localId: row.localId,
-    place: { icon: 'tag', label: `Listed at ${formatCents(row.buyerPriceCents, row.currency)}` },
+    place: { icon: 'tag', label: `Listed at ${formatAmount(row.buyerPriceCents, row.currency)}` },
     ...(row.venue === 'STEAM' ? { caption: { icon: 'smartphone' as const, text: 'Steam has no price edit: the listing is removed and a new one created, which asks for a phone confirmation.' } } : {}),
     venues: [VENUE_ID[row.venue]],
     seed: listed === null

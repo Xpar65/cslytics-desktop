@@ -1,5 +1,5 @@
 import type { EngineDatabase } from '../../db/database.js';
-import { InGameStoreStore, parseItemIds, type StorePurchaseState } from '../../db/in-game-store.js';
+import { InGameStoreStore, STORE_PURCHASE, parseItemIds, type StorePurchaseState } from '../../db/in-game-store.js';
 
 /**
  * The in-game store's read models: what the GC will sell this account, and what this account
@@ -95,7 +95,8 @@ export function readStorePurchase(db: EngineDatabase, accountId: string, id: str
 
 /** Newest first, one page, cursor bound to the latest purchase update so a changed row cannot slip between pages. */
 export function pageStorePurchases(db: EngineDatabase, accountId: string, cursor?: string): StorePurchasePage {
-  const snapshot = (db.raw().prepare('SELECT COALESCE(MAX(updated_at),\'\') AS at FROM store_purchase WHERE account_id=?').get(accountId) as { at: string }).at;
+  const snapshot = (db.raw().prepare(`SELECT COALESCE(MAX(s.updated_at),'') AS at FROM work_step s JOIN command c ON c.id=s.command_id WHERE s.account_id=? AND c.kind=?`)
+    .get(accountId, STORE_PURCHASE) as { at: string }).at;
   let before: { createdAt: string; id: string } | null = null;
   if (cursor) {
     try {
@@ -106,10 +107,13 @@ export function pageStorePurchases(db: EngineDatabase, accountId: string, cursor
       return { accountId, rows: [], nextCursor: null, stalePage: true };
     }
   }
+  // One purchase is one command; its init hop is the row that dates it.
   const rows = (before
-    ? db.raw().prepare('SELECT id FROM store_purchase WHERE account_id=? AND (created_at<? OR (created_at=? AND id<?)) ORDER BY created_at DESC,id DESC LIMIT ?')
-      .all(accountId, before.createdAt, before.createdAt, before.id, PURCHASE_PAGE + 1)
-    : db.raw().prepare('SELECT id FROM store_purchase WHERE account_id=? ORDER BY created_at DESC,id DESC LIMIT ?').all(accountId, PURCHASE_PAGE + 1)
+    ? db.raw().prepare(`SELECT c.id FROM command c JOIN work_step s ON s.id=c.id || ':STORE_INIT' WHERE s.account_id=? AND c.kind=?
+        AND (c.created_at<? OR (c.created_at=? AND c.id<?)) ORDER BY c.created_at DESC,c.id DESC LIMIT ?`)
+      .all(accountId, STORE_PURCHASE, before.createdAt, before.createdAt, before.id, PURCHASE_PAGE + 1)
+    : db.raw().prepare(`SELECT c.id FROM command c JOIN work_step s ON s.id=c.id || ':STORE_INIT' WHERE s.account_id=? AND c.kind=? ORDER BY c.created_at DESC,c.id DESC LIMIT ?`)
+      .all(accountId, STORE_PURCHASE, PURCHASE_PAGE + 1)
   ) as Array<{ id: string }>;
   const hasNext = rows.length > PURCHASE_PAGE;
   const page = rows.slice(0, PURCHASE_PAGE).map((row) => readStorePurchase(db, accountId, row.id)).filter((row): row is StorePurchaseView => row !== null);

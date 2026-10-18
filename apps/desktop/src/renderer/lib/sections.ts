@@ -12,6 +12,7 @@ export const SECTION_IDS = [
   'portfolio',
   'inventory',
   'trades',
+  'items',
   'listings',
   'buy-orders',
   'records',
@@ -33,4 +34,4 @@ export type RecordTab = (typeof RECORD_TABS)[number];
  * The pages of Settings: this desktop's, an account's overview, and one per marketplace, named by
  * its id in `MARKETPLACES`. A page that offers to set up a venue opens its page by that id.
  */
-export type SettingsPage = 'general' | 'overview' | VenueId;
+export type SettingsPage = 'general' | 'cslytics' | 'overview' | VenueId;

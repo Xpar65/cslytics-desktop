@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { CsfloatItemClass } from '@cslytics/catalogue';
 import type { BuyOrderBookRow, BuyOrderVenue } from '@cslytics/engine';
 import type { IconName } from '../../components/Icon.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { formatRelative, humanize, type Tone } from '../../lib/labels.js';
 import { VENUE_LABEL } from '../../lib/marketplaces.js';
 import type { NamedBuyOrderFilter } from './buy-order-filters.js';
@@ -107,7 +107,7 @@ export function buyOrderStatus(row: BuyOrderBookRow, now = new Date()): BuyOrder
       label: 'Changing',
       tone: 'warn',
       icon: 'pencil',
-      detail: `Asked ${formatRelative(row.editPending.sentAt, now)} for ${formatCents(row.editPending.priceCents, row.currency)} each, ${row.editPending.quantity.toLocaleString()} wanted${row.editPending.filters ? ', with new filters' : ''}. The terms shown stay until a ${read} shows the new ones.`,
+      detail: `Asked ${formatRelative(row.editPending.sentAt, now)} for ${formatAmount(row.editPending.priceCents, row.currency)} each, ${row.editPending.quantity.toLocaleString()} wanted${row.editPending.filters ? ', with new filters' : ''}. The terms shown stay until a ${read} shows the new ones.`,
       canCancel: false,
       canEdit: false
     };
@@ -304,7 +304,7 @@ export type EditCheck = { blocking: string | null; warnings: string[] };
 export function checkEdit(terms: BuyOrderTerms, facts: CsfloatAccountFacts | null, now = new Date()): EditCheck {
   if (terms.maxPriceCents < CSFLOAT_MIN_PRICE_CENTS) return { blocking: 'CSFloat takes no buy order under $0.03 each.', warnings: [] };
   const warnings: string[] = [];
-  const usd = (cents: number): string => formatCents(cents, 1);
+  const usd = (cents: number): string => formatAmount(cents, 1);
   const total = terms.maxPriceCents * terms.quantity;
   if (facts && facts.availableCents !== null) {
     const read = facts.balanceObservedAt ? ` when last read ${formatRelative(facts.balanceObservedAt, now)}` : '';

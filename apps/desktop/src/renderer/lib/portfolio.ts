@@ -1,118 +1,114 @@
+import type { BaseSum, ObservedKey, PortfolioValuation } from '../../shared/market.js';
+import { conversionNote } from './money.js';
 import type { AccountHoldings, SurfaceEvidence } from './types.js';
 
 /**
- * Portfolio arithmetic.
+ * Portfolio presentation over figures main has already assembled.
  *
- * A headline figure, an allocation bar split into labelled segments, and a per-account table
- * underneath. What is deliberately *not* here is a valuation: this app has neither a price
- * catalogue nor an FX source, and `cslytics-app-docs/steam/wallet.md` states the rule as *"the engine never
- * values an item"*. So every figure below is a number a venue itself named, and inventory
- * appears as counts.
+ * Every money figure on the page comes from main's valuation (`main/market-data/portfolio.ts`,
+ * portfolio and pricing plan §3): the observed money grouped by its own currency, each group
+ * converted once, and the inventory at the mid price. This file decides how those figures *read*:
+ * which one is printed large, what sits quietly beside it, which segments the bar draws. It adds
+ * nothing across currencies itself, and it never values an item.
  *
- * Pure functions on purpose. Vitest runs in a node environment with no DOM, so this is the
- * half of the portfolio that can be tested; the component that renders it is the half that
- * cannot.
+ * What it does compute from the engine's holdings is what is not money: counts, and how old and how
+ * complete the evidence behind them is.
+ *
+ * Pure functions on purpose. Vitest runs in a node environment with no DOM, so this is the half of
+ * the portfolio that can be tested; the component that renders it is the half that cannot.
  */
 
-export type HoldingsSegmentKey = 'wallet' | 'walletDelayed' | 'listed' | 'onHold' | 'awaitingConfirmation';
+/** One amount to print, in its own currency. `approx` marks a figure that went through FX. */
+export type Amount = { cents: number; currency: string; approx: boolean };
+
+/**
+ * How one observed quantity reads.
+ *
+ * One part, in one currency: that native figure, with its base equivalent beside it when it was
+ * converted. Several parts: their sum in the base, marked `≈` when any part was converted, with the
+ * natives beside it; when nothing converts, the natives themselves, side by side, never added.
+ */
+export type QuantityView = {
+  /** Printed large. Empty when the scope holds none of it. */
+  main: Amount[];
+  /** Printed quietly under it. */
+  beside: Amount[];
+  /** Currencies holding some of it that have no rate: left out of a converted sum, which is then a floor. */
+  missing: string[];
+  /** Each conversion's rate and date, for the hover. */
+  notes: string[];
+};
+
+export function quantity(answer: Pick<PortfolioValuation, 'base' | 'observed' | 'observedInBase'>, key: ObservedKey): QuantityView {
+  const parts = answer.observed.map((group) => group[key]).filter((figure) => figure.cents !== 0);
+  const notes = parts.flatMap((figure) => (figure.converted ? [conversionNote(figure.converted)] : []));
+  const natives = parts.map((figure) => ({ cents: figure.cents, currency: figure.currency, approx: false }));
+  if (parts.length === 0) return { main: [], beside: [], missing: [], notes };
+  if (parts.length === 1) {
+    const converted = parts[0]!.converted;
+    return { main: natives, beside: converted ? [{ cents: converted.cents, currency: converted.currency, approx: true }] : [], missing: [], notes };
+  }
+  const sum = answer.observedInBase[key];
+  if (sum.cents === null) return { main: natives, beside: [], missing: sum.missingCurrencies, notes };
+  return {
+    main: [{ cents: sum.cents, currency: answer.base, approx: parts.some((figure) => figure.currency !== answer.base) }],
+    beside: natives,
+    missing: sum.missingCurrencies,
+    notes
+  };
+}
+
+export type HoldingsSegmentKey = 'steam' | 'steamPending' | 'csfloat' | 'csfloatPending' | 'inventory';
 
 export type HoldingsSegment = {
   key: HoldingsSegmentKey;
   label: string;
   /** The token holding this segment's colour. Segments are data, so they are never the accent. */
   variable: string;
-  /** Hatched in the bar: money Steam is holding, or a listing that is not live yet. */
+  /** Hatched in the bar: money a venue is holding and has not let the account spend yet. */
   pending: boolean;
   cents: number;
 };
 
-type SegmentDefinition = Omit<HoldingsSegment, 'cents'> & { of: (holdings: HoldingsSource) => number };
-
-/** The fields `segments` reads. Both a single account and an aggregate satisfy it. */
-type HoldingsSource = {
-  wallet: { balanceCents: number; delayedBalanceCents: number } | null;
-  listedReceiveCents: number;
-  onHoldReceiveCents: number;
-  awaitingConfirmationReceiveCents: number;
-};
-
 /**
- * One bucket per thing Steam told us a number for, hue per bucket and hatching for the part of
- * it that has not cleared — the incumbent's convention, and the reason the bar reads at a
- * glance without a legend per segment.
- *
- * Buy-order commitments are deliberately absent. A buy order is money reserved *out of* the
- * wallet balance (`cslytics-app-docs/steam/wallet.md`), so adding it as a sixth segment would count the same
- * cents twice. It gets a card of its own instead.
+ * The wallet parts of the bar: each venue's spendable money, solid, and its pending money, hatched
+ * in the same hue. Listings are not segments, because a listed item stays a holding until it sells
+ * and is inside the appraisal already (N-SELL-06); nor are buy orders, which are inside the Steam
+ * wallet. Either would count the same cents twice.
  */
-const SEGMENTS: readonly SegmentDefinition[] = [
-  {
-    key: 'wallet',
-    label: 'Wallet',
-    variable: '--cs-hold-wallet',
-    pending: false,
-    of: (holdings) => holdings.wallet?.balanceCents ?? 0
-  },
-  {
-    key: 'walletDelayed',
-    label: 'Wallet (delayed)',
-    variable: '--cs-hold-wallet',
-    pending: true,
-    of: (holdings) => holdings.wallet?.delayedBalanceCents ?? 0
-  },
-  {
-    key: 'listed',
-    label: 'Listed proceeds',
-    variable: '--cs-hold-listed',
-    pending: false,
-    of: (holdings) => holdings.listedReceiveCents
-  },
-  {
-    key: 'onHold',
-    label: 'On hold',
-    variable: '--cs-hold-listed',
-    pending: true,
-    of: (holdings) => holdings.onHoldReceiveCents
-  },
-  {
-    key: 'awaitingConfirmation',
-    label: 'Awaiting confirmation',
-    variable: '--cs-hold-unconfirmed',
-    pending: true,
-    of: (holdings) => holdings.awaitingConfirmationReceiveCents
-  }
+const WALLET_SEGMENTS: ReadonlyArray<Omit<HoldingsSegment, 'cents'> & { key: Extract<ObservedKey, HoldingsSegmentKey> }> = [
+  { key: 'steam', label: 'Steam wallet', variable: '--cs-hold-wallet', pending: false },
+  { key: 'steamPending', label: 'Steam pending', variable: '--cs-hold-wallet', pending: true },
+  { key: 'csfloat', label: 'CSFloat balance', variable: '--cs-hold-csfloat', pending: false },
+  { key: 'csfloatPending', label: 'CSFloat pending', variable: '--cs-hold-csfloat', pending: true }
 ];
 
-export function segments(holdings: HoldingsSource): HoldingsSegment[] {
-  return SEGMENTS.map(({ of, ...segment }) => ({ ...segment, cents: of(holdings) }));
-}
-
-/** Everything Steam named a figure for, added up. Never includes an appraisal, because there is none. */
-export function observedTotalCents(holdings: HoldingsSource): number {
-  return segments(holdings).reduce((total, segment) => total + segment.cents, 0);
-}
-
 /**
- * Adding one account's cents to another's is only meaningful in one currency.
- *
- * The incumbent solves this with an FX rate; this app has no FX source, so it says so instead
- * of inventing one. `mixed` is what stops a A$ balance and a US$ balance being silently added
- * into a number that means nothing.
+ * The holdings bar, in the base: every wallet part as main converted it, then the inventory at the
+ * mid price, solid, because an appraisal is not money a venue holds. A part with no rate is left
+ * out at zero width; the headline names it and calls the figure a floor. `null` inventory draws no
+ * inventory segment, for a scope that could not be valued.
  */
-export type PortfolioCurrency =
-  | { kind: 'none' }
-  | { kind: 'single'; code: number }
-  | { kind: 'mixed'; codes: number[] };
+export function holdingsSegments(inBase: Readonly<Record<ObservedKey, BaseSum>>, inventoryCents: number | null): HoldingsSegment[] {
+  const out: HoldingsSegment[] = WALLET_SEGMENTS.map((segment) => ({ ...segment, cents: inBase[segment.key].cents ?? 0 }));
+  if (inventoryCents !== null) out.push({ key: 'inventory', label: 'Inventory', variable: '--cs-hold-inventory', pending: false, cents: inventoryCents });
+  return out;
+}
 
-export type PortfolioTotals = HoldingsSource & {
+/** The holdings bar added up, in the bar's one currency. */
+export function totalHoldingsCents(bar: readonly HoldingsSegment[]): number {
+  return bar.reduce((total, segment) => total + segment.cents, 0);
+}
+
+/** What the portfolio counts across accounts, and how far its evidence can be trusted. Never money. */
+export type PortfolioTotals = {
   accounts: number;
-  currency: PortfolioCurrency;
-  reservedCents: number;
-  buyOrderOpenCents: number;
   counts: AccountHoldings['counts'];
   /** The worst evidence across the accounts: one unfinished walk makes the whole total a floor. */
   inventory: SurfaceEvidence;
   market: SurfaceEvidence;
+  /** Accounts whose CSFloat balance is known for the key connected now, and the oldest of those reads. */
+  csfloat: { accounts: number; observedAt: string | null };
 };
 
 const ZERO_COUNTS: AccountHoldings['counts'] = {
@@ -141,41 +137,22 @@ export function aggregate(rows: readonly AccountHoldings[]): PortfolioTotals {
   // real one — which is how a total quietly loses the age it was supposed to be reporting.
   let inventory: SurfaceEvidence | null = null;
   let market: SurfaceEvidence | null = null;
-  const totals: PortfolioTotals = {
-    accounts: rows.length,
-    currency: currencyOf(rows),
-    wallet: null,
-    reservedCents: 0,
-    listedReceiveCents: 0,
-    onHoldReceiveCents: 0,
-    awaitingConfirmationReceiveCents: 0,
-    buyOrderOpenCents: 0,
-    counts,
-    inventory: NO_EVIDENCE,
-    market: NO_EVIDENCE
-  };
-
   for (const row of rows) {
-    if (row.wallet) {
-      totals.wallet = {
-        balanceCents: (totals.wallet?.balanceCents ?? 0) + row.wallet.balanceCents,
-        delayedBalanceCents: (totals.wallet?.delayedBalanceCents ?? 0) + row.wallet.delayedBalanceCents
-      };
-    }
-    totals.reservedCents += row.reservedCents;
-    totals.listedReceiveCents += row.listedReceiveCents;
-    totals.onHoldReceiveCents += row.onHoldReceiveCents;
-    totals.awaitingConfirmationReceiveCents += row.awaitingConfirmationReceiveCents;
-    totals.buyOrderOpenCents += row.buyOrderOpenCents;
     for (const key of Object.keys(counts) as Array<keyof AccountHoldings['counts']>) {
       counts[key] += row.counts[key];
     }
     inventory = inventory === null ? row.inventory : worse(inventory, row.inventory);
     market = market === null ? row.market : worse(market, row.market);
   }
-  totals.inventory = inventory ?? NO_EVIDENCE;
-  totals.market = market ?? NO_EVIDENCE;
-  return totals;
+  // A balance nobody has read adds no money, so it adds no age either: the oldest of the reads there are.
+  const csfloatReads = rows.flatMap((row) => (row.csfloatWallet ? [row.csfloatWallet.observedAt] : [])).sort();
+  return {
+    accounts: rows.length,
+    counts,
+    inventory: inventory ?? NO_EVIDENCE,
+    market: market ?? NO_EVIDENCE,
+    csfloat: { accounts: csfloatReads.length, observedAt: csfloatReads[0] ?? null }
+  };
 }
 
 /** Holdings by place, both kinds added together, and how many of those in main inventory are listed. */
@@ -211,13 +188,6 @@ function worse(left: SurfaceEvidence, right: SurfaceEvidence): SurfaceEvidence {
     ? null
     : (left.observedAt < right.observedAt ? left.observedAt : right.observedAt);
   return { observedAt, settled: left.settled && right.settled };
-}
-
-function currencyOf(rows: readonly AccountHoldings[]): PortfolioCurrency {
-  const codes = [...new Set(rows.map((row) => row.currency).filter((code): code is number => code !== null))];
-  if (codes.length === 0) return { kind: 'none' };
-  if (codes.length === 1) return { kind: 'single', code: codes[0]! };
-  return { kind: 'mixed', codes: codes.sort((left, right) => left - right) };
 }
 
 /**

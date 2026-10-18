@@ -39,32 +39,44 @@ export type RetryPolicy =
    * Another driver sends it again on its own cadence — convergence for a listing goal, the
    * storage reconciler for a rename — and this table only holds its cap, `limit` attempts in
    * all. On the last proof the goal is suspended with the reason, which is how that driver stops.
+   * `delaysMs`, when present, is how long after the n-th proof the owner may send again: the gap
+   * between a command's rounds (bulk storage plan D3). Absent, the owner may send at once.
    */
-  | { resend: 'owner'; owner: string; limit: number };
+  | { resend: 'owner'; owner: string; limit: number; delaysMs?: readonly number[] };
 
 /** After the proof: five seconds, then thirty, then a minute; then it fails. Three retries, four sends. */
 export const CANCEL_RETRY_DELAYS_MS: readonly number[] = [5_000, 30_000, 60_000];
+
+/**
+ * The gaps between a casket move's rounds (bulk storage plan D3): two seconds after the round that
+ * proved it did not land, then ten, then thirty; four sends in all. A round's proof read settles
+ * every move of the round at once, so every move it proved absent goes again together.
+ */
+export const CASKET_ROUND_DELAYS_MS: readonly number[] = [2_000, 10_000, 30_000];
 
 /** Why a kind is `never`, or carries the limit it does, when the row alone does not say. */
 export const RETRY_POLICY: Readonly<Record<string, RetryPolicy>> = {
   REMOVE_SELL_LISTING: { resend: 'retry-service', delaysMs: CANCEL_RETRY_DELAYS_MS },
   CANCEL_BUY_ORDER: { resend: 'retry-service', delaysMs: CANCEL_RETRY_DELAYS_MS },
-  // A never-landed create retries once (order-lifecycle A1, D3): convergence re-sends the `READY`
-  // action on its next tick, and the second proof parks the goal.
-  CREATE_SELL_LISTING: { resend: 'owner', owner: 'convergence', limit: 2 },
+  // A never-landed create retries once (order-lifecycle A1, D3): its owner re-sends the `READY`
+  // action, convergence on its next tick for a goal and `CommandService.advanceSteps` at the
+  // proof for a hop; the second proof parks the goal, or fails the hop.
+  CREATE_SELL_LISTING: { resend: 'owner', owner: 'convergence for a goal, the command service for a hop', limit: 2 },
   // One deliberate second try; a name Steam declines twice is a name, not a lost reply (STO-07).
   RENAME_CASKET: { resend: 'owner', owner: 'storage', limit: 2 },
   // A buy order is wallet money: proved never placed, it fails with the reason and the person
   // decides whether to place it again. It used to go back to `READY`, which nothing re-sent and
   // the buy-order book did not show.
   CREATE_BUY_ORDER: { resend: 'never' },
-  // KNOWN GAP: a casket move proved not applied goes back to `READY` (`StorageService.reconcile`),
-  // and only convergence re-sends one — the retrieve a listing goal owns, under its own mutation
-  // cap. A store, or a retrieve a command queued, has no sender and stays *Sent, waiting* for
-  // ever. The fix is a sender in `engine.ts` and the schedule above; left as it was until a
-  // scenario proves the resend against the casket evidence rules.
-  STORE_IN_CASKET: { resend: 'owner', owner: 'convergence (goal-carried only)', limit: 8 },
-  RETRIEVE_FROM_CASKET: { resend: 'owner', owner: 'convergence (goal-carried only)', limit: 8 },
+  // A casket move proved not applied goes back to `READY` (`StorageService.reconcile`, through
+  // `settleNotApplied`): the proof is a complete unit read and a complete inventory walk, both begun
+  // after the attempt, that still show the item where it was. Its owner sends it again in the next
+  // round, after the round's gap: convergence for the retrieve a listing goal carries, under the
+  // goal's own mutation cap, and `CommandService` for a store or retrieve a command's hop carries
+  // (N-QUEUE-09, BULK-04). Four sends, then it fails with the reason (bulk storage plan D3, BULK-05).
+  // Until 2026-10-16 the reconciler bypassed `settleNotApplied`, so the cap never ended anything.
+  STORE_IN_CASKET: { resend: 'owner', owner: 'convergence for a goal, the command service for a hop', limit: 4, delaysMs: CASKET_ROUND_DELAYS_MS },
+  RETRIEVE_FROM_CASKET: { resend: 'owner', owner: 'convergence for a goal, the command service for a hop', limit: 4, delaysMs: CASKET_ROUND_DELAYS_MS },
   // CSF-46: a CSFloat edit the listing read proves not applied fails and is never re-sent. Its
   // own orchestrator would be the sender; flipping this row is the day that is wanted.
   CSFLOAT_CANCEL: { resend: 'never' },
@@ -90,12 +102,13 @@ export function attemptLimit(policy: RetryPolicy): number {
 /**
  * What follows the proof that attempt number `attempts` did not land, made at `provedAt`.
  *
- * An owner's resend is due at once: that driver has its own cadence and this table is only its
- * cap. The service's resend waits the delay the attempt earned, counted from the proof.
+ * A resend waits the delay the attempt earned, counted from the proof: the service's always, an
+ * owner's when its row names delays (a casket move's round gap), and otherwise an owner's is due at
+ * once, because that driver has its own cadence and this table is only its cap.
  */
 export function retryPlan(policy: RetryPolicy, attempts: number, provedAt: string): RetryPlan {
   const limit = attemptLimit(policy);
   if (attempts >= limit) return { kind: 'exhausted', attempt: attempts, limit };
-  const delayMs = policy.resend === 'retry-service' ? policy.delaysMs[attempts - 1] ?? 0 : 0;
+  const delayMs = policy.resend === 'never' ? 0 : policy.delaysMs?.[attempts - 1] ?? 0;
   return { kind: 'again', retryAt: new Date(Date.parse(provedAt) + delayMs).toISOString(), attempt: attempts + 1, limit };
 }

@@ -29,18 +29,29 @@ export class HoldingsStore {
     const observation = this.db.observation(accountId, observationId)!;
     const existing = this.db.itemByAssetId(accountId, item.id);
     const localId = existing?.local_id ?? randomUUID();
-    if (existing && !this.db.canUpdateLocation(existing, observation)) return localId;
+    if (existing && !this.db.canUpdateLocation(existing, observation)) {
+      // Newer evidence placed this row: a GC event applied while the walk was in flight, or a
+      // later generation. The walk still saw it, and a complete walk sweeps only what it did not
+      // see (rule 5). On the storage lane of 2026-10-15 a read that had just seen a resident
+      // swept it, because the resident's `added` event landed between the read's start and its
+      // write and the read then left the row untouched, sighting included.
+      if (observation.surface !== 'gc-event') {
+        sqlite.prepare('UPDATE item SET last_seen_obs=? WHERE account_id=? AND local_id=?').run(observationId, accountId, localId);
+        this.db.touch(accountId, 'item');
+      }
+      return localId;
+    }
     const individual = isIndividualItem(item);
     const fingerprint = stableItemKey(item);
     sqlite.prepare(`
       INSERT INTO item(local_id, account_id, def_index, paint_index, paint_wear, paint_seed, quality,
-                       kit, stable_key, current_asset_id, location, casket_id, tradable_after,
+                       kit, stable_key, asset_id, location, casket_id, tradable_after,
                        trade_protected_until, first_seen_obs, last_seen_obs, location_obs, location_generation,
-                       row_generation, unit_kind, group_key, quantity, reserved_command, attributes_json, end_reason)
+                       unit_kind, group_key, quantity, reserved_command, attributes_json, end_reason)
       VALUES (@localId, @accountId, @defIndex, @paintIndex, @paintWear, @paintSeed, @quality,
               @kit, @stableKey, @assetId, @location, @casketId, @tradableAfter,
               @tradeProtectedUntil, @firstSeen, @lastSeen, @lastSeen, @generation,
-              @rowGeneration, @unitKind, @groupKey, @quantity, NULL, @attributes, NULL)
+              @unitKind, @groupKey, @quantity, NULL, @attributes, NULL)
       ON CONFLICT(local_id) DO UPDATE SET
         -- Re-derived on every pass. An item that gains or loses an identity-bearing attribute is
         -- a different market item and must stop matching the old one; one that gains a sticker
@@ -56,7 +67,6 @@ export class HoldingsStore {
         last_seen_obs=excluded.last_seen_obs,
         location_obs=excluded.location_obs,
         location_generation=COALESCE(excluded.location_generation, item.location_generation),
-        row_generation=excluded.row_generation,
         end_reason=NULL
     `).run({
       localId,
@@ -76,7 +86,6 @@ export class HoldingsStore {
       firstSeen: existing?.first_seen_obs ?? observationId,
       lastSeen: observationId,
       generation: observation.generation,
-      rowGeneration: this.db.activeRowGeneration(accountId, location === 'CASKET' ? 'gc-casket' : 'gc-inventory', location === 'CASKET' ? casketId ?? '' : '', observation.generation),
       unitKind: individual ? 'individual' : 'fungible',
       groupKey: keyOf(item),
       quantity: item.quantity ?? 1,
@@ -88,6 +97,7 @@ export class HoldingsStore {
       for (const line of given) this.linkReceipt(accountId, localId, line.asset_id, observationId, observation.finished_at);
     }
     this.replaceAccessories(accountId, localId, item, observationId);
+    this.db.touch(accountId, 'item');
     return localId;
   }
 
@@ -110,6 +120,7 @@ export class HoldingsStore {
     const stale = this.db.raw().prepare(`
       SELECT local_id FROM item WHERE account_id=? AND location=? AND IFNULL(casket_id,'')=? AND last_seen_obs<>?
     `).all(accountId, location, location === 'CASKET' ? casketId ?? '' : '', observationId) as Array<{ local_id: string }>;
+    // The receipt may live on the receiving account (rule 3), so the giver's row is asked for by its id alone.
     const traded = this.db.raw().prepare(`SELECT 1 FROM item_lineage WHERE from_local_id=? AND evidence='trade-receipt' LIMIT 1`);
     for (const row of stale) {
       this.db.setItemLocation(accountId, row.local_id, observationId, 'MISSING', location === 'CASKET' ? casketId : null);
@@ -140,7 +151,7 @@ export class HoldingsStore {
    * the two the engine records second writes the link.
    */
   linkTradeLine(assetId: string, newAssetId: string, observationId: number, at: string): void {
-    const received = this.db.raw().prepare(`SELECT account_id, local_id FROM item WHERE current_asset_id=?`).all(newAssetId) as Array<{ account_id: string; local_id: string }>;
+    const received = this.db.raw().prepare(`SELECT account_id, local_id FROM item WHERE asset_id=?`).all(newAssetId) as Array<{ account_id: string; local_id: string }>;
     for (const row of received) this.linkReceipt(row.account_id, row.local_id, assetId, observationId, at);
   }
 
@@ -151,7 +162,7 @@ export class HoldingsStore {
    */
   private linkReceipt(accountId: string, localId: string, givenAssetId: string, observationId: number, at: string): void {
     const sqlite = this.db.raw();
-    const from = sqlite.prepare(`SELECT account_id, local_id FROM item WHERE current_asset_id=? AND local_id<>?`).get(givenAssetId, localId) as { account_id: string; local_id: string } | undefined;
+    const from = sqlite.prepare(`SELECT account_id, local_id FROM item WHERE asset_id=? AND local_id<>?`).get(givenAssetId, localId) as { account_id: string; local_id: string } | undefined;
     if (!from) return;
     this.insertLineage(accountId, from.local_id, localId, 'trade-receipt', observationId, at);
     this.db.setEndReason(from.account_id, from.local_id, 'traded');
@@ -190,12 +201,12 @@ export class HoldingsStore {
    */
   commodityStacks(accountId: string): CommodityStackRow[] {
     // The staging swap applies; the published-generation predicate does not, as it never did to
-    // the stack table. A listed unit is in its MAIN stack: listing is not a place (`db/steam-listing.ts`).
+    // the stack table. A listed unit is in its MAIN stack: listing is not a place (`db/commitment.ts`).
     return this.db.raw().prepare(`
       SELECT account_id, group_key AS stack_key, location, IFNULL(casket_id,'') AS casket_id,
         MIN(def_index) AS def_index, MIN(quality) AS quality, MIN(kit) AS kit,
         SUM(quantity) AS quantity, MAX(last_seen_obs) AS last_seen_obs
-      FROM ${this.db.inventoryReadTable('item', accountId)}
+      FROM item
       WHERE account_id=? AND unit_kind='fungible' AND location<>'MISSING'
       GROUP BY group_key, location, IFNULL(casket_id,'')
       ORDER BY stack_key, location, casket_id
@@ -212,9 +223,9 @@ export class HoldingsStore {
   /** The units of one group, of either kind; without a group, every fungible unit. Ordered by asset id. */
   units(accountId: string, groupKey?: string): ItemRow[] {
     if (groupKey) {
-      return this.db.raw().prepare(`SELECT * FROM item WHERE account_id=? AND group_key=? ORDER BY current_asset_id`).all(accountId, groupKey) as ItemRow[];
+      return this.db.raw().prepare(`SELECT * FROM item WHERE account_id=? AND group_key=? ORDER BY asset_id`).all(accountId, groupKey) as ItemRow[];
     }
-    return this.db.raw().prepare(`SELECT * FROM item WHERE account_id=? AND unit_kind='fungible' ORDER BY current_asset_id`).all(accountId) as ItemRow[];
+    return this.db.raw().prepare(`SELECT * FROM item WHERE account_id=? AND unit_kind='fungible' ORDER BY asset_id`).all(accountId) as ItemRow[];
   }
 
   /**
@@ -226,20 +237,21 @@ export class HoldingsStore {
     const sqlite = this.db.raw();
     const available = sqlite.prepare(`
       SELECT * FROM item
-      WHERE account_id=? AND group_key=? AND location=? AND IFNULL(casket_id,'')=? AND reserved_command IS NULL AND current_asset_id IS NOT NULL
-      ORDER BY current_asset_id
+      WHERE account_id=? AND group_key=? AND location=? AND IFNULL(casket_id,'')=? AND reserved_command IS NULL AND asset_id IS NOT NULL
+      ORDER BY asset_id
     `).all(accountId, groupKey, location, casketId ?? '') as ItemRow[];
     let remaining = quantity;
     const chosen: ItemRow[] = [];
     const reserve = sqlite.prepare(`UPDATE item SET reserved_command=? WHERE local_id=? AND reserved_command IS NULL`);
     for (const unit of available) {
       if (remaining <= 0) break;
-      if (unit.quantity > remaining || exclude?.has(unit.current_asset_id!)) continue;
+      if (unit.quantity > remaining || exclude?.has(unit.asset_id!)) continue;
       const updated = reserve.run(commandId, unit.local_id);
       if (updated.changes !== 1) continue;
       chosen.push({ ...unit, reserved_command: commandId });
       remaining -= unit.quantity;
     }
+    if (chosen.length) this.db.touch(accountId, 'item');
     if (remaining > 0) {
       for (const unit of chosen) sqlite.prepare(`UPDATE item SET reserved_command=NULL WHERE local_id=?`).run(unit.local_id);
       throw new Error(`Not enough unreserved quantity on ${groupKey} (need ${quantity})`);
@@ -250,11 +262,13 @@ export class HoldingsStore {
   /** A stopped command hands back the one unit its action targeted. */
   releaseUnit(accountId: string, localId: string, commandId: string): void {
     this.db.raw().prepare(`UPDATE item SET reserved_command=NULL WHERE account_id=? AND local_id=? AND reserved_command=?`).run(accountId, localId, commandId);
+    this.db.touch(accountId, 'item');
   }
 
   releaseCommandReservations(commandId: string): void {
-    this.db.raw().prepare(`UPDATE item SET reserved_command=NULL WHERE reserved_command=?`).run(commandId);
-    this.db.raw().prepare(`UPDATE reservation SET state='RELEASED' WHERE ref_kind='MAIN_SLOT' AND ref_id IN (SELECT action_id FROM command_member WHERE command_id=? AND action_id IS NOT NULL)`).run(commandId);
+    const released = this.db.raw().prepare(`UPDATE item SET reserved_command=NULL WHERE reserved_command=? RETURNING account_id`).all(commandId) as Array<{ account_id: string }>;
+    for (const accountId of new Set(released.map((row) => row.account_id))) this.db.touch(accountId, 'item');
+    this.db.raw().prepare(`UPDATE reservation SET state='RELEASED' WHERE ref_kind='MAIN_SLOT' AND ref_id IN (SELECT action_id FROM work_step WHERE command_id=? AND action_id IS NOT NULL)`).run(commandId);
   }
 
   /**
@@ -263,8 +277,9 @@ export class HoldingsStore {
    */
   releaseSettledListingReservations(accountId: string): void {
     this.db.raw().prepare(`UPDATE item SET reserved_command=NULL WHERE account_id=? AND reserved_command IS NOT NULL AND EXISTS (
-      SELECT 1 FROM action a JOIN command_member m ON m.action_id=a.id
+      SELECT 1 FROM action a JOIN work_step s ON s.action_id=a.id
       WHERE a.account_id=item.account_id AND a.kind='CREATE_SELL_LISTING' AND a.target_id=item.local_id
-        AND a.state IN ('DONE','FAILED') AND m.command_id=item.reserved_command)`).run(accountId);
+        AND a.state IN ('DONE','FAILED') AND s.command_id=item.reserved_command)`).run(accountId);
+    this.db.touch(accountId, 'item');
   }
 }

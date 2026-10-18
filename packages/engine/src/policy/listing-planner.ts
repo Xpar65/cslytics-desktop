@@ -2,6 +2,7 @@ import type { AccountId } from '@cslytics/ports';
 import type { ActionRow, DesiredStateRow } from '../db/database.js';
 import type { EngineContext } from '../kernel/context.js';
 import { required } from '../kernel/support.js';
+import { OrderStore } from '../db/orders.js';
 import { ACCOUNT_MARKET, PRECONDITIONS, evaluatePreconditions, surfaceEvidence, type ActionKind, type Evidence, type ScopeRef, type Surface } from '../kernel/evidence.js';
 
 export const LISTING_TARGET = 'sell-listing';
@@ -20,12 +21,12 @@ export type ListingStep = Target & (
 export class ListingPlanner {
   constructor(protected readonly context: EngineContext) {}
 
-  setListingGoal(accountId: AccountId, localId: string, priceReceiveCents: number, basis = 'manual'): DesiredStateRow {
+  setListingGoal(accountId: AccountId, localId: string, priceReceiveCents: number, commandId: string | null = null): DesiredStateRow {
     const { database } = this.context;
     if (!Number.isInteger(priceReceiveCents) || priceReceiveCents <= 0) throw new Error('Seller-receives price must be positive integer cents');
     required(database.itemByLocalId(accountId, localId), `Unknown item ${localId}`);
     const goal = database.upsertDesired({ accountId, targetKind: LISTING_TARGET, targetId: localId, intent: LISTED_AT,
-      params: { priceReceiveCents }, basis, now: this.context.now() });
+      params: { priceReceiveCents }, commandId, now: this.context.now() });
     database.raw().prepare(`UPDATE desired_state SET expires_at=COALESCE(expires_at,?) WHERE account_id=? AND id=?`)
       .run(new Date(Date.parse(goal.created_at) + 7 * 86400_000).toISOString(), accountId, goal.id);
     return database.desiredState(goal.id)!;
@@ -40,11 +41,10 @@ export class ListingPlanner {
     const params = JSON.parse(goal.params_json) as ListingGoalParams;
     const now = this.context.ports.clock.now();
     const market = surfaceEvidence(database, accountId, ACCOUNT_MARKET, now);
-    const listing = database.raw().prepare(`SELECT price_receive_cents FROM market_listing WHERE account_id=? AND local_id=?
-      AND status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')`).get(accountId, localId) as { price_receive_cents: number } | undefined;
+    const listing = new OrderStore(database).openSteamListingFor(accountId, localId);
     if (listing && market.grade === 'SATISFIED') {
-      return listing.price_receive_cents === params.priceReceiveCents ? { ...target, kind: 'NONE', reason: 'satisfied' }
-        : { ...target, kind: 'BLOCKED', reason: `Existing listing at ${listing.price_receive_cents}c needs review before repricing` };
+      return listing.price_cents === params.priceReceiveCents ? { ...target, kind: 'NONE', reason: 'satisfied' }
+        : { ...target, kind: 'BLOCKED', reason: `Existing listing at ${listing.price_cents}c needs review before repricing` };
     }
     if (database.inFlight(accountId, `item:${localId}`)) return { ...target, kind: 'NONE', reason: 'in-flight' };
     if (goal.expires_at && Date.parse(goal.expires_at) <= now.getTime()) return { ...target, kind: 'BLOCKED', reason: 'Listing goal expired; review the price before resuming' };
@@ -63,7 +63,7 @@ export class ListingPlanner {
     const blocked = because.find((evidence) => evidence.grade === 'UNSATISFIED');
     if (blocked?.grade === 'UNSATISFIED') return { ...target, kind: 'BLOCKED', reason: blocked.reason, ...(blocked.blockedUntil ? { blockedUntil: blocked.blockedUntil } : {}) };
     return { ...target, kind: 'MUTATE', action, because,
-      params: action === 'RETRIEVE_FROM_CASKET' ? { casketId: item!.casket_id!, assetId: item!.current_asset_id! } : params };
+      params: action === 'RETRIEVE_FROM_CASKET' ? { casketId: item!.casket_id!, assetId: item!.asset_id! } : params };
   }
 
   protected mutationLimit(): number { return MAX_GOAL_MUTATIONS; }

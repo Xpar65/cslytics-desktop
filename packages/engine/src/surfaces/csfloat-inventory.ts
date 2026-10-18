@@ -1,13 +1,11 @@
 import type { AccountId, CsfloatListingItem, CsfloatReadResult } from '@cslytics/ports';
 import { MarketplaceStore } from '../db/marketplace.js';
+import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import type { EngineContext } from '../kernel/context.js';
 
 export class CsfloatInventoryService {
   constructor(protected readonly context: EngineContext) {}
-  sync(accountId: AccountId): Promise<number> {
-    return this.context.reads.run(`${accountId}:csfloat-inventory`, () => this.walk(accountId));
-  }
-  private async walk(accountId: AccountId): Promise<number> {
+  async sync(accountId: AccountId): Promise<number> {
     const { database: db } = this.context;
     const store = new MarketplaceStore(db), before = store.connection(accountId,'csfloat'), startedAt = this.context.now();
     let result: CsfloatReadResult<CsfloatListingItem[]> = { kind: 'unavailable', cause: 'transport', raw: null };
@@ -22,9 +20,7 @@ export class CsfloatInventoryService {
         startedAt, finishedAt: this.context.now(), complete, pagesWalked: complete ? 1 : 0,
         ...(complete ? {} : { error: 'CSFloat inventory unavailable or connection changed' }) });
       if (complete && result.kind === 'ok') {
-        db.raw().prepare('DELETE FROM csfloat_inventory WHERE account_id=?').run(accountId);
-        const insert = db.raw().prepare('INSERT INTO csfloat_inventory(account_id,asset_id,item_json,observation_id) VALUES (?,?,?,?)');
-        for (const item of result.value) insert.run(accountId,item.assetId,JSON.stringify(item),obs);
+        new AssetEvidenceStore(db).observeCsfloat(accountId,result.value,obs);
       }
       return obs;
     });

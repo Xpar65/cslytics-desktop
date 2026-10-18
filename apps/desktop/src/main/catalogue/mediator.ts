@@ -6,6 +6,7 @@ import {
   HttpCatalogueSource,
   commodityMatchKey,
   displayName,
+  marketHashName,
   prepare,
   rank,
   type Prepared,
@@ -21,6 +22,7 @@ import {
   type MatchKey,
   type SyncOutcome
 } from '@cslytics/catalogue';
+import { WEAR_TIERS } from '@cslytics/ports';
 import { buyOrderMatches, floatWindow, type BuyOrderFacets, type ResolvedBuyOrderFilter } from './buy-order-match.js';
 
 /**
@@ -64,6 +66,32 @@ export type EnrichedRow = {
    * and only as a refusal — the window's `isDisplayOnly` weighs it against what Steam observed.
    */
   catalogueMarketable: boolean | null;
+};
+
+/** One market name an item is sold under: a wear tier of a skin, or the item's only name. */
+export type CatalogueVariant = {
+  name: string;
+  /** `FN` … `BS`, or `null` for an item with no wear. */
+  tier: string | null;
+  label: string | null;
+  /** Valve's band index, 0 to 4, matching `inventory.positions`' `wearBand`. */
+  band: number | null;
+  /** Every catalogue key carrying the base name: the qualities and phases sold under it. */
+  keys: MatchKey[];
+};
+
+/** What `variantsOf` answers: the item's picture and kind, and each market name it is sold under. */
+export type CatalogueVariants = {
+  base: string;
+  /** False for a name the catalogue does not hold; it is still offered as itself. */
+  known: boolean;
+  category: string | null;
+  rarity: { id: string; name: string; colour: string } | null;
+  imageUrl: string | null;
+  marketable: boolean | null;
+  minFloat: number | null;
+  maxFloat: number | null;
+  variants: CatalogueVariant[];
 };
 
 /** A sticker, a patch or a charm, as a buy-order filter names it. */
@@ -200,8 +228,9 @@ export class CatalogueMediator {
     return this.catalogue.collectionList();
   }
 
-  suggest(text: string, limit?: number): ReturnType<Catalogue['suggest']> {
-    return this.catalogue.suggest(text, limit);
+  /** `holdings` orders the item suggestions by what the user holds; see `HoldingCounts`. */
+  suggest(text: string, limit?: number, holdings?: ReadonlyMap<string, number>): ReturnType<Catalogue['suggest']> {
+    return this.catalogue.suggest(text, limit, holdings);
   }
 
   /**
@@ -252,7 +281,9 @@ export class CatalogueMediator {
         matchKey: key,
         name: displayName(entry, wear),
         // A kind with no market has no market page: naming one would offer a dead Steam Market link.
-        marketHashName: entry.marketable === false || (entry.wearSuffixed && wear === null) ? null : displayName(entry, wear),
+        // The bare market name, never the display name: Steam has one name for every Doppler phase,
+        // and a phase in it is a name no order book, curve or market page knows.
+        marketHashName: entry.marketable === false ? null : marketHashName(entry, wear),
         category: entry.category,
         rarity: entry.rarity,
         collection: collection ? { id: collection.id, name: collection.name } : null,
@@ -482,6 +513,53 @@ export class CatalogueMediator {
     };
   }
 
+  /**
+   * The market names one item is sold under, for the Items page's wear switch.
+   *
+   * `name` is what the filter bar suggested (`AK-47 | Redline`, or `★ Karambit | Doppler — Phase 2`
+   * with its phase) or a market name already (`… (Field-Tested)`); both reach the same entries. A
+   * wear-suffixed skin is one market name per tier its float range reaches, from the catalogue's
+   * own range and Valve's fixed thresholds, so a skin that cannot be Factory New offers no Factory
+   * New page. Anything else is one name. A Doppler's phases share one market name, as `enrich`
+   * spells them; the phase only picks the picture. A name the catalogue does not know is still
+   * offered as itself, unknown, because Steam may well know it.
+   */
+  variantsOf(name: string): CatalogueVariants {
+    const [plain, phase] = name.split(' — ');
+    const base = stripWearTier(plain!.trim());
+    const entries = (this.nameKeys().get(fold(base)) ?? [])
+      .map((key) => this.catalogue.lookup(key))
+      .flatMap((result) => (result.kind === 'entry' ? [result.entry] : []));
+    if (entries.length === 0) {
+      return { base: plain!.trim(), known: false, category: null, rarity: null, imageUrl: null, marketable: null, minFloat: null, maxFloat: null, variants: [{ name: plain!.trim(), tier: null, label: null, band: null, keys: [] }] };
+    }
+    const pictured = (phase ? entries.find((entry) => entry.phase === phase.trim() && entry.image) : undefined)
+      ?? entries.find((entry) => entry.image) ?? entries[0]!;
+    const keys = entries.map((entry) => entry.key);
+    const marketBase = entries[0]!.marketHashNameBase;
+    const floats = entries.filter((entry) => entry.minFloat !== null && entry.maxFloat !== null);
+    const minFloat = floats.length ? Math.min(...floats.map((entry) => entry.minFloat!)) : null;
+    const maxFloat = floats.length ? Math.max(...floats.map((entry) => entry.maxFloat!)) : null;
+    const variants: CatalogueVariant[] = entries.some((entry) => entry.wearSuffixed)
+      ? WEAR_TIERS.filter((tier, index) => {
+          const low = index === 0 ? 0 : WEAR_TIERS[index - 1]!.max;
+          // No range published: every tier is offered rather than guessing which are impossible.
+          return minFloat === null || maxFloat === null || (low < maxFloat && tier.max > minFloat);
+        }).map((tier) => ({ name: `${marketBase} (${tier.label})`, tier: tier.code, label: tier.label, band: tier.band, keys }))
+      : [{ name: marketBase, tier: null, label: null, band: null, keys }];
+    return {
+      base: marketBase,
+      known: true,
+      category: pictured.category,
+      rarity: pictured.rarity,
+      imageUrl: cachedImageUrl(pictured.image),
+      marketable: entries.every((entry) => entry.marketable === false) ? false : entries.some((entry) => entry.marketable === true) ? true : null,
+      minFloat,
+      maxFloat,
+      variants
+    };
+  }
+
   /** A name, picture, rarity and float range for a market name, from the catalogue entry it is a wear of. */
   private namedByMarket(hashName: string): Omit<EnrichedRow, 'matchKey'> {
     const entry = this.entryByName(hashName);
@@ -612,11 +690,12 @@ function resolveHostChips(catalogue: Catalogue, input: { search: string; categor
     return left.filter((key) => keep.has(key));
   };
 
-  if (nameTerms.length || categoryTerms.length) {
-    const named = nameTerms.map((term) => catalogue.search(term));
-    const typed = categoryTerms.map((term) => catalogue.search('', term));
-    keys = union([...named, ...typed]);
-  }
+  // Two names are either one, and so are two categories, but a name beside a category is that name
+  // within it: `Sticker` and one sticker is that sticker. A union of the two was every sticker.
+  const named = nameTerms.length ? union(nameTerms.map((term) => catalogue.search(term))) : undefined;
+  const typed = categoryTerms.length ? union(categoryTerms.map((term) => catalogue.search('', term))) : undefined;
+  if (named && typed) keys = intersect(named, typed);
+  else keys = named ?? typed;
   if (rarityIds.length) {
     const rarityKeys = catalogue.allEntries().filter((entry) => entry.rarity && rarityIds.includes(entry.rarity.id)).map((entry) => entry.key);
     keys = keys ? intersect(keys, rarityKeys) : rarityKeys;

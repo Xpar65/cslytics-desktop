@@ -1,13 +1,15 @@
-import type { CsfloatListingItem, MutationOutcome } from '@cslytics/ports';
+import type { MutationOutcome } from '@cslytics/ports';
 import type { EngineContext } from '../kernel/context.js';
 import { executeMutation } from '../kernel/context.js';
-import { CsfloatStore, type CsfloatOperation } from '../db/csfloat.js';
+import { CsfloatStore, type CsfloatContract } from '../db/csfloat.js';
+import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { MarketplaceStore } from '../db/marketplace.js';
 import type { ActionRow, ObservationRow } from '../db/database.js';
-import { TransferStore } from '../db/transfers.js';
-import { attemptReturned, locationEvidence, postAttempt, type ProofNeed, type Surface } from '../kernel/evidence.js';
+import { WorkStore, type WorkStepRow } from '../db/work.js';
+import { attemptReturned, locationEvidence, postAttempt, type ProofNeed, type Surface, type SurfaceRef } from '../kernel/evidence.js';
 import { AccountLock, errorMessage } from '../kernel/support.js';
 import { HoldingsStore } from '../db/holdings.js';
+import { STEAM_LISTED_SQL } from '../db/commitment.js';
 import {
   CSFLOAT_LIST_EVIDENCE, CSFLOAT_LIST_LIMIT, CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, VISIBILITY_DEADLINE_MS, VISIBILITY_READ_OFFSETS_MS,
   type CsfloatSellGroupMember, type CsfloatSellMember, type CsfloatSellRequest
@@ -21,7 +23,7 @@ import type { MarketService } from '../surfaces/market.js';
 import type { TradeService } from '../surfaces/trades.js';
 import { MAIN_INVENTORY_HARD_CAP, type StorageService } from '../surfaces/storage.js';
 import type { Settling } from './settle.js';
-import type { Observe } from './refresh.js';
+import type { Reading } from './reads.js';
 
 export type CsfloatSellingServices = { listings: CsfloatListingService; inventory: CsfloatInventoryService; trades: CsfloatTradeService;
   csfloatAccount: CsfloatAccountService; steamInventory: InventoryService; steamMarket: MarketService; steamTrades: TradeService; policy: CsfloatSellingPolicy;
@@ -29,40 +31,72 @@ export type CsfloatSellingServices = { listings: CsfloatListingService; inventor
   storage: StorageService;
   /** Settles on the caller's stack when a decision follows the driver's own read. */
   settle: Settling;
-  /** The governed read (`RefreshService.observe`): the budget, the breaker, then the settle. */
-  observe: Observe;
-  /** `RefreshService.ensureFresh`: reads a surface only when its own window has lapsed, and waits for it. */
-  ensureFresh: (accountId: string, surfaces: readonly Surface[]) => Promise<void>;
-  /** `RefreshService.readNow`: one read now, through the read budget and the breaker, fresh or not. */
-  readNow: (accountId: string, surface: Surface) => Promise<boolean> };
+  /** The read broker: every read here is a need it answers. */
+  reads: Reading };
+
+/**
+ * The three kinds of CSFloat listing work. Each is a command kind, the kind of the step that
+ * sends it, and the kind of that step's action: one name, so a read of any of the three says the
+ * same thing (consolidation plan D2).
+ */
+export const CSFLOAT_CREATE = 'CSFLOAT_CREATE' as const;
+export const CSFLOAT_REPRICE = 'CSFLOAT_REPRICE' as const;
+export const CSFLOAT_CANCEL = 'CSFLOAT_CANCEL' as const;
+export const CSFLOAT_LISTING_KINDS = [CSFLOAT_CREATE, CSFLOAT_REPRICE, CSFLOAT_CANCEL] as const;
+export type CsfloatListingKind = (typeof CSFLOAT_LISTING_KINDS)[number];
+
+/**
+ * The frozen terms of a listing hop, on the step and on its action alike. `operationId` is the id
+ * of the hop that sends to CSFloat (`<command id>:<member index>` for a create, the command id for
+ * an edit); a crated member's retrieve and wait hops carry the same id, suffixed, so the three are
+ * found from any one of them.
+ */
+export type CsfloatListingStepParams = {
+  operationId: string;
+  assetId: string | null;
+  listingId: string | null;
+  priceCents: number | null;
+  /** The storage unit a crated member leaves first; on its retrieve hop only. */
+  casketId?: string;
+  /** The CSFloat connection the terms were admitted under; a walk of another generation proves nothing about them. */
+  generation: number;
+  policyVersion: number;
+};
 
 /** The shortest sleep of the wait for CSFloat, so a refused read can never spin. */
 const MIN_TURN_MS = 5_000;
 
+/** The id of a crated member's retrieve or wait hop, beside the id of its listing hop. */
+export function listingHopId(operationId: string, hop: 'retrieve' | 'await'): string {
+  return `${operationId}:${hop}`;
+}
+
 export class CsfloatSellingService {
   protected readonly store: CsfloatStore;
+  protected readonly work: WorkStore;
   /** One `advance` per account at a time; a second asked for meanwhile waits and re-reads. */
   private readonly advancing = new AccountLock();
   private readonly scheduled = new Set<string>();
   private readonly running = new Map<string, Promise<void>>();
-  /** At most one wait for CSFloat per account, however many operations are waiting. */
+  /** At most one wait for CSFloat per account, however many listings are waiting. */
   private readonly waits = new Map<string, Promise<void>>();
   private stopped = false;
-  constructor(protected readonly context: EngineContext, protected readonly services: CsfloatSellingServices) { this.store = new CsfloatStore(context.database); }
+  constructor(protected readonly context: EngineContext, protected readonly services: CsfloatSellingServices) {
+    this.store = new CsfloatStore(context.database);
+    this.work = new WorkStore(context.database);
+  }
 
   async refresh(accountId: string, eligibility = false): Promise<void> {
-    // Account-wide books through the read budget (plan D4). A single listing's own read below is
-    // not a loop surface and stays direct.
-    const read = (surface: Surface) => this.services.observe(accountId, { surface, scope: { kind: 'account' } });
-    await read('csfloat-account-status');
-    await read('csfloat-stall');
-    await read('csfloat-trades');
-    const missing = this.context.database.raw().prepare(`SELECT c.listing_id FROM csfloat_contract c WHERE c.account_id=?
-      AND c.state NOT IN ('delisted','cancelled','refunded') AND NOT EXISTS (SELECT 1 FROM csfloat_listing l WHERE l.account_id=c.account_id AND l.listing_id=c.listing_id) LIMIT 250`)
-      .all(accountId) as Array<{ listing_id: string }>;
-    for (const row of missing) await this.services.listings.syncListing(accountId,row.listing_id);
+    // The person's reads: every book as a person need, and each listing nothing explains by its own scope.
+    const startedAfter = this.context.now();
+    const read = (ref: SurfaceRef) => this.services.reads.need(accountId, { ref, startedAfter, priority: 'person' });
+    const account = (surface: Surface): SurfaceRef => ({ surface, scope: { kind: 'account' } });
+    await read(account('csfloat-account-status'));
+    await read(account('csfloat-stall'));
+    await read(account('csfloat-trades'));
+    for (const listingId of this.store.unexplainedListings(accountId)) await read({ surface: 'csfloat-listing', scope: { kind: 'item', id: listingId } });
     if (eligibility) {
-      for (const surface of ['gc-inventory', 'steam-market', 'steam-trade-inventory', 'steam-trade-offers', 'csfloat-inventory'] as const) await read(surface);
+      for (const surface of ['gc-inventory', 'steam-market', 'steam-trade-inventory', 'steam-trade-offers', 'csfloat-inventory'] as const) await read(account(surface));
     }
     this.services.settle.settleNow(accountId);
     this.observeConflicts(accountId);
@@ -75,26 +109,26 @@ export class CsfloatSellingService {
    * short transaction (rule 6). Reading happens here, before it, one account at a time: whatever
    * `validate` would refuse on age alone is read again first, and nothing is read that is still
    * inside its window. A request already admitted under this command id is answered from the
-   * journal without reading anything.
+   * record without reading anything.
    *
-   * **The reply is the admission, not the send.** What comes back is the durable record — every
-   * member `QUEUED`, its action `READY` — and the send happens behind it, through `advance`. The
-   * desktop used to hold its request open through the send and a stall walk after it, which for
-   * CSFloat meant the Game Coordinator, the post and the walk before a person saw anything move;
-   * a listing now shows on the work panel as queued the moment this returns, the way a Steam
-   * command does through `CommandService.prepare`. A refusal still comes back here, because
-   * admission is still here.
+   * **The reply is the admission, not the send.** What comes back is the durable record — one
+   * `QUEUED` listing step per unit, its action `READY` — and the send happens behind it, through
+   * `advance`. The desktop used to hold its request open through the send and a stall walk after
+   * it, which for CSFloat meant the Game Coordinator, the post and the walk before a person saw
+   * anything move; a listing now shows on the work panel as queued the moment this returns, the
+   * way a Steam command does through `CommandService.prepare`. A refusal still comes back here,
+   * because admission is still here.
    */
-  async submit(request: CsfloatSellRequest): Promise<CsfloatOperation[]> {
-    const admitted = this.context.database.raw().prepare('SELECT 1 FROM csfloat_operation WHERE command_id=? LIMIT 1').get(request.commandId);
+  async submit(request: CsfloatSellRequest): Promise<WorkStepRow[]> {
+    const admitted = this.work.steps(request.commandId).length > 0;
     if (!admitted) {
       for (const accountId of new Set(request.members.map(member => member.accountId))) {
-        await this.services.ensureFresh(accountId, CSFLOAT_LIST_EVIDENCE);
+        await this.services.reads.ensureFresh(accountId, CSFLOAT_LIST_EVIDENCE, 'person');
       }
     }
-    const operations = this.queue(request);
-    for (const accountId of new Set(operations.map(op => op.account_id))) this.schedule(accountId);
-    return operations;
+    const steps = this.queue(request);
+    for (const accountId of new Set(steps.map(step => step.account_id))) this.schedule(accountId);
+    return steps;
   }
 
   /**
@@ -102,11 +136,11 @@ export class CsfloatSellingService {
    * judges the contract's own observation and refuses one older than its window, then it is
    * queued and sent behind the reply.
    */
-  async submitEdit(accountId: string, commandId: string, listingId: string, priceCents?: number): Promise<CsfloatOperation> {
-    if (!this.store.operation(commandId)) await this.services.listings.syncListing(accountId,listingId);
-    const op = this.queueEdit(accountId,commandId,listingId,priceCents);
+  async submitEdit(accountId: string, commandId: string, listingId: string, priceCents?: number): Promise<WorkStepRow> {
+    if (!this.work.step(commandId)) await this.listing(accountId, listingId, 'person');
+    const step = this.queueEdit(accountId,commandId,listingId,priceCents);
     this.schedule(accountId);
-    return op;
+    return step;
   }
 
   /**
@@ -127,26 +161,25 @@ export class CsfloatSellingService {
   }
 
   /**
-   * Every operation of this account that was admitted and never sent, sent once each, in order.
+   * Every listing hop of this account that was admitted and never sent, sent once each, in order.
    *
-   * This is `CommandService.resume` for a CSFloat operation, and holds to the same rule: it
-   * resumes by *identity*, never by retry. `QUEUED` with a `READY` action means no mutation has
-   * ever been attempted for it, so sending is safe; anything past that is `execute`'s own guard
-   * and is settled by observation alone (rule 1, `CSF-17`). Nothing here re-sends.
+   * This is `CommandService.resume` for CSFloat work, and holds to the same rule: it resumes by
+   * *identity*, never by retry. `QUEUED` with a `READY` action means no mutation has ever been
+   * attempted for it, so sending is safe; anything past that is `execute`'s own guard and is
+   * settled by observation alone (rule 1, `CSF-17`). Nothing here re-sends.
    *
-   * It is what `submit` hands the send to, and what a reattaching session runs, so an operation
-   * queued in a run that died before it got to the send is sent by the next one — the gap the
-   * desktop's inline send used to leave open, since nothing but that one call ever looked at a
-   * queued operation.
+   * It is what `submit` hands the send to, and what a reattaching session runs, so a hop queued in
+   * a run that died before it got to the send is sent by the next one — the gap the desktop's
+   * inline send used to leave open, since nothing but that one call ever looked at a queued one.
    *
-   * A venue with no credential on this account is not an error: the operation waits, and the
-   * next connection schedules it. A refusal at the send is `execute`'s to record, durably, on the
-   * operation itself. Anything else thrown reaches Activity and leaves the operation queued, still
-   * never sent, for the next pass.
+   * A venue with no credential on this account is not an error: the hop waits, and the next
+   * connection schedules it. A refusal at the send is `execute`'s to record, durably, on the hop
+   * itself. Anything else thrown reaches Activity and leaves the hop queued, still never sent,
+   * for the next pass.
    *
    * A member admitted from a storage unit gets here twice more first: `advanceRetrievals` sends
    * and settles its retrieve, and `awaitVisibility` holds it until CSFloat's own read shows the
-   * item, at which point it is an ordinary queued create.
+   * item, at which point its listing hop is an ordinary queued create.
    */
   async advance(accountId: string): Promise<void> {
     const work = this.advancing.run(accountId,async () => {
@@ -159,16 +192,16 @@ export class CsfloatSellingService {
           try { db.addEvent(accountId,'csfloat-dispatch-error',{ message: errorMessage(error) },this.context.now()); } catch { /* closed under us */ }
         }
       }
-      const queued = db.raw().prepare(`SELECT o.id AS id FROM csfloat_operation o JOIN action a ON a.id=o.action_id
-        WHERE o.account_id=? AND o.state='QUEUED' AND a.state='READY' AND o.kind IN ('CREATE','REPRICE','CANCEL') ORDER BY o.id`).all(accountId) as Array<{ id: string }>;
+      const queued = this.work.openOf(accountId, CSFLOAT_LISTING_KINDS, CSFLOAT_LISTING_KINDS)
+        .filter(step => step.state === 'QUEUED' && step.action_id !== null && db.action(step.action_id)?.state === 'READY');
       for (const { id } of queued) {
         if (this.stopped) return;
         try {
           await this.execute(id);
         } catch (error) {
           if (this.stopped) return;
-          // A refusal at admission is already on the operation; a second copy would be noise.
-          if (this.store.operation(id)?.state === 'FAILED') continue;
+          // A refusal at admission is already on the hop; a second copy would be noise.
+          if (this.work.step(id)?.state === 'FAILED') continue;
           try { db.addEvent(accountId,'csfloat-dispatch-error',{ operationId: id, message: errorMessage(error) },this.context.now()); } catch { /* closed under us */ }
           continue;
         }
@@ -177,24 +210,28 @@ export class CsfloatSellingService {
         // delisted. This is the first such read, not the only one: until one settles it the
         // refresh loop keeps reading (`needs`). A create is proved by the stall walk
         // `mutation-settled` asks for.
-        const op = this.store.operation(id);
-        if (op?.listing_id && op.kind !== 'CREATE') await this.services.listings.syncListing(accountId,op.listing_id).catch(() => undefined);
+        const step = this.work.step(id);
+        if (step?.target_id && step.kind !== CSFLOAT_CREATE) await this.listing(accountId, step.target_id, 'work');
       }
     });
     this.running.set(accountId,work);
     try { await work; } finally { if (this.running.get(accountId) === work) this.running.delete(accountId); }
   }
 
+  /** One listing's own read, begun now: the proof a delist or reprice needs (CSF-45). */
+  private async listing(accountId: string, listingId: string, priority: 'person' | 'work'): Promise<void> {
+    await this.services.reads.need(accountId, { ref: { surface: 'csfloat-listing', scope: { kind: 'item', id: listingId } }, startedAfter: this.context.now(), priority });
+  }
+
   /**
    * Every send this command asked for, as something a caller can wait for.
    *
-   * The desktop never does — the operation is a durable receipt and the window reads `work.open`
-   * — but a scenario has to, and sleeping asserts nothing. `CommandService.settled` is the
-   * precedent, for the same reason.
+   * The desktop never does — the step is a durable receipt and the window reads `work.open` — but
+   * a scenario has to, and sleeping asserts nothing. `CommandService.settled` is the precedent,
+   * for the same reason.
    */
   async settled(commandId: string): Promise<void> {
-    const accounts = (this.context.database.raw().prepare('SELECT DISTINCT account_id FROM csfloat_operation WHERE command_id=?').all(commandId) as Array<{ account_id: string }>)
-      .map(row => row.account_id);
+    const accounts = [...new Set(this.work.steps(commandId).map(step => step.account_id))];
     for (;;) {
       if (accounts.some(accountId => this.scheduled.has(accountId))) { await new Promise<void>(resolve => setImmediate(resolve)); continue; }
       const running = accounts.map(accountId => this.running.get(accountId)).filter((work): work is Promise<void> => work !== undefined);
@@ -209,13 +246,15 @@ export class CsfloatSellingService {
   }
 
   /**
-   * Admission: one operation per unit, all of them or none.
+   * Admission: one listing hop per unit, all of them or none.
    *
-   * A group member becomes that many operations, one per unit the engine picks (`pickUnits`), so
-   * a replay is judged against the terms asked for — account, price, and the item or the group —
-   * never against which units were picked, which the first admission itself changed.
+   * A group member becomes that many hops, one per unit the engine picks (`pickUnits`), so a
+   * replay is judged against the terms asked for — account, price, and the item or the group —
+   * never against which units were picked, which the first admission itself changed. What comes
+   * back is each unit's listing hop; a crated unit's retrieve and wait hops sit before it under
+   * the same command.
    */
-  queue(request: CsfloatSellRequest): CsfloatOperation[] {
+  queue(request: CsfloatSellRequest): WorkStepRow[] {
     const { database: db } = this.context;
     for (const member of request.members) {
       if ('stackKey' in member && (!Number.isSafeInteger(member.quantity) || member.quantity < 1)) throw new Error('A group member needs a positive whole quantity');
@@ -224,14 +263,15 @@ export class CsfloatSellingService {
       'stackKey' in member ? Array.from({ length: member.quantity }, () => member) : [member]);
     if (!request.members.length || terms.length > CSFLOAT_LIST_LIMIT) throw new Error(`Select between 1 and ${CSFLOAT_LIST_LIMIT} items`);
     return db.transaction(() => {
-      const existing = db.raw().prepare('SELECT * FROM csfloat_operation WHERE command_id=? ORDER BY id').all(request.commandId) as CsfloatOperation[];
+      const existing = this.work.steps(request.commandId).filter(step => step.kind === CSFLOAT_CREATE);
       if (existing.length) {
         if (existing.length !== terms.length || terms.some((m,i) => {
-          const op = existing.find(o => o.id === `${request.commandId}:${i}`);
-          return !op || op.kind !== 'CREATE' || op.account_id !== m.accountId || op.price_cents !== m.priceCents
-            || ('stackKey' in m ? db.itemByLocalId(op.account_id,op.local_id ?? '')?.group_key !== m.stackKey : op.local_id !== m.localId);
+          const step = existing.find(s => s.id === `${request.commandId}:${i}`);
+          const params = step ? this.paramsOf(step) : undefined;
+          return !step || step.account_id !== m.accountId || params?.priceCents !== m.priceCents
+            || ('stackKey' in m ? db.itemByLocalId(step.account_id,step.local_id ?? '')?.group_key !== m.stackKey : step.local_id !== m.localId);
         })) throw new Error('Command id was already used for different terms');
-        return existing;
+        return existing.sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id));
       }
       const selected = new Set<string>();
       const slots = new Map<string, number>();
@@ -250,8 +290,9 @@ export class CsfloatSellingService {
         if (selected.has(key)) throw new Error('Item selected more than once');
         selected.add(key); return { ...member,assetId,casketId };
       });
+      this.work.adoptCommand(request.commandId, CSFLOAT_CREATE, this.context.now());
       return frozen.map((member,i) => this.insert({ id: `${request.commandId}:${i}`, commandId: request.commandId, accountId: member.accountId,
-        localId: member.localId, assetId: member.assetId, priceCents: member.priceCents, kind: 'CREATE',
+        localId: member.localId, assetId: member.assetId, priceCents: member.priceCents, kind: CSFLOAT_CREATE,
         ...(member.casketId ? { casketId: member.casketId } : {}) }));
     });
   }
@@ -279,7 +320,7 @@ export class CsfloatSellingService {
    */
   protected pickUnits(member: CsfloatSellGroupMember, excluded: (localId: string) => boolean): CsfloatSellMember[] {
     const candidates = new HoldingsStore(this.context.database).units(member.accountId,member.stackKey)
-      .filter(unit => unit.location === 'MAIN' && unit.current_asset_id && !unit.reserved_command && !excluded(unit.local_id));
+      .filter(unit => unit.location === 'MAIN' && unit.asset_id && !unit.reserved_command && !excluded(unit.local_id));
     if (candidates.length === 0) throw new Error('No unit of this group is in main inventory and free to list');
     const picked: CsfloatSellMember[] = [];
     let refusal: string | null = null;
@@ -294,16 +335,18 @@ export class CsfloatSellingService {
     throw new Error(`Only ${picked.length} of the ${member.quantity} asked for from this group can be listed on CSFloat now${refusal ? `; the rest: ${refusal}` : ''}`);
   }
 
-  queueEdit(accountId: string, commandId: string, listingId: string, priceCents?: number): CsfloatOperation {
-    const kind = priceCents === undefined ? 'CANCEL' : 'REPRICE';
+  queueEdit(accountId: string, commandId: string, listingId: string, priceCents?: number): WorkStepRow {
+    const kind = priceCents === undefined ? CSFLOAT_CANCEL : CSFLOAT_REPRICE;
     return this.context.database.transaction(() => {
-      const existing = this.store.operation(commandId);
+      const existing = this.work.step(commandId);
       if (existing) {
-        if (existing.account_id !== accountId || existing.listing_id !== listingId || existing.kind !== kind || existing.price_cents !== (priceCents ?? null)) throw new Error('Command id was already used for different terms');
+        const params = this.paramsOf(existing);
+        if (existing.account_id !== accountId || existing.target_id !== listingId || existing.kind !== kind || params.priceCents !== (priceCents ?? null)) throw new Error('Command id was already used for different terms');
         return existing;
       }
       this.validateEdit(accountId,listingId,priceCents);
       const listing = this.store.contract(accountId,listingId)!;
+      this.work.adoptCommand(commandId, kind, this.context.now());
       return this.insert({ id: commandId, commandId, accountId, localId: listing.local_id, assetId: listing.asset_id, listingId,
         priceCents: priceCents ?? null, kind });
     });
@@ -317,76 +360,82 @@ export class CsfloatSellingService {
     if (connection?.status !== 'CONNECTED' || !listing || listing.type !== 'buy_now' || listing.state !== 'listed'
       || !observation?.complete || observation.generation !== connection.generation || !(age >= 0 && age <= 300_000)) throw new Error('Refresh this active fixed-price CSFloat listing first');
     // A listing must have been in the authenticated own book; public known-id lookup cannot confer authority.
-    if (!this.context.database.raw().prepare('SELECT 1 FROM csfloat_listing WHERE account_id=? AND listing_id=?').get(accountId,listingId)) throw new Error('Listing is no longer in the authenticated own book');
+    if (!this.store.inStall(accountId,listingId)) throw new Error('Listing is no longer in the authenticated own book');
     if (priceCents !== undefined && (!Number.isSafeInteger(priceCents) || priceCents < 3)) throw new Error('CSFloat listing price must be at least 3 USD cents');
   }
 
+  protected paramsOf(step: WorkStepRow): CsfloatListingStepParams {
+    return this.work.params<CsfloatListingStepParams>(step);
+  }
+
+  /**
+   * The hops of one admitted unit. A loose unit is one listing hop with its action. A crated unit
+   * is three: the retrieve, whose action the storage service sends and the Game Coordinator walk
+   * proves; the wait for CSFloat's own read to show the item, which has no action and a deadline;
+   * and the listing hop, which gets its action only once CSFloat has seen the item, because an
+   * action on `item:<localId>` would hold the resource against the retrieve.
+   */
   private insert(input: { id: string; commandId: string; accountId: string; localId: string | null; assetId: string | null;
-    listingId?: string; priceCents: number | null; kind: string; casketId?: string }): CsfloatOperation {
+    listingId?: string; priceCents: number | null; kind: CsfloatListingKind; casketId?: string }): WorkStepRow {
     const db = this.context.database, now = this.context.now();
     const connection = new MarketplaceStore(db).connection(input.accountId,'csfloat');
     if (!connection?.credential_ref) throw new Error('Connect CSFloat first');
-    const goal = db.upsertDesired({ accountId: input.accountId, targetKind: 'csfloat-operation', targetId: input.id,
-      intent: input.kind, params: { venue: 'csfloat', priceCents: input.priceCents }, basis: 'manual', now });
+    const params: CsfloatListingStepParams = { operationId: input.id, assetId: input.assetId, listingId: input.listingId ?? null, priceCents: input.priceCents,
+      generation: connection.generation, policyVersion: this.store.policy().version };
+    const common = { commandId: input.commandId, accountId: input.accountId, localId: input.localId, now };
     if (input.casketId) {
-      // The retrieve is a hop of this goal, as the Steam chain's is of its listing goal: an
-      // `item-location` goal of its own would read the later sale as someone moving the item.
-      // No create action yet — it would hold `item:<localId>` against the retrieve — so
-      // `action_id` stays empty until CSFloat has seen the item (`awaitVisibility`).
-      const retrieve = db.enqueueAction({ accountId: input.accountId, desiredId: goal.id, desiredVersion: goal.version,
-        actionKind: 'RETRIEVE_FROM_CASKET', targetId: input.localId!, resourceKey: `item:${input.localId}`,
-        params: { casketId: input.casketId, assetId: input.assetId }, now });
-      db.reserveMainSlot(input.accountId,retrieve.id);
-      db.raw().prepare(`INSERT INTO csfloat_operation(id,command_id,account_id,kind,local_id,asset_id,listing_id,price_cents,generation,policy_version,state,action_id,created_at,updated_at,retrieve_action_id)
-        VALUES (?,?,?,?,?,?,NULL,?,?,?,'RETRIEVING',NULL,?,?,?)`).run(input.id,input.commandId,input.accountId,input.kind,input.localId,input.assetId,
-        input.priceCents,connection.generation,this.store.policy().version,now,now,retrieve.id);
-      return this.store.operation(input.id)!;
+      const retrieve = this.work.insert({ ...common, id: listingHopId(input.id, 'retrieve'), ordinal: 0, kind: 'RETRIEVE', params: { ...params, casketId: input.casketId } });
+      const action = db.enqueueAction({ accountId: input.accountId, stepId: retrieve.id, actionKind: 'RETRIEVE_FROM_CASKET',
+        targetId: input.localId!, resourceKey: `item:${input.localId}`, params: { casketId: input.casketId, assetId: input.assetId }, now });
+      db.reserveMainSlot(input.accountId,action.id);
+      this.work.attachAction(retrieve.id, action.id, now);
+      this.work.insert({ ...common, id: listingHopId(input.id, 'await'), ordinal: 1, kind: 'CSFLOAT_AWAIT_VENUE', params });
+      return this.work.insert({ ...common, id: input.id, ordinal: 2, kind: CSFLOAT_CREATE, params });
     }
-    const action = db.enqueueAction({ accountId: input.accountId, desiredId: goal.id, desiredVersion: goal.version,
-      actionKind: `CSFLOAT_${input.kind}`, targetId: input.localId ?? `csfloat-listing:${input.listingId}`,
-      resourceKey: input.localId ? `item:${input.localId}` : `csfloat-listing:${input.listingId}`,
-      params: { operationId: input.id, assetId: input.assetId, listingId: input.listingId ?? null, priceCents: input.priceCents }, now });
-    db.raw().prepare(`INSERT INTO csfloat_operation(id,command_id,account_id,kind,local_id,asset_id,listing_id,price_cents,generation,policy_version,state,action_id,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,'QUEUED',?,?,?)`).run(input.id,input.commandId,input.accountId,input.kind,input.localId,input.assetId,input.listingId ?? null,
-      input.priceCents,connection.generation,this.store.policy().version,action.id,now,now);
-    return this.store.operation(input.id)!;
+    const step = this.work.insert({ ...common, id: input.id, ordinal: 0, kind: input.kind, targetId: input.listingId ?? null, params });
+    const action = db.enqueueAction({ accountId: input.accountId, stepId: step.id, actionKind: input.kind,
+      targetId: input.localId ?? `csfloat-listing:${input.listingId}`, resourceKey: input.localId ? `item:${input.localId}` : `csfloat-listing:${input.listingId}`,
+      params, now });
+    this.work.attachAction(step.id, action.id, now);
+    return this.work.step(step.id)!;
   }
 
   async execute(id: string): Promise<MutationOutcome | null> {
-    const initial = this.store.operation(id);
+    const initial = this.work.step(id);
     if (!initial) throw new Error('Unknown CSFloat operation');
     return this.context.locks.run(initial.account_id,async () => {
-      const op = this.store.operation(id)!, db = this.context.database, action = op.action_id ? db.action(op.action_id) : undefined;
-      if (!action || action.state !== 'READY' || op.state !== 'QUEUED') return null;
-      const connection = new MarketplaceStore(db).connection(op.account_id,'csfloat'), ports = this.context.ports.csfloat;
+      const step = this.work.step(id)!, db = this.context.database, action = step.action_id ? db.action(step.action_id) : undefined;
+      if (!action || action.state !== 'READY' || step.state !== 'QUEUED' || !(CSFLOAT_LISTING_KINDS as readonly string[]).includes(step.kind)) return null;
+      const params = this.paramsOf(step);
+      const connection = new MarketplaceStore(db).connection(step.account_id,'csfloat'), ports = this.context.ports.csfloat;
       if (!connection?.credential_ref || !ports) throw new Error('Connect CSFloat first');
       const validate = () => {
-        const current = new MarketplaceStore(db).connection(op.account_id,'csfloat');
-        if (current?.generation !== op.generation || current.status !== 'CONNECTED') throw new Error('Connection changed; review the listing command');
-        if (op.kind === 'CREATE') {
-          const asset = this.services.policy.validate({ accountId: op.account_id,localId: op.local_id!,priceCents: op.price_cents! },op.id);
-          if (asset !== op.asset_id) throw new Error('Item asset changed; submit a new selection');
-        } else this.validateEdit(op.account_id,op.listing_id!,op.kind === 'REPRICE' ? op.price_cents! : undefined);
+        const current = new MarketplaceStore(db).connection(step.account_id,'csfloat');
+        if (current?.generation !== params.generation || current.status !== 'CONNECTED') throw new Error('Connection changed; review the listing command');
+        if (step.kind === CSFLOAT_CREATE) {
+          const asset = this.services.policy.validate({ accountId: step.account_id,localId: step.local_id!,priceCents: params.priceCents! },step.id);
+          if (asset !== params.assetId) throw new Error('Item asset changed; submit a new selection');
+        } else this.validateEdit(step.account_id,step.target_id!,step.kind === CSFLOAT_REPRICE ? params.priceCents! : undefined);
       };
       const admission = { rejected: null as Error | null };
       const admit = () => { try { validate(); } catch (error) { admission.rejected = error instanceof Error ? error : new Error(String(error)); throw admission.rejected; } };
       let outcome: MutationOutcome;
       try {
-        outcome = await executeMutation(this.context,action, () => op.kind === 'CREATE'
-          ? ports.listings.create(op.account_id,connection.credential_ref!,op.asset_id!,op.price_cents!)
-          : op.kind === 'REPRICE' ? ports.listings.reprice(op.account_id,connection.credential_ref!,op.listing_id!,op.price_cents!)
-            : ports.listings.cancel(op.account_id,connection.credential_ref!,op.listing_id!),admit);
+        outcome = await executeMutation(this.context,action, () => step.kind === CSFLOAT_CREATE
+          ? ports.listings.create(step.account_id,connection.credential_ref!,params.assetId!,params.priceCents!)
+          : step.kind === CSFLOAT_REPRICE ? ports.listings.reprice(step.account_id,connection.credential_ref!,step.target_id!,params.priceCents!)
+            : ports.listings.cancel(step.account_id,connection.credential_ref!,step.target_id!),admit);
       } catch (error) {
         // Admission refused before any call: the command is over, durably (XLIST-11). Nothing
         // re-queues it when the setting, the connection or the network changes.
         const rejected = admission.rejected;
         if (rejected && error === rejected) db.transaction(() => {
           db.setActionState(action.id,'FAILED',this.context.now(),rejected.message);
-          this.store.update(op.id,'FAILED',this.context.now(),rejected.message);
+          this.work.settle(step.id,'FAILED',null,this.context.now(),rejected.message);
         });
         throw error;
       }
-      this.store.update(op.id,outcome.kind === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION',this.context.now(),outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : null);
+      this.work.setState(step.id,outcome.kind === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION',this.context.now(),outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : null);
       return outcome;
     });
   }
@@ -394,165 +443,198 @@ export class CsfloatSellingService {
   // --- listing from a storage unit ------------------------------------------------------------
 
   /**
-   * The retrieve stage of every crated member on this account.
+   * The retrieve hop of every crated member on this account.
    *
    * A `READY` retrieve is sent. One in flight is resolved only by the storage reconciler, from a
-   * complete walk that started after the attempt (rule 1). A `DONE` one moves the operation to
-   * waiting for CSFloat, anchored on the observation that resolved it. Isolated so a saboteur can
-   * skip the observation.
+   * complete walk that started after the attempt (rule 1); the hop reflects its action's state.
+   * A `DONE` one starts the wait for CSFloat, anchored on the observation that resolved it.
+   * Isolated so a saboteur can skip the observation.
    */
   protected async advanceRetrievals(accountId: string): Promise<void> {
     const db = this.context.database;
-    const ops = this.operationsIn(accountId,'RETRIEVING');
-    if (!ops.length) return;
-    if (ops.some(op => op.retrieve_action_id && db.action(op.retrieve_action_id)?.state === 'AWAITING_OBSERVATION')) this.services.settle.settleNow(accountId);
-    for (const { id } of ops) {
+    const hops = this.work.openOf(accountId, [CSFLOAT_CREATE], ['RETRIEVE']);
+    if (!hops.length) return;
+    if (hops.some(hop => hop.action_id && db.action(hop.action_id)?.state === 'AWAITING_OBSERVATION')) this.services.settle.settleNow(accountId);
+    for (const { id } of hops) {
       if (this.stopped) return;
-      const op = this.store.operation(id)!;
-      const retrieve = op.retrieve_action_id ? db.action(op.retrieve_action_id) : undefined;
-      if (!retrieve) { this.failOperation(op,'Retrieve action is missing; review the listing'); continue; }
-      if (retrieve.state === 'FAILED') { this.failRetrieve(op,retrieve.error ?? 'no reason given'); continue; }
-      if (retrieve.state === 'READY') { await this.sendRetrieve(op,retrieve); continue; }
-      if (retrieve.state === 'DONE') this.startWaiting(op,retrieve);
+      const step = this.work.reflectAction(this.work.step(id)!, this.context.now());
+      const retrieve = step.action_id ? db.action(step.action_id) : undefined;
+      if (!retrieve) { this.failHop(step,'Retrieve action is missing; review the listing'); continue; }
+      if (step.state === 'FAILED') { this.failRetrieve(step,retrieve.error ?? 'no reason given'); continue; }
+      if (retrieve.state === 'READY') { await this.sendRetrieve(step,retrieve); continue; }
+      if (step.state === 'DONE') {
+        const loose = db.observation(accountId, step.observation_id ?? retrieve.resolved_by_obs);
+        if (loose) this.startWaiting(step, loose);
+        else this.failHop(this.awaitHop(step) ?? step,'Retrieve was resolved without an observation; review the listing');
+      }
       // RUNNING or AWAITING_OBSERVATION: the next complete walk schedules another pass.
     }
   }
 
-  private async sendRetrieve(op: CsfloatOperation, retrieve: ActionRow): Promise<void> {
-    const db = this.context.database, accountId = op.account_id;
+  private async sendRetrieve(step: WorkStepRow, retrieve: ActionRow): Promise<void> {
+    const db = this.context.database, accountId = step.account_id;
     // No session, no send; the session coming up schedules the next pass.
     if (this.context.ports.gc.connectionStatus(accountId).state !== 'CONNECTED') return;
     // The retrieve's own admission wants the unit and main inventory freshly walked. Admission read
     // them moments ago; a restart may not have.
     const { casketId } = db.actionParams(retrieve) as { casketId: string };
-    if (locationEvidence(db,accountId,op.local_id!,'CASKET',this.context.ports.clock.now()).grade !== 'SATISFIED') {
-      await this.services.observe(accountId, { surface: 'gc-casket', scope: { kind: 'casket', id: casketId } });
+    if (locationEvidence(db,accountId,step.local_id!,'CASKET',this.context.ports.clock.now()).grade !== 'SATISFIED') {
+      await this.services.reads.need(accountId, { ref: { surface: 'gc-casket', scope: { kind: 'casket', id: casketId } }, startedAfter: this.context.now(), priority: 'work' });
     }
-    await this.services.ensureFresh(accountId,['gc-inventory']);
+    await this.services.reads.ensureFresh(accountId,['gc-inventory']);
     let outcome: MutationOutcome;
     try {
       outcome = await this.context.locks.run(accountId,() => this.services.storage.execute(retrieve.id));
     } catch (error) {
       // Refused before any call: nothing was sent, so the listing is over (XLIST-11's rule).
-      if (db.action(retrieve.id)?.state === 'READY') this.failRetrieve(op,errorMessage(error));
+      if (db.action(retrieve.id)?.state === 'READY') this.failRetrieve(step,errorMessage(error));
       return;
     }
-    if (outcome.kind === 'DEFINITIVELY_REJECTED') { this.failRetrieve(op,outcome.reason); return; }
+    if (outcome.kind === 'DEFINITIVELY_REJECTED') { this.failRetrieve(step,outcome.reason); return; }
     db.markSlotSubmitted(accountId,retrieve.id);
+    this.work.reflectAction(this.work.step(step.id)!, this.context.now());
   }
 
-  /** The retrieve was proved: the item is loose, and the ten minutes start from that proof. */
-  private startWaiting(op: CsfloatOperation, retrieve: ActionRow): void {
+  /**
+   * The retrieve was proved: the item is loose, and the ten minutes start from that proof. The
+   * wait hop goes from queued to waiting on CSFloat's read, with its deadline on the row so a
+   * restart judges the same instant.
+   */
+  protected startWaiting(retrieve: WorkStepRow, loose: ObservationRow): void {
     const db = this.context.database, now = this.context.now();
-    const loose = db.observation(op.account_id,retrieve.resolved_by_obs);
-    if (!loose) { this.failOperation(op,'Retrieve was resolved without an observation; review the listing'); return; }
+    const waiting = this.awaitHop(retrieve);
+    if (!waiting || waiting.state !== 'QUEUED') return;
+    const params = this.paramsOf(retrieve);
     const deadline = new Date(Date.parse(loose.started_at)+VISIBILITY_DEADLINE_MS).toISOString();
     db.transaction(() => {
-      this.store.stampLoose(op.id,loose.id,deadline,now);
-      db.addEvent(op.account_id,'csfloat-visibility-wait',{ operationId: op.id, localId: op.local_id, assetId: op.asset_id, looseAt: loose.started_at, deadline },now);
+      this.work.update(waiting.id, { state: 'AWAITING_OBSERVATION', deadline_at: deadline, reason: 'Waiting for CSFloat to see the retrieved item' }, now);
+      db.addEvent(retrieve.account_id,'csfloat-visibility-wait',{ operationId: params.operationId, localId: retrieve.local_id, assetId: params.assetId, looseAt: loose.started_at, deadline },now);
     });
   }
 
   /**
-   * Every operation of this account whose item is loose and not yet seen by CSFloat.
+   * Every wait hop of this account: a unit that is loose and not yet seen by CSFloat.
    *
    * The deadline is judged first, from the stored column, so a restart judges the same instant
    * and a wait that ran out while the app was closed fails without a read. Then the latest
    * CSFloat read: only one that started after the item was proved loose can say anything about it
-   * (`venueSees`). Seen, the operation gets its create and joins the ordinary path; not yet, the
+   * (`venueSees`). Seen, the listing hop gets its action and joins the ordinary path; not yet, the
    * account's one wait loop is armed.
    */
   protected async awaitVisibility(accountId: string): Promise<void> {
     const db = this.context.database;
     let waiting = false;
-    for (const { id } of this.operationsIn(accountId,'AWAITING_VENUE')) {
+    for (const { id } of this.work.openOf(accountId, [CSFLOAT_CREATE], ['CSFLOAT_AWAIT_VENUE'])) {
       if (this.stopped) return;
-      const op = this.store.operation(id)!;
-      const loose = db.observation(accountId,op.loose_obs);
-      if (!loose || !op.visibility_deadline_at) { this.failOperation(op,'The retrieve\'s observation is missing; review the listing'); continue; }
-      if (this.context.now() >= op.visibility_deadline_at) { this.timeOut(op,loose); continue; }
-      if (db.itemByLocalId(accountId,op.local_id!)?.current_asset_id !== op.asset_id) { this.failOperation(op,'Item asset changed; submit a new selection'); continue; }
-      if (!this.venueSees(op,loose)) { waiting = true; continue; }
-      await this.attachCreate(op,loose);
+      const step = this.work.step(id)!;
+      // Queued: the retrieve before it is still in flight.
+      if (step.state !== 'AWAITING_OBSERVATION') continue;
+      const params = this.paramsOf(step);
+      const loose = this.looseOf(step);
+      if (!loose || !step.deadline_at) { this.failHop(step,'The retrieve\'s observation is missing; review the listing'); continue; }
+      if (this.context.now() >= step.deadline_at) { this.timeOut(step,loose); continue; }
+      if (db.itemByLocalId(accountId,step.local_id!)?.asset_id !== params.assetId) { this.failHop(step,'Item asset changed; submit a new selection'); continue; }
+      if (!this.venueSees(step,loose)) { waiting = true; continue; }
+      await this.attachCreate(step,loose);
     }
     if (waiting) this.armVisibility(accountId);
   }
 
   /** CSFloat's latest complete read, taken after the item was proved loose, shows this exact item tradable. */
-  protected venueSees(op: CsfloatOperation, loose: ObservationRow): boolean {
-    const db = this.context.database;
-    const latest = db.latestObservation(op.account_id,'csfloat-inventory');
-    if (!latest?.complete || latest.error || latest.generation !== op.generation || latest.id <= loose.id || latest.started_at < loose.started_at) return false;
-    const row = db.raw().prepare('SELECT item_json,observation_id FROM csfloat_inventory WHERE account_id=? AND asset_id=?').get(op.account_id,op.asset_id) as { item_json: string; observation_id: number } | undefined;
-    if (!row || row.observation_id !== latest.id) return false;
-    const item = JSON.parse(row.item_json) as CsfloatListingItem;
-    return item.tradable === 1 && this.store.associate(op.account_id,item) === op.local_id;
+  protected venueSees(step: WorkStepRow, loose: ObservationRow): boolean {
+    const db = this.context.database, params = this.paramsOf(step);
+    const latest = db.latestObservation(step.account_id,'csfloat-inventory');
+    if (!latest?.complete || latest.error || latest.generation !== params.generation || latest.id <= loose.id || latest.started_at < loose.started_at) return false;
+    const row = params.assetId ? new AssetEvidenceStore(db).csfloat(step.account_id,params.assetId) : undefined;
+    if (!row || row.last_seen_obs !== latest.id) return false;
+    return row.eligible === 1 && this.store.associate(step.account_id,row.item) === step.local_id;
   }
 
   /**
-   * CSFloat has seen it: the create action, and the operation is an ordinary queued create.
+   * CSFloat has seen it: the wait hop is settled on that read, and the listing hop gets its
+   * action and is an ordinary queued create.
    *
    * Everything `validate` judges is read again first where it may have lapsed during the wait —
    * otherwise the send's admission turns a ten-minute-old read into a permanent refusal — and
    * Steam's trade inventory is read again if the walk on record predates the retrieve, because
    * that walk could not see the item at all.
    */
-  private async attachCreate(op: CsfloatOperation, loose: ObservationRow): Promise<void> {
-    const db = this.context.database, accountId = op.account_id;
-    const steam = new TransferStore(db).fresh(accountId,'steam-trade-inventory',this.context.now());
-    if (!steam || steam.id <= loose.id || steam.started_at < loose.started_at) await this.services.steamTrades.syncEligibility(accountId);
-    await this.services.ensureFresh(accountId,CSFLOAT_LIST_EVIDENCE);
+  private async attachCreate(step: WorkStepRow, loose: ObservationRow): Promise<void> {
+    const db = this.context.database, accountId = step.account_id, params = this.paramsOf(step);
+    // Steam's trade inventory from a walk begun after the item was loose: an earlier one could not see it.
+    await this.services.reads.need(accountId, { ref: { surface: 'steam-trade-inventory', scope: { kind: 'account' } }, startedAfter: loose.started_at, priority: 'work' });
+    await this.services.reads.ensureFresh(accountId,CSFLOAT_LIST_EVIDENCE);
     try {
       db.transaction(() => {
-        const current = this.store.operation(op.id);
-        if (current?.state !== 'AWAITING_VENUE') return;
-        const goal = db.currentDesiredState(accountId,'csfloat-operation',op.id);
-        if (!goal) throw new Error('The listing goal was replaced; review the listing');
+        const current = this.work.step(step.id);
+        if (current?.state !== 'AWAITING_OBSERVATION') return;
+        const listing = this.work.step(params.operationId);
+        if (!listing || listing.state !== 'QUEUED' || listing.action_id) throw new Error('The listing hop was replaced; review the listing');
         const now = this.context.now();
-        const action = db.enqueueAction({ accountId, desiredId: goal.id, desiredVersion: goal.version, actionKind: 'CSFLOAT_CREATE',
-          targetId: op.local_id!, resourceKey: `item:${op.local_id}`,
-          params: { operationId: op.id, assetId: op.asset_id, listingId: null, priceCents: op.price_cents }, now });
-        this.store.attachAction(op.id,action.id,now);
+        const read = db.latestObservation(accountId,'csfloat-inventory')!;
+        const action = db.enqueueAction({ accountId, stepId: listing.id, actionKind: CSFLOAT_CREATE,
+          targetId: step.local_id!, resourceKey: `item:${step.local_id}`, params: this.paramsOf(listing), now });
+        this.work.attachAction(listing.id,action.id,now);
+        this.work.settle(step.id,'DONE',read.id,now);
       });
     } catch (error) {
-      this.failOperation(op,errorMessage(error));
+      this.failHop(step,errorMessage(error));
     }
   }
 
   /** Ten minutes and CSFloat never showed it. The item stays loose: nothing is stored back. */
-  private timeOut(op: CsfloatOperation, loose: ObservationRow): void {
-    const db = this.context.database;
+  private timeOut(step: WorkStepRow, loose: ObservationRow): void {
+    const db = this.context.database, params = this.paramsOf(step);
     const reads = (db.raw().prepare("SELECT COUNT(*) AS n FROM observation WHERE account_id=? AND surface='csfloat-inventory' AND id>?")
-      .get(op.account_id,loose.id) as { n: number }).n;
+      .get(step.account_id,loose.id) as { n: number }).n;
     db.transaction(() => {
-      this.failOperation(op,CSFLOAT_VISIBILITY_TIMEOUT_REASON);
-      db.addEvent(op.account_id,'csfloat-visibility-timeout',{ operationId: op.id, localId: op.local_id, assetId: op.asset_id,
-        looseAt: loose.started_at, deadline: op.visibility_deadline_at, readsMade: reads },this.context.now());
+      this.failHop(step,CSFLOAT_VISIBILITY_TIMEOUT_REASON);
+      db.addEvent(step.account_id,'csfloat-visibility-timeout',{ operationId: params.operationId, localId: step.local_id, assetId: params.assetId,
+        looseAt: loose.started_at, deadline: step.deadline_at, readsMade: reads },this.context.now());
     });
   }
 
-  private failRetrieve(op: CsfloatOperation, reason: string): void {
-    const db = this.context.database;
+  private failRetrieve(step: WorkStepRow, reason: string): void {
+    const db = this.context.database, params = this.paramsOf(step);
     db.transaction(() => {
-      this.failOperation(op,`Retrieve refused: ${reason}`);
-      db.addEvent(op.account_id,'csfloat-retrieve-failed',{ operationId: op.id, localId: op.local_id, assetId: op.asset_id, reason },this.context.now());
+      this.failHop(step,`Retrieve refused: ${reason}`);
+      db.addEvent(step.account_id,'csfloat-retrieve-failed',{ operationId: params.operationId, localId: step.local_id, assetId: params.assetId, reason },this.context.now());
     });
   }
 
   /**
-   * An operation that cannot reach its create: failed with the reason, and a retrieve that never
-   * moved the item is failed too and gives its slot back. A retrieve that did move it keeps its
-   * `DONE`: the item is in main inventory, and that is where it stays.
+   * A member that cannot reach its listing: the hop that stopped it is failed with the reason and
+   * the hops after it are never reached. A retrieve that never moved the item is failed too and
+   * gives its slot back. A retrieve that did move it keeps its `DONE`: the item is in main
+   * inventory, and that is where it stays.
    */
-  private failOperation(op: CsfloatOperation, reason: string): void {
+  private failHop(step: WorkStepRow, reason: string): void {
     const db = this.context.database;
     db.transaction(() => {
       const now = this.context.now();
-      const retrieve = op.retrieve_action_id ? db.action(op.retrieve_action_id) : undefined;
-      if (retrieve?.state === 'READY') db.setActionState(retrieve.id,'FAILED',now,reason);
-      if (retrieve && ['READY','FAILED'].includes(retrieve.state)) db.releaseSlot(op.account_id,retrieve.id,false);
-      this.store.update(op.id,'FAILED',now,reason);
+      const retrieve = step.kind === 'RETRIEVE' ? step : this.retrieveHop(step);
+      const action = retrieve?.action_id ? db.action(retrieve.action_id) : undefined;
+      if (action?.state === 'READY') db.setActionState(action.id,'FAILED',now,reason);
+      if (action && ['READY','FAILED'].includes(action.state)) db.releaseSlot(step.account_id,action.id,false);
+      this.work.failHop(step,reason,now);
     });
+  }
+
+  /** The wait hop of a crated member, from any of its hops. */
+  private awaitHop(step: WorkStepRow): WorkStepRow | undefined {
+    return this.work.step(listingHopId(this.paramsOf(step).operationId, 'await'));
+  }
+
+  /** The retrieve hop of a crated member, from any of its hops. */
+  private retrieveHop(step: WorkStepRow): WorkStepRow | undefined {
+    return this.work.step(listingHopId(this.paramsOf(step).operationId, 'retrieve'));
+  }
+
+  /** The observation that proved a crated member loose: the one that settled its retrieve hop. */
+  private looseOf(step: WorkStepRow): ObservationRow | undefined {
+    const retrieve = this.retrieveHop(step);
+    const observationId = retrieve?.observation_id ?? (retrieve?.action_id ? this.context.database.action(retrieve.action_id)?.resolved_by_obs : null);
+    return this.context.database.observation(step.account_id, observationId ?? null);
   }
 
   /** Starts this account's wait for CSFloat, unless one is already running. */
@@ -585,65 +667,62 @@ export class CsfloatSellingService {
     }
   }
 
-  /** One read of CSFloat's copy of this account's inventory, for everything waiting on it. */
+  /** One read of CSFloat's copy of this account's inventory, begun now, for everything waiting on it. */
   protected async readVenue(accountId: string): Promise<void> {
-    await this.services.readNow(accountId,'csfloat-inventory');
+    await this.services.reads.need(accountId, { ref: { surface: 'csfloat-inventory', scope: { kind: 'account' } }, startedAfter: this.context.now(), priority: 'work' });
   }
 
   /**
    * When this account next reads CSFloat and next hits a deadline. Offsets count from the earliest
-   * waiting operation's loose observation, and the next one is the first strictly after the latest
+   * waiting member's loose observation, and the next one is the first strictly after the latest
    * CSFloat read of any kind — a failed read still spent the budget, and a read someone else asked
    * for counts too.
    */
   private visibilityTurn(accountId: string): { readAt: number | null; deadline: number } | null {
     const db = this.context.database;
-    const ops = this.operationsIn(accountId,'AWAITING_VENUE').filter(op => op.loose_obs !== null && op.visibility_deadline_at !== null);
-    if (!ops.length) return null;
-    const anchor = Math.min(...ops.map(op => Date.parse(db.observation(accountId,op.loose_obs)?.started_at ?? op.visibility_deadline_at!)));
+    const waiting = this.work.openOf(accountId, [CSFLOAT_CREATE], ['CSFLOAT_AWAIT_VENUE'])
+      .filter(step => step.state === 'AWAITING_OBSERVATION' && step.deadline_at !== null);
+    if (!waiting.length) return null;
+    const anchor = Math.min(...waiting.map(step => Date.parse(this.looseOf(step)?.started_at ?? step.deadline_at!)));
     const last = db.latestObservation(accountId,'csfloat-inventory');
     const lastRead = last ? Date.parse(last.started_at) : -Infinity;
     const readAt = VISIBILITY_READ_OFFSETS_MS.map(offset => anchor+offset).find(at => at > lastRead) ?? null;
-    return { readAt, deadline: Math.min(...ops.map(op => Date.parse(op.visibility_deadline_at!))) };
-  }
-
-  private operationsIn(accountId: string, state: 'RETRIEVING' | 'AWAITING_VENUE'): CsfloatOperation[] {
-    return this.context.database.raw().prepare("SELECT * FROM csfloat_operation WHERE account_id=? AND state=? AND kind='CREATE' ORDER BY id")
-      .all(accountId,state) as CsfloatOperation[];
+    return { readAt, deadline: Math.min(...waiting.map(step => Date.parse(step.deadline_at!))) };
   }
 
   /** Called after reads and on restart. It never sends, even when absence is proven. */
   reconcile(accountId: string): void {
     const db = this.context.database;
-    for (const op of this.store.operations(accountId)) {
-      if (!['CREATE','REPRICE','CANCEL'].includes(op.kind)) continue;
-      if (!['QUEUED','AWAITING_OBSERVATION'].includes(op.state) || !op.action_id) continue;
-      const action = db.action(op.action_id);
+    for (const step of this.work.openOf(accountId, CSFLOAT_LISTING_KINDS, CSFLOAT_LISTING_KINDS)) {
+      if (!['QUEUED','AWAITING_OBSERVATION'].includes(step.state) || !step.action_id) continue;
+      const action = db.action(step.action_id);
       if (!action || !['RUNNING','AWAITING_OBSERVATION'].includes(action.state)) continue;
-      this.store.update(op.id,'AWAITING_OBSERVATION',this.context.now());
-      const candidates = op.listing_id ? [this.store.contract(accountId,op.listing_id)].filter(Boolean)
-        : db.raw().prepare('SELECT * FROM csfloat_contract WHERE account_id=? AND (local_id=? OR asset_id=?)').all(accountId,op.local_id,op.asset_id) as ReturnType<CsfloatStore['contract']>[];
+      if (step.state !== 'AWAITING_OBSERVATION') this.work.setState(step.id,'AWAITING_OBSERVATION',this.context.now());
+      const params = this.paramsOf(step);
+      const candidates = step.target_id ? [this.store.contract(accountId,step.target_id)].filter((row): row is CsfloatContract => row !== undefined)
+        : this.store.contractsFor(accountId,step.local_id,params.assetId);
       const listing = candidates.length === 1 ? candidates[0] : undefined;
       if (!listing) continue;
       const obs = db.observation(accountId,listing.observation_id);
-      if (!obs?.complete || obs.error || obs.generation !== op.generation || !postAttempt(db,action,obs,false)) continue;
-      const applied = op.kind === 'CANCEL' ? ['delisted','cancelled'].includes(listing.state)
-        : op.kind === 'CREATE' ? ['listed','sold'].includes(listing.state) && listing.price_cents === op.price_cents
-          : listing.state === 'listed' && listing.price_cents === op.price_cents;
+      if (!obs?.complete || obs.error || obs.generation !== params.generation || !postAttempt(db,action,obs,false)) continue;
+      const applied = step.kind === CSFLOAT_CANCEL ? ['delisted','cancelled'].includes(listing.state)
+        : step.kind === CSFLOAT_CREATE ? ['listed','sold'].includes(listing.state) && listing.price_cents === params.priceCents
+          : listing.state === 'listed' && listing.price_cents === params.priceCents;
       if (applied) {
         db.transaction(() => {
           db.resolveAction(action,obs.id,true,this.context.now());
-          db.raw().prepare('UPDATE csfloat_operation SET listing_id=? WHERE id=?').run(listing.listing_id,op.id);
-          this.store.update(op.id,'DONE',this.context.now());
+          this.work.update(step.id, { state: 'DONE', target_id: listing.listing_id, observation_id: obs.id, reason: null }, this.context.now());
         });
       } else if (['sold','refunded','delisted','cancelled'].includes(listing.state)) {
-        db.setActionState(action.id,'FAILED',this.context.now(),`Observed ${listing.state}; requested operation did not complete`);
-        this.store.update(op.id,'FAILED',this.context.now(),`CSFloat listing is ${listing.state}; check sales before using the item`);
-      } else if (this.editProvedNotApplied(op,listing,action,obs)) {
+        db.transaction(() => {
+          db.setActionState(action.id,'FAILED',this.context.now(),`Observed ${listing.state}; requested operation did not complete`);
+          this.work.settle(step.id,'FAILED',obs.id,this.context.now(),`CSFloat listing is ${listing.state}; check sales before using the item`);
+        });
+      } else if (this.editProvedNotApplied(step,listing,action,obs)) {
         // Failed, never `READY`: `resolveAction` would hand a current goal back to be sent again.
         db.transaction(() => {
           db.setActionState(action.id,'FAILED',this.context.now(),'complete-observation-proved-not-applied');
-          this.store.update(op.id,'FAILED',this.context.now(),op.kind === 'CANCEL'
+          this.work.settle(step.id,'FAILED',obs.id,this.context.now(),step.kind === CSFLOAT_CANCEL
             ? 'A CSFloat read after the delist still showed the listing up, so nothing was delisted'
             : `A CSFloat read after the reprice still showed it at $${(listing.price_cents/100).toFixed(2)}, so the price did not change`);
         });
@@ -657,18 +736,18 @@ export class CsfloatSellingService {
    * the call could have read the listing before the change landed, so it proves nothing (CSF-46,
    * the buy-order cancel's rule in CSF-39). Isolated so a saboteur can wait instead.
    */
-  protected editProvedNotApplied(op: CsfloatOperation, listing: NonNullable<ReturnType<CsfloatStore['contract']>>, action: ActionRow, obs: ObservationRow): boolean {
-    if (op.kind === 'CREATE' || listing.state !== 'listed') return false;
+  protected editProvedNotApplied(step: WorkStepRow, listing: CsfloatContract, action: ActionRow, obs: ObservationRow): boolean {
+    if (step.kind === CSFLOAT_CREATE || listing.state !== 'listed') return false;
     return postAttempt(this.context.database,action,obs,true);
   }
 
   /**
    * What proves a delist or reprice CSFloat accepted: that listing's own read, begun after the
    * send returned (CSF-45). The stall cannot prove it, because a listing the stall no longer holds
-   * may have sold. The refresh loop reads the listing for as long as the operation waits — at
-   * once, then on the proof intervals, then on the listing's own cadence — so a read that fails
-   * is followed by another rather than by nothing, and a restart reads for it from the record.
-   * A create is proved by the stall walk its send nudges, which the stall's cadence repeats.
+   * may have sold. The refresh loop reads the listing for as long as the hop waits — at once, then
+   * on the proof intervals, then on the listing's own cadence — so a read that fails is followed
+   * by another rather than by nothing, and a restart reads for it from the record. A create is
+   * proved by the stall walk its send nudges, which the stall's cadence repeats.
    */
   needs(action: ActionRow): ProofNeed {
     const { listingId } = this.context.database.actionParams(action) as { listingId?: string | null };
@@ -680,22 +759,20 @@ export class CsfloatSellingService {
    * One durable conflict per foreign duplicate (XLIST-09, XLIST-14). Raised only while
    * protection is on; resolved only when the latest complete Steam and CSFloat walks no longer
    * show both advertisements. An incomplete walk changes nothing in either direction, and no
-   * refresh ever raises a second row for the same unit.
+   * refresh ever raises a second row for the same unit. Judged after every read that could show one.
    */
-  /** A foreign duplicate is one durable conflict (XLIST-09). Judged after every read that could show one. */
   observeConflicts(accountId: string): void {
     const db = this.context.database, now = this.context.now();
-    const conflicts = db.raw().prepare(`SELECT c.listing_id FROM csfloat_contract c JOIN market_listing s ON s.account_id=c.account_id
-      AND (s.local_id=c.local_id OR s.asset_id=c.asset_id) WHERE c.account_id=? AND c.state='listed'
-      AND s.status IN ('ACTIVE','ON_HOLD','PENDING_CONFIRMATION')`).all(accountId) as Array<{ listing_id: string }>;
+    const conflicts = db.raw().prepare(`SELECT c.venue_order_id AS listing_id FROM venue_order c JOIN venue_order o ON o.account_id=c.account_id
+      AND (o.local_id=c.local_id OR o.asset_id=c.asset_id) WHERE c.account_id=? AND c.venue='csfloat' AND c.side='SELL' AND c.state='OPEN' AND ${STEAM_LISTED_SQL}`).all(accountId) as Array<{ listing_id: string }>;
     if (this.store.policy().preventDuplicates) {
-      for (const row of conflicts) db.raw().prepare(`INSERT INTO marketplace_conflict(account_id,conflict_key,reason,observed_at) VALUES (?,?,?,?)
+      for (const row of conflicts) db.raw().prepare(`INSERT INTO venue_conflict(account_id,conflict_key,reason,observed_at) VALUES (?,?,?,?)
         ON CONFLICT(account_id,conflict_key) DO UPDATE SET resolved_at=NULL`).run(accountId,`duplicate:${row.listing_id}`,`Item advertised on Steam and CSFloat (${row.listing_id})`,now);
     }
     const stall = db.latestObservation(accountId,'csfloat-stall'), market = db.latestObservation(accountId,'steam-market');
     if (!stall?.complete || stall.error || !market?.complete || market.error) return;
     const current = new Set(conflicts.map(row => `duplicate:${row.listing_id}`));
-    const open = db.raw().prepare(`SELECT conflict_key FROM marketplace_conflict WHERE account_id=? AND resolved_at IS NULL AND conflict_key LIKE 'duplicate:%'`).all(accountId) as Array<{ conflict_key: string }>;
-    for (const row of open) if (!current.has(row.conflict_key)) db.raw().prepare('UPDATE marketplace_conflict SET resolved_at=? WHERE account_id=? AND conflict_key=?').run(now,accountId,row.conflict_key);
+    const open = db.raw().prepare(`SELECT conflict_key FROM venue_conflict WHERE account_id=? AND resolved_at IS NULL AND conflict_key LIKE 'duplicate:%'`).all(accountId) as Array<{ conflict_key: string }>;
+    for (const row of open) if (!current.has(row.conflict_key)) db.raw().prepare('UPDATE venue_conflict SET resolved_at=? WHERE account_id=? AND conflict_key=?').run(now,accountId,row.conflict_key);
   }
 }

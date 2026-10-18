@@ -59,9 +59,15 @@ importers:
       '@cslytics/catalogue':
         specifier: workspace:*
         version: link:../../packages/catalogue
+      '@cslytics/cslytics-account':
+        specifier: workspace:*
+        version: link:../../packages/cslytics-account
       '@cslytics/engine':
         specifier: workspace:*
         version: link:../../packages/engine
+      '@cslytics/market-data':
+        specifier: workspace:*
+        version: link:../../packages/market-data
       '@cslytics/ports':
         specifier: workspace:*
         version: link:../../packages/ports
@@ -138,7 +144,19 @@ importers:
         specifier: workspace:*
         version: link:../ports
 
+  packages/cslytics-account:
+    dependencies:
+      '@cslytics/ports':
+        specifier: workspace:*
+        version: link:../ports
+
   packages/engine:
+    dependencies:
+      '@cslytics/ports':
+        specifier: workspace:*
+        version: link:../ports
+
+  packages/market-data:
     dependencies:
       '@cslytics/ports':
         specifier: workspace:*

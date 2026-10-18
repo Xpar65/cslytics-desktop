@@ -2,7 +2,7 @@ import React from 'react';
 import { Badge, Button, Caption, Empty, KeyValue, StatusBadge } from '../../components/ui.js';
 import { Icon } from '../../components/Icon.js';
 import { VenueMark } from '../../components/VenueMark.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { UNRESOLVED_REASON, formatDateTime, formatRelative, humanize } from '../../lib/labels.js';
 import { InspectorHero, InspectorWear } from '../../components/InspectorParts.js';
 import { delistBlocked, repriceBlocked, type Delisting } from './listing-actions.js';
@@ -58,7 +58,7 @@ export function ListingInspector({ row, account, multiAccount, busy, staged, del
     <div className="inspector-price">
       <Money cents={row.buyerPriceCents} currency={row.currency} />
       <span className="caption">
-        {row.receiveCents === null ? 'buyer pays' : `buyer pays · you receive ${formatCents(row.receiveCents, row.currency)}`}
+        {row.receiveCents === null ? 'buyer pays' : `buyer pays · you receive ${formatAmount(row.receiveCents, row.currency)}`}
       </span>
     </div>
 

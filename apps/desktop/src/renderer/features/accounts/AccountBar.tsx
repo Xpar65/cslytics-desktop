@@ -3,7 +3,7 @@ import type { MarketplaceStatus } from '@cslytics/engine';
 import type { AccountConnection, AccountHoldings } from '../../lib/types.js';
 import { freshness } from '../../lib/portfolio.js';
 import { describeConnection, worstTone } from '../../lib/connection.js';
-import { formatCents } from '../../lib/format.js';
+import { formatAmount } from '../../lib/money.js';
 import { plural } from '../../lib/labels.js';
 import { Avatar, AvatarStack } from '../../components/Avatar.js';
 import { Icon } from '../../components/Icon.js';
@@ -120,7 +120,7 @@ export function AccountBar({
                     {holding?.wallet ? (
                       <>
                         <Icon name="wallet" size={11} />
-                        {formatCents(holding.wallet.balanceCents, holding.currency)}
+                        {formatAmount(holding.wallet.balanceCents, holding.currency)}
                         <span className="quiet">· {age.label}</span>
                       </>
                     ) : (

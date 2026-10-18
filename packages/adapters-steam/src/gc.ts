@@ -263,6 +263,10 @@ export class SteamGcAdapter implements SteamGcPort {
     return this.session(accountId).events.iterable();
   }
 
+  drainEvents(accountId: AccountId): GcEvent[] {
+    return this.session(accountId).events.drain();
+  }
+
   async listStorageUnits(accountId: AccountId): Promise<StorageUnit[]> {
     const session = this.session(accountId);
     return (session.gc.inventory ?? [])
@@ -302,6 +306,10 @@ export class SteamGcAdapter implements SteamGcPort {
     const before = unit();
     if (!before) throw new Error(`Unknown storage unit ${casketId}`);
     const countBefore = Number(before.casket_contained_item_count ?? 0);
+    // What `globaloffensive` is about to do, decided the way it decides it: an empty unit and one whose
+    // children are all in the cache are answered without a message; anything else is a load.
+    const loaded = (session.gc.inventory ?? []).filter((item: any) => String(item.casket_id ?? '') === casketId).length;
+    const transport: CasketRead['transport'] = countBefore === 0 || loaded === countBefore ? 'cache' : 'wire';
     const rawItems = await callbackWithTimeout<any[]>(this.operationTimeoutMs, (done) => session.gc.getCasketContents(casketId, done));
     const items = rawItems.map(mapItem);
     // The SO cache may have replaced the unit's row while the children loaded; read it again now.
@@ -314,7 +322,8 @@ export class SteamGcAdapter implements SteamGcPort {
       containsCount,
       countGeneration: generation,
       itemsGeneration: generation,
-      completeness: complete ? 'complete' : 'incomplete'
+      completeness: complete ? 'complete' : 'incomplete',
+      transport
     };
   }
 
@@ -452,11 +461,22 @@ export class SteamGcAdapter implements SteamGcPort {
     }
   }
 
+  /**
+   * One store or retrieve. Moves may overlap: a command sends the next one without waiting for this
+   * one's answer (bulk storage plan D1), so the answer is matched by the item's own SO event and
+   * never by the unit's notification, which names only the unit (`waitForCasketOperation`). A move
+   * is given `MOVE_TIMEOUT_MS`, not the half-minute other operations get: the GC answers one in
+   * about 350 ms, and a silent one is ambiguous however long it is waited for.
+   *
+   * With no live session nothing is written to the socket and the move is refused as such. It
+   * used to throw from `session()` before its `try`, which `executeMutation` recorded as an
+   * ambiguous attempt for a send that never left.
+   */
   private async move(accountId: string, casketId: string, itemId: string, adding: boolean): Promise<MutationOutcome> {
-    const session = this.session(accountId);
-    if (!session.connected) return { kind: 'DEFINITIVELY_REJECTED', reason: 'gc-disconnected', raw: null };
+    const session = this.sessions.get(accountId);
+    if (!session || !isLive(session)) return { kind: 'DEFINITIVELY_REJECTED', reason: 'gc-disconnected', raw: null };
     try {
-      const type = await waitForCasketOperation(session.gc, casketId, itemId, adding, this.operationTimeoutMs, () => {
+      const type = await waitForCasketOperation(session.gc, casketId, itemId, adding, Math.min(this.operationTimeoutMs, MOVE_TIMEOUT_MS), () => {
         if (adding) session.gc.addToCasket(casketId, itemId);
         else session.gc.removeFromCasket(casketId, itemId);
       });
@@ -771,6 +791,10 @@ class AsyncQueue<T> {
     if (waiter) waiter({ done: false, value });
     else this.values.push(value);
   }
+  /** Everything buffered, in order, and nothing more: never a value a waiter is owed. */
+  drain(): T[] {
+    return this.values.splice(0);
+  }
   iterable(): AsyncIterable<T> {
     return { [Symbol.asyncIterator]: () => ({ next: async () => this.values.length
       ? { done: false, value: this.values.shift()! }
@@ -805,6 +829,62 @@ async function callbackWithTimeout<T>(timeoutMs: number, action: (done: (error: 
   });
 }
 
+/**
+ * How long a store or retrieve waits for its answer. The GC answers one in about 350 ms (measured
+ * by us, 2026-04-17); past this the move is ambiguous, and the command's round read decides it.
+ */
+export const MOVE_TIMEOUT_MS = 5_000;
+
+/** A move still waiting for its answer, as the unit it went to knows it. */
+type CasketWaiter = { adding: boolean; refuse: (type: unknown) => void };
+
+/** Per GC handler: the moves waiting on each unit, oldest first. */
+const casketWaiters = new WeakMap<object, Map<string, CasketWaiter[]>>();
+
+/**
+ * The moves waiting on one unit, with the one listener per GC handler that hands a unit's refusal
+ * to the move it answers.
+ *
+ * `CasketTooFull` (1011) and `CasketInvFull` (1015) name the unit and nothing else, and a command
+ * may have several moves to one unit in flight at once. The GC answers in the order it was asked,
+ * so a refusal answers the oldest move of its kind still waiting on that unit. A success needs no
+ * such guess: it is the item's own SO event, which carries the item's id.
+ */
+function waitersOn(gc: any, casketId: string): CasketWaiter[] {
+  let units = casketWaiters.get(gc);
+  if (!units) {
+    const created = new Map<string, CasketWaiter[]>();
+    units = created;
+    casketWaiters.set(gc, created);
+    // Moves overlap, each with its own listeners for its item: more than the default ten is normal.
+    if (typeof gc.setMaxListeners === 'function') gc.setMaxListeners(Math.max(gc.getMaxListeners?.() ?? 10, 100));
+    gc.on('itemCustomizationNotification', (itemIds: unknown, type: unknown) => {
+      const kind = notificationKind(type);
+      if (kind !== 'casket-full' && kind !== 'inventory-full') return;
+      const ids = Array.isArray(itemIds) ? itemIds.map(String) : [];
+      created.get(ids[0] ?? '')?.find((waiter) => waiter.adding === (kind === 'casket-full'))?.refuse(type);
+    });
+  }
+  let waiting = units.get(casketId);
+  if (!waiting) {
+    waiting = [];
+    units.set(casketId, waiting);
+  }
+  return waiting;
+}
+
+/**
+ * Sends one move and waits for what answers it: the item's SO destroy for a store (or an SO update
+ * that places it in the unit), its SO create outside the unit for a retrieve (or an SO update that
+ * takes it out), the unit's refusal routed by `waitersOn`, a dropped session, or the deadline. The
+ * unit-level `CasketAdded` and `CasketRemoved` notifications are not answers: with several moves in
+ * flight they cannot say which one landed.
+ *
+ * Reading a unit loads its contents into the cache as SO creates, each carrying the unit's id. A
+ * resident whose retrieve is in flight arrives that way too, and that is the item where it was, not
+ * a retrieve. Answered by it, a retrieve was proved not applied by the read that followed, before
+ * the GC had moved anything (measured 2026-10-16: answered after 20 ms, moved 270 ms later).
+ */
 async function waitForCasketOperation(
   gc: any,
   casketId: string,
@@ -814,30 +894,33 @@ async function waitForCasketOperation(
   action: () => void
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    const waiting = waitersOn(gc, casketId);
+    const waiter: CasketWaiter = { adding, refuse: (type) => { cleanup(); resolve(type); } };
     const timer = setTimeout(() => { cleanup(); reject(new Error('casket operation timeout')); }, timeoutMs);
-    const listener = (itemIds: unknown, type: unknown): void => {
-      const ids = Array.isArray(itemIds) ? itemIds.map(String) : [];
-      if (ids[0] !== casketId) return;
-      const kind = notificationKind(type);
-      if (!['casket-full', 'inventory-full', adding ? 'added' : 'removed'].includes(kind)) return;
-      cleanup();
-      resolve(type);
-    };
     const itemEvent = (item: any): void => {
       if (String(item?.id ?? item) !== itemId) return;
+      if (!adding && String(item?.casket_id ?? '') === casketId) return;
+      cleanup();
+      resolve(adding ? 1013 : 1014);
+    };
+    const changed = (_previous: any, item: any): void => {
+      if (String(item?.id ?? '') !== itemId || (String(item?.casket_id ?? '') === casketId) !== adding) return;
       cleanup();
       resolve(adding ? 1013 : 1014);
     };
     const disconnected = (): void => { cleanup(); reject(new Error('GC disconnected')); };
     const cleanup = (): void => {
       clearTimeout(timer);
-      gc.removeListener('itemCustomizationNotification', listener);
+      const at = waiting.indexOf(waiter);
+      if (at >= 0) waiting.splice(at, 1);
       gc.removeListener('disconnectedFromGC', disconnected);
       gc.removeListener(adding ? 'itemRemoved' : 'itemAcquired', itemEvent);
+      gc.removeListener('itemChanged', changed);
     };
-    gc.on('itemCustomizationNotification', listener);
+    waiting.push(waiter);
     gc.once('disconnectedFromGC', disconnected);
     gc.on(adding ? 'itemRemoved' : 'itemAcquired', itemEvent);
+    gc.on('itemChanged', changed);
     action();
   });
 }
