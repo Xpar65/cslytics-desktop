@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { pageCommandMembers, pageTransfers, readDetail, bounded, csfloatOperationAccount, selectionAccounts, selectionMembers, type TradingEngine, type ObservationRow, type ReadOutcome, type RefusalReason, type CommandRequest, type ListingFilter, type TransferMember, type TransferPreview } from '@cslytics/engine';
-import type { EngineCommand } from '../../shared/api.js';
+import type { RuntimeCommand } from './api.js';
 
-export function createRuntimeDispatch(engine: TradingEngine, hasStoredCredential: (id: string) => Promise<boolean>) {
-async function dispatch(command: EngineCommand): Promise<unknown> {
+/** The function that answers one runtime command: the engine's reply, or a thrown refusal by name. */
+export type RuntimeDispatch = (command: RuntimeCommand) => Promise<unknown>;
+
+export function createRuntimeDispatch(engine: TradingEngine, hasStoredCredential: (id: string) => Promise<boolean>): RuntimeDispatch {
+async function dispatch(command: RuntimeCommand): Promise<unknown> {
   switch (command.type) {
     case 'csfloat.page': return engine.views.csfloatPage(command.accountId,command.book,command.cursor);
     case 'csfloat.overview': return engine.views.csfloatOverview(command.accountId);
@@ -396,6 +399,10 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     }
     case 'refresh.resume':
       return engine.refreshResumed();
+    case 'accounts.add':
+      // The row a host needs before a session minted elsewhere can be connected. An account already
+      // known by name or SteamID64 is updated in place; the reply is the id the record uses.
+      return { accountId: engine.ensureAccount(command.accountId, command.steamId64, command.accountName) };
     case 'accounts.clearable':
       return { refusal: engine.accountClearRefusal(command.accountId) };
     case 'refresh.status':
@@ -403,8 +410,8 @@ async function dispatch(command: EngineCommand): Promise<unknown> {
     case 'refresh.scope':
       engine.setActiveAccount(command.accountId);
       return { kind: 'scoped', accountId: command.accountId };
-    // Main answers the rest itself (`release.*`, `settings.*`, `cslytics.*`, the price commands)
-    // and never forwards them. Anything else that reaches here is a command this table does not
+    // A caller answers its own commands (the desktop's `release.*`, `settings.*`, `cslytics.*` and
+    // price commands) and never forwards them. Anything else that reaches here is a command this table does not
     // know, and the answer is a refusal by name rather than `undefined`: a caller reading a field
     // off a silent nothing fails one step later, in a place that says nothing about which command
     // was missing (the `inventory.positions` gap read as "Cannot read properties of undefined").
@@ -452,7 +459,7 @@ function engineFilter(filter: Record<string, unknown> | undefined): Record<strin
 }
 
 /** The listings filter as the engine takes it. Chips are main's to resolve; one arriving here was not. */
-function listingEngineFilter(filter: NonNullable<Extract<EngineCommand, { type: 'listings.page' }>['filter']>): ListingFilter {
+function listingEngineFilter(filter: NonNullable<Extract<RuntimeCommand, { type: 'listings.page' }>['filter']>): ListingFilter {
   const { chips, ...rest } = definedFields({ type: 'filter', ...filter });
   if (chips !== undefined) throw new Error('listings filter reached the engine with chips in it; main must resolve them to matchKeys');
   return rest;

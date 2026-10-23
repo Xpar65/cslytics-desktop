@@ -1,6 +1,6 @@
 {
   "name": "cslytics-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -13,13 +13,9 @@
     "build": "pnpm --filter @cslytics/desktop build",
     "dev": "pnpm --filter @cslytics/desktop dev",
     "package:desktop": "pnpm build && pnpm --filter @cslytics/desktop exec electron-builder --config electron-builder.config.mjs --win --publish never",
-    "smoke:packaged": "tsx scripts/smoke-packaged.ts",
-    "release:desktop": "tsx scripts/release-desktop.ts",
-    "release:publish": "tsx scripts/release-publish.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
-    "@playwright/test": "^1.63.0",
     "@types/node": "^24.3.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"

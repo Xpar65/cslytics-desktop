@@ -3,7 +3,7 @@
  * The Windows installer and the update feed every installed copy reads (desktop release plan §4).
  *
  * JavaScript rather than YAML because signing depends on the environment: `pnpm package:desktop`
- * builds an unsigned installer for this machine, and `pnpm release:desktop` refuses to run without
+ * builds an unsigned installer for this machine, and an official release refuses to build without
  * the certificate, whose thumbprint and subject arrive as
  *
  *   CSLYTICS_SIGN_SHA1       the YubiKey certificate's SHA-1 thumbprint (`certutil -scinfo`)

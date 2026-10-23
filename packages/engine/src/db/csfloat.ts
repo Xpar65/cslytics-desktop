@@ -275,10 +275,17 @@ export class CsfloatStore {
   inStall(accountId: string, listingId: string): boolean {
     return Boolean(this.db.raw().prepare(`SELECT 1 FROM venue_order v WHERE v.account_id=? AND v.venue='csfloat' AND v.venue_order_id=? AND ${IN_BOOK}`).get(accountId, listingId));
   }
-  /** Listings the stall no longer shows, or never has, whose word is not yet an ending: each is owed its own read. */
+  /**
+   * Listings the stall no longer shows, or never has, whose word is not yet an ending: each is owed
+   * its own read. A listing the venue calls `sold` whose trade the sales book carries is explained
+   * by that trade, which the trades walk keeps current, and is not among them: on a long-lived
+   * account every past sale would otherwise be read one at a time at the endpoint's budget, and
+   * again on the next refresh (CSF-48, 1,545 of them on the first headless run, 2026-10-20).
+   */
   unexplainedListings(accountId: string, limit = 250): string[] {
     return (this.db.raw().prepare(`SELECT v.venue_order_id AS listing_id FROM venue_order v JOIN csfloat_order s ON s.account_id=v.account_id AND s.order_id=v.order_id
-      WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND s.state_word NOT IN ${CSFLOAT_ENDED_SQL} AND NOT (${IN_BOOK}) LIMIT ?`)
+      WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND s.state_word NOT IN ${CSFLOAT_ENDED_SQL} AND NOT (${IN_BOOK})
+        AND NOT (s.state_word='sold' AND EXISTS (SELECT 1 FROM csfloat_trade t WHERE t.account_id=v.account_id AND t.listing_id=v.venue_order_id)) LIMIT ?`)
       .all(accountId, limit) as Array<{ listing_id: string }>).map((row) => row.listing_id);
   }
   trade(accountId: string, tradeId: string): CsfloatTradeRow | undefined {

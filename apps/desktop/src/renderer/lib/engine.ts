@@ -24,6 +24,8 @@ export type RefreshStatusRow = {
   /** Set only while every due read is being held off. */
   heldUntil?: string;
   reason?: string;
+  /** The one surface resting, when the hold is a failed walk's and not the CS2 session's. */
+  heldSurface?: string;
 };
 
 export type SavedAccount = {

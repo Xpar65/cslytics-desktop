@@ -54,6 +54,8 @@ export const COMMAND_EFFECTS = {
   'auth.cancel': 'local',
   'auth.refresh': 'local',
   'accounts.list': 'local',
+  // Ensures a row in the record and asks no venue anything; a host's substitute for a QR login.
+  'accounts.add': 'local',
   // Both erase this computer's copy of one account and reach no venue: a retired version keeps them,
   // so a person can still take an account off a machine.
   'accounts.clearable': 'local',

@@ -128,6 +128,8 @@ export type RefreshStatus = {
   /** Set while reads are being held off, with the reason and when it lifts. */
   heldUntil?: string;
   reason?: string;
+  /** The one surface a failed walk backed off, when the hold is one scope's and not the session's: the rest of the account reads on. */
+  heldSurface?: Surface;
   scopes: ScopeStatus[];
 };
 
@@ -180,7 +182,7 @@ type AccountEntry = {
   lanes: Set<string>;
   loop?: Promise<void> | undefined;
   wake?: (() => void) | undefined;
-  held?: { until: number; reason: string } | undefined;
+  held?: { until: number; reason: string; surface?: Surface } | undefined;
   lastSweptMs: number;
 };
 
@@ -397,7 +399,7 @@ export class ReadBroker implements Reading {
     const base: RefreshStatus = { accountId, tier: this.tier(accountId), running: account?.kept ?? false, scopes: this.status(accountId) };
     const held = account?.held;
     if (!held || held.until <= nowMs) return base;
-    return { ...base, heldUntil: new Date(held.until).toISOString(), reason: held.reason };
+    return { ...base, heldUntil: new Date(held.until).toISOString(), reason: held.reason, ...(held.surface ? { heldSurface: held.surface } : {}) };
   }
 
   private scopeStatus(account: AccountEntry, scope: ScopeEntry, gc: GcStatus, nowMs: number): ScopeStatus {
@@ -439,8 +441,17 @@ export class ReadBroker implements Reading {
     return account;
   }
 
+  /**
+   * The key a scope is held under: its surface and, for anything narrower than the account, its
+   * id. Isolated so a saboteur can key by surface alone, the mistake that left a second CSFloat
+   * delist unread on 2026-10-19 (`CSF-47`).
+   */
+  protected scopeKey(ref: SurfaceRef): string {
+    return surfaceName(ref);
+  }
+
   private scope(account: AccountEntry, ref: SurfaceRef): ScopeEntry {
-    const name = surfaceName(ref);
+    const name = this.scopeKey(ref);
     let scope = account.scopes.get(name);
     if (!scope) {
       scope = { ref, name, transport: TRANSPORT_OF[ref.surface], needs: [], hintUntilMs: 0, since: this.context.now() };
@@ -609,7 +620,9 @@ export class ReadBroker implements Reading {
       }
       // A held scope is walked only for a need that reads through the hold; the cadence waits.
       if (this.heldNow(account, scope) && !scope.needs.some((entry) => this.presses(entry))) continue;
-      if (!this.context.governors.tryAdmitRead(account.accountId, scope.transport, scope.name)) continue;
+      // The bucket is the endpoint's, not the scope's: a venue counts calls to a route, so a
+      // hundred listings read one at a time share one route's budget.
+      if (!this.context.governors.tryAdmitRead(account.accountId, scope.transport, scope.ref.surface)) continue;
       this.startWalk(account, scope, lane);
     }
   }
@@ -653,7 +666,7 @@ export class ReadBroker implements Reading {
     if (scope.walk === walk) scope.walk = undefined;
     account.lanes.delete(lane);
     scope.since = this.context.now();
-    if (result.kind === 'walked' && result.transport === 'gc-wire') this.context.governors.debitRead(accountId, 'gc-wire', scope.name);
+    if (result.kind === 'walked' && result.transport === 'gc-wire') this.context.governors.debitRead(accountId, 'gc-wire', scope.ref.surface);
     if (result.kind !== 'walked') {
       for (const entry of [...walk.needs]) this.answer(scope, entry, refused(result.kind));
       return;
@@ -754,7 +767,7 @@ export class ReadBroker implements Reading {
       const resetsAtMs = this.context.governors.breakerFor(account.accountId, scope.name).resetsAtMs();
       if (resetsAtMs !== null) { earliest = Math.min(earliest, resetsAtMs); continue; }
       if (scope.hintUntilMs > nowMs) { earliest = Math.min(earliest, scope.hintUntilMs); continue; }
-      earliest = Math.min(earliest, this.context.governors.readAdmittedAtMs(account.accountId, scope.transport, scope.name));
+      earliest = Math.min(earliest, this.context.governors.readAdmittedAtMs(account.accountId, scope.transport, scope.ref.surface));
     }
     if (account.kept) {
       const demand = this.demand(account.accountId);
@@ -938,7 +951,8 @@ export class ReadBroker implements Reading {
       now,
       hasOpenCommitment: hasOpenCommitment(this.context.database, accountId),
       transferIntervalMs,
-      proofDueAtMs: proofDueAtMs(ref, demand, observation?.started_at, now.getTime())
+      proofDueAtMs: proofDueAtMs(ref, demand, observation?.started_at, now.getTime()),
+      backfillPending: ref.surface === 'steam-market-history' && this.services.market.orders.backfillPending(accountId)
     });
   }
 
@@ -965,13 +979,13 @@ export class ReadBroker implements Reading {
 
   /** Backs a scope off after a failed or incomplete walk, from its own interval, and says why in the window's words. */
   protected decay(accountId: AccountId, ref: SurfaceRef, reason: string): void {
-    const name = surfaceName(ref);
+    const name = this.scopeKey(ref);
     const nowMs = this.context.ports.clock.now().getTime();
     const account = this.account(accountId);
     const base = baseIntervalMs(ref.surface, account.tier);
     const state = this.backoff.fail(accountId, name, Number.isFinite(base) ? base : 60_000, nowMs);
     this.scope(account, ref).holdReason = reason;
-    account.held = { until: state.notBeforeMs, reason };
+    account.held = { until: state.notBeforeMs, reason, surface: ref.surface };
   }
 
   // --- signals -------------------------------------------------------------

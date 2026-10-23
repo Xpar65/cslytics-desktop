@@ -111,7 +111,17 @@ export type DueInput = {
   transferIntervalMs?: number;
   /** When a waiting action's need makes this scope due (`policy/proof.ts`). */
   proofDueAtMs?: number | undefined;
+  /** The market history still has older pages to read (`OrderService.coverage`): the backfill interval caps the tier's. */
+  backfillPending?: boolean;
 };
+
+/**
+ * How soon the market history is read again while older pages remain. A walk reads the top of the
+ * log and at most `HISTORY_PAGES_PER_WALK` pages, so an account whose log is deep is covered over
+ * several walks rather than one; two minutes apart keeps the per-endpoint budget untouched and
+ * finishes a log of fifty pages inside half an hour.
+ */
+export const HISTORY_BACKFILL_EVERY_MS = 2 * 60_000;
 
 export type DueVerdict =
   | { due: true; because: 'never-observed' | 'proof' | 'stale' | 'incomplete' }
@@ -150,7 +160,8 @@ export function isDue(input: DueInput): DueVerdict {
   // again as soon as the hold its failure earned lifts, which the broker waits out.
   if (grade === 'INCOMPLETE') return { due: true, because: 'incomplete' };
 
-  const interval = Math.min(baseIntervalMs(surface, input.tier, input.hasOpenCommitment ?? true),input.transferIntervalMs ?? Infinity);
+  const interval = Math.min(baseIntervalMs(surface, input.tier, input.hasOpenCommitment ?? true), input.transferIntervalMs ?? Infinity,
+    input.backfillPending ? HISTORY_BACKFILL_EVERY_MS : Infinity);
   const startedMs = Date.parse(input.observation.started_at);
   if (!Number.isFinite(startedMs)) return { due: true, because: 'incomplete' };
   const staleAtMs = startedMs + interval;

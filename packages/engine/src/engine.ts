@@ -584,8 +584,8 @@ export class TradingEngine {
     return this.database.resolveGoalConflict(accountId, desiredId, resolution, this.context.now());
   }
   converge(accountId: AccountId) { return this.convergenceService.converge(accountId); }
-  syncMarketHistory(accountId: AccountId) {
-    return this.settledAfter(accountId, this.marketService.orders.syncHistory(accountId));
+  syncMarketHistory(accountId: AccountId, pageSize?: number) {
+    return this.settledAfter(accountId, this.marketService.orders.syncHistory(accountId, pageSize));
   }
 
   /**

@@ -41,14 +41,25 @@
       ],
       "@cslytics/cslytics-account": [
         "packages/cslytics-account/src/index.ts"
+      ],
+      "@cslytics/runtime": [
+        "packages/runtime/src/index.ts"
+      ],
+      "@cslytics/runtime/api": [
+        "packages/runtime/src/api.ts"
+      ],
+      "@cslytics/runtime/lock": [
+        "packages/runtime/src/lock.ts"
+      ],
+      "@cslytics/host": [
+        "apps/host/src/index.ts"
       ]
     }
   },
   "include": [
     "apps/**/*.ts",
     "apps/**/*.tsx",
-    "packages/**/*.ts",
-    "scripts/**/*.ts"
+    "packages/**/*.ts"
   ],
   "exclude": [
     "node_modules",

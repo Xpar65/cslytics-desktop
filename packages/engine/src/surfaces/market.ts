@@ -2,7 +2,7 @@ import type { AccountId, MarketBuyOrder, MarketListing, MutationOutcome } from '
 import type { ActionRow, ObservationRow } from '../db/database.js';
 import { type EngineContext, executeMutation } from '../kernel/context.js';
 import { errorMessage, required } from '../kernel/support.js';
-import { ACCOUNT_MARKET, ACCOUNT_INVENTORY, attemptReturned, surfaceEvidence, postAttempt, locationEvidence, evaluatePreconditions, PRECONDITIONS, requirePreconditions, type ProofNeed } from '../kernel/evidence.js';
+import { ACCOUNT_HISTORY, ACCOUNT_MARKET, ACCOUNT_INVENTORY, attemptReturned, surfaceEvidence, postAttempt, locationEvidence, evaluatePreconditions, PRECONDITIONS, requirePreconditions, type ProofNeed } from '../kernel/evidence.js';
 import { LISTING_REVERSED, reconcileDivergence } from '../policy/divergence.js';
 import { settleNotApplied } from '../kernel/not-applied.js';
 import { NEVER_RETRY, RETRY_POLICY, type RetryPolicy } from '../kernel/retry-policy.js';
@@ -296,7 +296,11 @@ export class MarketService {
     if (action.kind === 'CREATE_SELL_LISTING') {
       const pending = new OrderStore(database).openSteamListingAt(action.account_id, action.target_id, (database.actionParams(action) as SellParams).priceReceiveCents);
       if (pending?.raw_bucket === 'PENDING_CONFIRMATION') return { kind: 'person', reason: 'Confirm the listing in the Steam mobile app' };
-      return { kind: 'walks', walks: [{ ref: ACCOUNT_MARKET, startedAfter: after }] };
+      // The book, and the inventory: a request the book never showed is proved not to have landed
+      // only by the item still held, and once the item is gone it is the history that says *sold*.
+      const item = database.itemByLocalId(action.account_id, action.target_id);
+      const walks = [{ ref: ACCOUNT_MARKET, startedAfter: after }, { ref: ACCOUNT_INVENTORY, startedAfter: after }];
+      return { kind: 'walks', walks: item && item.location !== 'MAIN' ? [...walks, { ref: ACCOUNT_HISTORY, startedAfter: after }] : walks };
     }
     if (action.kind === 'REMOVE_SELL_LISTING') {
       // Gone from the book is half of it; back in inventory is what tells a cancel from a sale.
@@ -308,6 +312,25 @@ export class MarketService {
   /** The kind's row in `RETRY_POLICY`. Isolated so a saboteur can retry without end; nothing shipped overrides it. */
   protected retryPolicyFor(action: ActionRow): RetryPolicy {
     return RETRY_POLICY[action.kind] ?? NEVER_RETRY;
+  }
+
+  /**
+   * Whether a listing request absent from a complete market walk begun after the attempt is
+   * proved not to have landed: `proved` when a complete inventory walk begun after that market
+   * walk still holds the item in main inventory, `gone` when such a walk no longer holds it, which
+   * is what a sale before the first walk looks like, and `unknown` until one has been made. The
+   * inventory walk must begin after the market walk, not merely after the attempt: a sale between
+   * the two would leave an older walk holding an item the book had already sold. Isolated so a
+   * saboteur can read the empty book alone as proof, which is the belief that sent ten sold
+   * listings again.
+   */
+  protected listingRequestProvedNotApplied(action: ActionRow, market: ObservationRow): 'proved' | 'gone' | 'unknown' {
+    const { database } = this.context;
+    const held = locationEvidence(database, action.account_id, action.target_id, 'MAIN', this.context.ports.clock.now(), action);
+    if (held.grade === 'UNKNOWN') return 'unknown';
+    const proof = database.observation(action.account_id, held.observationId);
+    if (!proof || proof.started_at < market.started_at) return 'unknown';
+    return held.grade === 'SATISFIED' ? 'proved' : 'gone';
   }
 
   /**
@@ -350,9 +373,19 @@ export class MarketService {
             if (action.desired_id !== null) database.suspendGoal(accountId, action.desired_id, LISTING_REVERSED, this.context.now());
             database.resolveAction(action, obs.id, true, this.context.now());
           } else {
-            // Never on the book in a complete walk begun after the attempt: the request did not
-            // land (order-lifecycle A1). Convergence sends the `READY` action once more, and the
-            // cap, like every kind's, is `kernel/retry-policy.ts`.
+            // Never on the book in a complete walk begun after the attempt. That alone is not
+            // proof the request did not land: a listing can sell before the first walk after it,
+            // and then the book never showed it and the item is gone. Ten did on 2026-10-14, were
+            // read as never sent, and were sent again against an inventory that no longer held
+            // them. The request did not land only when the item is still held (order-lifecycle
+            // A1); gone, it waits for the history to say sold (`OrderService.bindSales`).
+            const held = this.listingRequestProvedNotApplied(action, obs);
+            if (held === 'unknown') continue;
+            if (held === 'gone') {
+              database.addEventOnce(accountId, 'listing-unresolved-sale-race', { actionId: action.id, localId: action.target_id }, this.context.now());
+              continue;
+            }
+            // Convergence sends the `READY` action once more, and the cap, like every kind's, is `kernel/retry-policy.ts`.
             settleNotApplied(this.context, action, obs.id, 'Steam never showed the listing', { policy: this.retryPolicyFor(action) });
           }
         }

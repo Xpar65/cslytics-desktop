@@ -10,7 +10,7 @@ import { imageFetch } from './images/fetch.js';
 import { ElectronCredentialVault } from './credential-vault.js';
 import { answerCslytics, createCslyticsAccount } from './cslytics-account/index.js';
 import { trustInterceptedHostsUnpackaged } from './unpackaged-certificates.js';
-import { reapRuntimeLock, reapRuntimeLockWhenGone } from './runtime/runtime-lock.js';
+import { reapRuntimeLock, reapRuntimeLockWhenGone } from '@cslytics/runtime/lock';
 import { purgeArgument, type PurgeOutcome, type PurgeRequest } from './runtime/account-clear.js';
 import { CHANGE_CHANNEL, engineCommandSchema } from '../shared/api.js';
 import { catalogueFetch, csfloatSchemaFetch } from './catalogue/fetch.js';

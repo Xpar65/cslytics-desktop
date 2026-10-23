@@ -1,6 +1,6 @@
 {
   "name": "@cslytics/desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "main": "./out/main/index.js",
@@ -26,6 +26,7 @@
     "@cslytics/engine": "workspace:*",
     "@cslytics/market-data": "workspace:*",
     "@cslytics/ports": "workspace:*",
+    "@cslytics/runtime": "workspace:*",
     "@types/qrcode": "^1.5.5",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",

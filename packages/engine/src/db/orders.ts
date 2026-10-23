@@ -179,6 +179,36 @@ export class OrderStore {
     return orderId;
   }
 
+  /**
+   * Sell requests of ours the book has never shown, by the asset each sent: a request still waiting,
+   * and one a walk once proved absent. The history walk reads them to bind a sale it names for that
+   * asset, because a listing that sells before the first walk after it leaves the book nothing to
+   * show and the inventory without the item.
+   */
+  unseenSellRequests(accountId: string, venue: OrderVenue): VenueOrderRow[] {
+    return this.sqlite.prepare(`SELECT * FROM venue_order INDEXED BY order_state_page WHERE account_id=? AND state IN ('SUBMITTED','ENDED_NOT_APPLIED')
+      AND venue=? AND side='SELL' AND first_seen_obs IS NULL AND asset_id IS NOT NULL AND action_id IS NOT NULL`)
+      .all(accountId, venue) as VenueOrderRow[];
+  }
+
+  /** When the account's earliest order on a venue opened: how far back a first history walk must cover. */
+  earliestOpenedAt(accountId: string, venue: OrderVenue): string | undefined {
+    const row = this.sqlite.prepare(`SELECT MIN(opened_at) AS at FROM venue_order WHERE account_id=? AND venue=?`).get(accountId, venue) as { at: string | null };
+    return row.at ?? undefined;
+  }
+
+  /**
+   * Binds a request the book never showed to the listing the history names for its asset. The row
+   * takes the venue's listing id, and one a walk had ended as never applied is reopened, so the
+   * order service grades the sale with everything else it grades and nothing here decides an end.
+   */
+  bindUnseenSale(accountId: string, orderId: string, listingId: string, hashName: string | null): void {
+    this.sqlite.prepare(`UPDATE venue_order SET venue_order_id=?, hash_name=COALESCE(?, hash_name),
+      state=CASE WHEN state='ENDED_NOT_APPLIED' THEN 'SUBMITTED' ELSE state END, ended_at=NULL, end_reason=NULL, end_evidence=NULL
+      WHERE account_id=? AND order_id=? AND first_seen_obs IS NULL`).run(listingId, hashName, accountId, orderId);
+    this.db.touch(accountId, 'venue_order');
+  }
+
   /** A request a complete walk proved absent never made an order: its row ends `ENDED_NOT_APPLIED` if no walk ever showed it. */
   endNotApplied(action: ActionRow, observationId: number, now: string): void {
     this.sqlite.prepare(`UPDATE venue_order SET state='ENDED_NOT_APPLIED', ended_at=?, end_evidence=?, confidence='proven',

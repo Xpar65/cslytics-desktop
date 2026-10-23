@@ -75,9 +75,18 @@ export const ACCOUNT_MARKET: SurfaceRef = { surface: 'steam-market', scope: { ki
 export const ACCOUNT_WALLET: SurfaceRef = { surface: 'steam-wallet', scope: { kind: 'account' } };
 export const ACCOUNT_HISTORY: SurfaceRef = { surface: 'steam-market-history', scope: { kind: 'account' } };
 export const ACCOUNT_STORAGE_UNITS: SurfaceRef = { surface: 'gc-storage-units', scope: { kind: 'account' } };
-/** The name a request or a message gives a scope. Never an observation's `surface`: a casket's observation is surface `gc-casket` with the casket in `scope_id` (consolidation plan D14). */
+/**
+ * The name a request or a message gives a scope, and the key the read broker, its breakers and its
+ * backoff hold the scope under. Never an observation's `surface`: a casket's observation is surface
+ * `gc-casket` with the casket in `scope_id` (consolidation plan D14).
+ *
+ * Every scope that is not the account's carries its id. Until 2026-10-19 only `gc-casket` did, so
+ * every `csfloat-listing` need joined the one broker entry the first listing had made: a second
+ * delist waiting beside it was never read, and the first was read every five seconds for good
+ * (adversarial testing plan §0.1). `G-INV-13` holds this injective.
+ */
 export function surfaceName(ref: SurfaceRef): string {
-  return ref.surface === 'gc-casket' ? `gc-casket:${ref.scope.id}` : ref.surface;
+  return ref.scope.kind === 'account' ? ref.surface : `${ref.surface}:${ref.scope.id ?? ''}`;
 }
 export function surfaceOf(obs: ObservationRow): Surface {
   return obs.surface as Surface;

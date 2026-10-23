@@ -94,7 +94,7 @@ export class CsfloatSellingService {
     await read(account('csfloat-account-status'));
     await read(account('csfloat-stall'));
     await read(account('csfloat-trades'));
-    for (const listingId of this.store.unexplainedListings(accountId)) await read({ surface: 'csfloat-listing', scope: { kind: 'item', id: listingId } });
+    for (const listingId of this.unexplained(accountId)) await read({ surface: 'csfloat-listing', scope: { kind: 'item', id: listingId } });
     if (eligibility) {
       for (const surface of ['gc-inventory', 'steam-market', 'steam-trade-inventory', 'steam-trade-offers', 'csfloat-inventory'] as const) await read(account(surface));
     }
@@ -119,6 +119,11 @@ export class CsfloatSellingService {
    * way a Steam command does through `CommandService.prepare`. A refusal still comes back here,
    * because admission is still here.
    */
+  /** The listings a refresh reads one by one: those nothing in the record explains (`CsfloatStore.unexplainedListings`). */
+  protected unexplained(accountId: string): string[] {
+    return this.store.unexplainedListings(accountId);
+  }
+
   async submit(request: CsfloatSellRequest): Promise<WorkStepRow[]> {
     const admitted = this.work.steps(request.commandId).length > 0;
     if (!admitted) {

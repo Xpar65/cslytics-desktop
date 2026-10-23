@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./market": "./src/market.ts",
+    "./trade": "./src/trade.ts"
+  },
   "dependencies": {
     "@cslytics/ports": "workspace:*",
     "globaloffensive": "^3.2.0",

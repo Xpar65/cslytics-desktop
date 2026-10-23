@@ -86,17 +86,28 @@ const SIDEBAR_PIN_KEY = 'cslytics.sidebar.pinned';
 
 const NO_CONNECTING: ReadonlySet<string> = new Set<string>();
 
+/** What the window calls a surface a failed walk backed off, so "sales history" rests and not "the account". */
+const HELD_SURFACE_WORDS: Readonly<Record<string, string>> = {
+  'steam-market-history': 'sales history', 'steam-market': 'listings', 'steam-wallet': 'the wallet', 'steam-persona': 'the profile',
+  'steam-trade-offers': 'trade offers', 'steam-trade-history': 'trade history', 'steam-trade-inventory': 'the trade inventory',
+  'gc-inventory': 'the inventory', 'gc-storage-units': 'storage units', 'gc-casket': 'a storage unit', 'gc-store-price-sheet': 'the store',
+  'csfloat-account-status': 'CSFloat', 'csfloat-stall': 'CSFloat listings', 'csfloat-trades': 'CSFloat sales', 'csfloat-inventory': 'the CSFloat inventory',
+  'csfloat-buy-orders': 'CSFloat buy orders', 'csfloat-listing': 'a CSFloat listing', 'csfloat-trade': 'a CSFloat trade'
+};
+
 /**
  * Turns a refresh hold into something a person can act on.
  *
  * The two causes need different responses and must not read alike: one is another computer
  * holding the CS2 session, which only that computer can release; the other is this app waiting
- * out a failure, which fixes itself.
+ * out a failure, which fixes itself. A failed walk's hold is one surface's, and the text names
+ * it, because the rest of the account is still being read.
  */
 function describeHold(hold: RefreshStatusRow): string {
   if (hold.reason === 'blocked-elsewhere') return 'CS2 is open on another computer';
   if (hold.reason === 'gc-disconnected') return 'reconnecting to the Game Coordinator';
-  return `retrying after ${hold.reason}`;
+  const surface = hold.heldSurface ? HELD_SURFACE_WORDS[hold.heldSurface] ?? hold.heldSurface : undefined;
+  return surface ? `${surface} is retrying after ${hold.reason}` : `retrying after ${hold.reason}`;
 }
 
 export function App(): React.JSX.Element {

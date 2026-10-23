@@ -88,8 +88,12 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
     return () => { live = false; };
   }, [open, scope]);
 
-  const unitLabel = (accountId: string, casketId: string): string =>
-    units.find((unit) => unit.accountId === accountId && unit.casketId === casketId)?.label ?? 'a storage unit';
+  // The unit a hop puts the item into. Only a store hop ends in one: a retrieve ends in the
+  // inventory, and a send to another account names a unit of that account, which is not in this list.
+  const unitName = (member: WorkRow): string | null | undefined =>
+    member.destinationCasketId && member.actionKind !== 'RETRIEVE_FROM_CASKET'
+      ? units.find((unit) => unit.accountId === member.accountId && unit.casketId === member.destinationCasketId)?.label
+      : undefined;
 
   const commands = new Map<string, WorkRow[]>();
   for (const row of rows) commands.set(row.commandId, [...(commands.get(row.commandId) ?? []), row]);
@@ -207,7 +211,7 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
                       <span className="work-row-meta quiet">
                         {/* A confirmed row says what happened, not what was under way: "Stored · into Storage Unit 1". */}
                         {member.memberState === 'COMPLETE' ? hop.done ?? hop.verb : hop.verb}<Venue of={hop} />
-                        {member.destinationCasketId ? <> · into {unitLabel(member.accountId, member.destinationCasketId)}</> : null}
+                        {unitName(member) ? <> · into {unitName(member)}</> : null}
                         {member.priceReceiveCents !== null ? <> · {formatUsd(member.priceReceiveCents)}</> : null}
                       </span>
                     )}

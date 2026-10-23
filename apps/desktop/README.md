@@ -7,7 +7,6 @@ utility process that owns the engine and the SQLite file.
 pnpm dev               # electron-vite dev server
 pnpm build             # produces apps/desktop/out, which every journey runs against
 pnpm package:desktop   # the unsigned installers (web and full), the app package and win-unpacked, in apps/desktop/dist
-pnpm smoke:packaged    # starts the packaged app and proves it opens a record and resolves its dependencies
 ```
 
 `electron-builder.config.mjs` is the installer and the update feed; `src/main/release/` is the
@@ -33,7 +32,7 @@ missing `case` in `engine-runtime.ts`'s `dispatch`, or a schema that rejected th
 
 ## Rules
 
-- One Engine Runtime per profile. `runtime-lock.ts` makes a second instance refuse rather than
+- One Engine Runtime per profile. `@cslytics/runtime/lock` makes a second instance refuse rather than
   corrupt, and closing the window terminates the runtime (AUTH-08, SYS-01).
 - The renderer reads SQLite projections, never Steam. Sign-in is a dialog over the shell, never the
   front door, so the window opens on cached data with nothing connected.

@@ -1,6 +1,6 @@
-import type { MarketHistoryEvent } from '@cslytics/ports';
+import type { MarketHistoryEvent, MyHistoryPage } from '@cslytics/ports';
 import type { EngineContext } from '../kernel/context.js';
-import { ACCOUNT_INVENTORY, ACCOUNT_MARKET, freshness, locationEvidence, postAttempt, surfaceEvidence, type Evidence } from '../kernel/evidence.js';
+import { ACCOUNT_HISTORY, ACCOUNT_INVENTORY, ACCOUNT_MARKET, freshness, locationEvidence, postAttempt, surfaceEvidence, type Evidence } from '../kernel/evidence.js';
 import type { ItemRow } from '../db/database.js';
 import type { OrderConfidence, OrderState, OrderVenue } from '../db/alphabets.js';
 import { OrderStore, type VenueOrderRow } from '../db/orders.js';
@@ -32,6 +32,36 @@ export type OrderClassification = {
   orderId: string; state: OrderState; evidence: number; confidence: OrderConfidence; reason: string;
   /** Present only when per-order history actually named a sale. Amounts stay optional. */
   sale?: { listingId: string; purchaseId: string; occurredAt: string };
+};
+
+/**
+ * The pages one history walk may read: the top of the log, then as many older pages as are left.
+ *
+ * `myhistory` is offset-paged from the newest event and answers HTTP 429 after about twenty pages
+ * back to back (corpus `steamcommunity.market.myhistory`). A walk that read the whole log from
+ * offset zero on every pass never finished on a log of 25,566 events: twenty-one walks between
+ * 2026-10-14 and 2026-10-19 each ended in a 429 at the same depth, and the account's sales never
+ * reached the record. A walk now reads what is new and extends its coverage by a few pages, and
+ * each page past the first takes the endpoint's own token (`admitPage`), so five pages cost what
+ * five requests cost rather than one.
+ */
+export const HISTORY_PAGES_PER_WALK = 5;
+
+/**
+ * What the record holds of an account's history: one segment, contiguous from the newest event
+ * down to `boundaryEventId`, kept in `surface_state` as the surface's cursor.
+ *
+ * `coveredCount` is also the boundary's offset plus one while the log only grows at the top, which
+ * is how a backfill page is addressed; the page is then checked to begin with the boundary event
+ * rather than trusted. `remaining` is what lay below the boundary at the last complete walk, and
+ * `stopped` says why the backfill gave up short of the log's end when it did.
+ */
+export type HistoryCoverage = {
+  coveredCount: number;
+  boundaryEventId: string;
+  boundaryAt: string;
+  remaining: number;
+  stopped?: string;
 };
 
 /**
@@ -77,34 +107,125 @@ export function historyMoney(raw: unknown, field: 'received_amount' | 'paid_amou
 export class OrderService {
   constructor(protected readonly context: EngineContext, readonly profile: VenueProfile = STEAM_PROFILE) {}
 
+  /** The committed coverage of the account's history, or undefined before its first complete walk. */
+  coverage(accountId: string): HistoryCoverage | undefined {
+    const row = this.context.database.checkpoint(accountId, ACCOUNT_HISTORY.surface);
+    if (!row) return undefined;
+    const cursor = JSON.parse(row.cursor_json) as Partial<HistoryCoverage>;
+    return typeof cursor.boundaryEventId === 'string' && Number.isSafeInteger(cursor.coveredCount) && Number.isSafeInteger(cursor.remaining)
+      ? cursor as HistoryCoverage : undefined;
+  }
+
+  /** Whether older pages of the history remain to be read, which hurries the surface's cadence (`policy/cadence.ts`). */
+  backfillPending(accountId: string): boolean {
+    const coverage = this.coverage(accountId);
+    return coverage !== undefined && coverage.remaining > 0 && !coverage.stopped;
+  }
+
+  /** The pages one walk may read. Isolated so a saboteur can read without end. */
+  protected pagesPerWalk(): number {
+    return HISTORY_PAGES_PER_WALK;
+  }
+
+  /**
+   * Takes the endpoint's token for one more page of a walk already admitted. The broker charges a
+   * walk one token; a walk of several pages is several requests to the venue, and is paced as such.
+   * Isolated so a saboteur can page for free.
+   */
+  protected async admitPage(accountId: string): Promise<void> {
+    await this.context.governors.admitRead(accountId, 'steam-web', ACCOUNT_HISTORY.surface);
+  }
+
+  /**
+   * One walk of the account's history: the newest pages down to what the record already holds,
+   * then, while the walk's pages last, older pages below its boundary.
+   *
+   * The log is offset-paged from the newest event, so an offset says nothing stable about an
+   * event; a page is judged by the events on it. The top is read until a page holds an event the
+   * record already has, which joins what was read to the coverage. A first walk has nothing to
+   * join and stops once the page's oldest event is older than the account's earliest order, as
+   * far back as any order's grading can ask; the rest of the log is the backfill's, a few pages a
+   * walk until the end. A top that outran the walk's pages restarts the coverage at what was
+   * read, contiguous from the newest event, and what lay under the old boundary is backfilled
+   * again (`history-coverage-rebased`). A backfill page is read at the boundary's offset and must
+   * begin with the boundary event; one that does not stops the backfill with a reason, since
+   * offsets that lie are not a thing to reason past.
+   *
+   * Any page that fails makes the walk incomplete and commits nothing (rule 5). A row is written
+   * only when it joins the coverage, so a row's presence is also its membership of the covered
+   * segment, which is what lets the next walk's top page recognise it.
+   */
   async syncHistory(accountId: string, pageSize = 500): Promise<number> {
     const { database } = this.context;
     const startedAt = this.context.now();
-    const events: MarketHistoryEvent[] = [];
-    let start = 0;
+    const previous = this.coverage(accountId);
+    const needBefore = previous ? undefined : new OrderStore(database).earliestOpenedAt(accountId, this.profile.venue) ?? startedAt;
+    const heldRow = database.raw().prepare(`SELECT 1 FROM market_history WHERE account_id=? AND event_id=?`);
+    const held = (event: MarketHistoryEvent): boolean => previous !== undefined && heldRow.get(accountId, event.eventId) !== undefined;
+    const seen = new Set<string>();
+    const fresh: MarketHistoryEvent[] = [];
     let pages = 0;
     let total: number | undefined;
     let error: string | undefined;
+    let coverage: HistoryCoverage | undefined;
+    let rebased = false;
+    const read = async (start: number): Promise<MyHistoryPage> => {
+      if (pages > 0) await this.admitPage(accountId);
+      const page = await this.context.ports.market.getMyHistoryPage(accountId, start, pageSize);
+      pages += 1;
+      if (page.start !== start || !Number.isSafeInteger(page.totalCount) || page.totalCount < 0
+        || (total !== undefined && page.totalCount < total)) throw new Error('history-pagination-mismatch');
+      if (new Set(page.events.map((event) => event.eventId)).size !== page.events.length) throw new Error('history-duplicate-events');
+      if (!page.events.length && start < page.totalCount) throw new Error('history-incomplete-walk');
+      total = page.totalCount;
+      return page;
+    };
     try {
+      // 1. The top of the log, down to the covered segment.
+      let newer = 0;
+      let oldestFresh: MarketHistoryEvent | undefined;
+      let joined = false;
+      let start = 0;
       for (;;) {
-        const page = await this.context.ports.market.getMyHistoryPage(accountId, start, pageSize);
-        pages += 1;
-        if (page.start !== start || !Number.isSafeInteger(page.totalCount) || page.totalCount < 0
-          || (total !== undefined && total !== page.totalCount)) throw new Error('history-pagination-mismatch');
-        total = page.totalCount;
-        events.push(...page.events);
-        if (events.length === total) break;
-        if (events.length > total || !page.events.length || pages >= 1000) throw new Error('history-incomplete-walk');
+        const page = await read(start);
+        for (const event of page.events) {
+          if (seen.has(event.eventId)) continue;
+          seen.add(event.eventId);
+          if (held(event)) joined = true;
+          else { fresh.push(event); newer += 1; oldestFresh = event; }
+        }
+        if (joined || !page.events.length || start + page.events.length >= total!) break;
+        if (needBefore !== undefined && page.events[page.events.length - 1]!.occurredAt < needBefore) break;
+        if (pages >= this.pagesPerWalk()) break;
         start += page.events.length;
       }
-      if (new Set(events.map((event) => event.eventId)).size !== events.length) throw new Error('history-duplicate-events');
-      if (!events.length && database.raw().prepare(`SELECT 1 FROM market_history WHERE account_id=? LIMIT 1`).get(accountId)) throw new Error('suspicious-empty-history');
+      if (total === 0) {
+        if (database.raw().prepare(`SELECT 1 FROM market_history WHERE account_id=? LIMIT 1`).get(accountId)) throw new Error('suspicious-empty-history');
+      } else if (joined && previous) {
+        coverage = { ...previous, coveredCount: previous.coveredCount + newer, remaining: Math.max(0, total! - (previous.coveredCount + newer)) };
+      } else if (oldestFresh) {
+        rebased = previous !== undefined;
+        coverage = { coveredCount: newer, boundaryEventId: oldestFresh.eventId, boundaryAt: oldestFresh.occurredAt, remaining: Math.max(0, total! - newer) };
+      }
+      // 2. Older pages, each anchored on the boundary, while the walk's pages last.
+      while (coverage && coverage.remaining > 0 && !coverage.stopped && pages < this.pagesPerWalk()) {
+        const page = await read(Math.max(0, coverage.coveredCount - 1));
+        const at = page.events.findIndex((event) => event.eventId === coverage!.boundaryEventId);
+        const older = at === -1 ? [] : page.events.slice(at + 1).filter((event) => !seen.has(event.eventId));
+        const reachedEnd = page.start + page.events.length >= total!;
+        if (at === -1 || (!older.length && !reachedEnd)) { coverage = { ...coverage, stopped: 'history-anchor-mismatch' }; break; }
+        for (const event of older) { seen.add(event.eventId); fresh.push(event); }
+        const oldest = older[older.length - 1];
+        const coveredCount = coverage.coveredCount + older.length;
+        coverage = { ...coverage, coveredCount, remaining: reachedEnd ? 0 : Math.max(0, total! - coveredCount),
+          ...(oldest ? { boundaryEventId: oldest.eventId, boundaryAt: oldest.occurredAt } : {}) };
+      }
     } catch (caught) { error = errorMessage(caught); }
     const observationId = database.transaction(() => {
-      const obs = database.insertObservation({ accountId, surface: 'steam-market-history', startedAt, finishedAt: this.context.now(),
-        complete: !error && total !== undefined, pagesWalked: pages, ...(total === undefined ? {} : { totalExpected: total }), ...(error ? { error } : {}) });
+      const obs = database.insertObservation({ accountId, surface: ACCOUNT_HISTORY.surface, startedAt, finishedAt: this.context.now(),
+        complete: !error, pagesWalked: pages, ...(total === undefined ? {} : { totalExpected: total }), ...(error ? { error } : {}) });
       if (!error) {
-        for (const event of events) {
+        for (const event of fresh) {
           // What a read asks of an event, and no body (D15): the money it named is the ledger's
           // row, keyed by the event, and the name is what the venue called the item, when it said.
           database.raw().prepare(`INSERT INTO market_history
@@ -113,24 +234,50 @@ export class OrderService {
             .run(accountId, event.eventId, event.listingId, event.purchaseId ?? null, event.eventType, event.occurredAt, obs, historyHashName(event.raw));
           this.postHistoryLedger(accountId, event, obs);
         }
-        database.touch(accountId, 'market_history');
-        // Deduplication, the history rows, the ledger postings and the checkpoint commit in one
-        // transaction, so a restart cannot keep half the accounting effect (DATA-06). The
-        // checkpoint moves only on a walk that reached `total_count`, which is what stops a
-        // failed page from making the next sync skip the events it never saw.
-        const newest = events.reduce<string | null>((latest, event) =>
-          latest === null || event.occurredAt > latest ? event.occurredAt : latest, null);
-        database.advanceCheckpoint({
-          accountId, surface: 'steam-market-history', cursor: { totalCount: total ?? 0 },
-          coveredThrough: newest, observationId: obs, now: this.context.now()
-        });
+        if (fresh.length) database.touch(accountId, 'market_history');
+        // The rows, the ledger postings, the bindings and the coverage commit in one transaction,
+        // so a restart cannot keep half the accounting effect (DATA-06), and the coverage moves
+        // only with the rows that join it, which is what stops a failed page from making the next
+        // walk skip the events it never saw.
+        if (coverage) {
+          database.advanceCheckpoint({ accountId, surface: ACCOUNT_HISTORY.surface, cursor: coverage, coveredThrough: coverage.boundaryAt, observationId: obs, now: this.context.now() });
+          if (rebased) database.addEvent(accountId, 'history-coverage-rebased', { coveredCount: coverage.coveredCount, remaining: coverage.remaining }, this.context.now());
+          if (coverage.stopped && coverage.stopped !== previous?.stopped) database.addEvent(accountId, 'history-backfill-stopped', { reason: coverage.stopped, coveredCount: coverage.coveredCount }, this.context.now());
+        }
+        this.bindSales(accountId, fresh, obs);
       }
       return obs;
     });
-    this.context.signals.emit({
-      kind: 'observed', accountId, surface: 'steam-market-history', complete: !error && total !== undefined, observationId
-    });
+    this.context.signals.emit({ kind: 'observed', accountId, surface: ACCOUNT_HISTORY.surface, complete: !error, observationId });
     return observationId;
+  }
+
+  /**
+   * Binds a sale the walk read to the request of ours that sent its asset, when no market walk
+   * ever showed the listing: it sold before the first walk after it, so the book had nothing to
+   * show and the inventory walk no item (order lifecycle A1). The order takes the listing id and
+   * the attempt is resolved as applied; the grading is `classifyOrders`'s, with every other order's.
+   */
+  protected bindSales(accountId: string, events: readonly MarketHistoryEvent[], observationId: number): void {
+    const { database } = this.context;
+    const sales = events.filter((event) => event.eventType === 3 && event.purchaseId && event.assetId);
+    if (!sales.length) return;
+    const store = new OrderStore(database);
+    for (const order of store.unseenSellRequests(accountId, this.profile.venue)) {
+      const action = order.action_id ? database.action(order.action_id) : undefined;
+      const attempt = action ? database.latestAttempt(action.id) : undefined;
+      if (!action || !attempt) continue;
+      const sale = sales.find((event) => event.assetId === order.asset_id && event.occurredAt >= attempt.started_at);
+      if (!sale || store.byVenueId(accountId, this.profile.venue, sale.listingId)) continue;
+      store.bindUnseenSale(accountId, order.order_id, sale.listingId, historyHashName(sale.raw));
+      database.resolveAction(action, observationId, true, this.context.now());
+    }
+  }
+
+  /** The history's events about one listing since a moment. A sale once walked stays walked: the log only grows. */
+  private historyFacts(accountId: string, listingId: string, since: string): Array<{ event_type: number; purchase_id: string | null; occurred_at: string }> {
+    return this.context.database.raw().prepare(`SELECT event_type, purchase_id, occurred_at FROM market_history WHERE account_id=? AND listing_id=?
+          AND occurred_at>=? ORDER BY occurred_at DESC`).all(accountId, listingId, since) as Array<{ event_type: number; purchase_id: string | null; occurred_at: string }>;
   }
 
   /** Pure read: no policy, database writes, ports, or ambient clock. */
@@ -147,6 +294,12 @@ export class OrderService {
       if (!order.first_seen_obs) {
         const rejected = order.action_id ? database.action(order.action_id) : undefined;
         if (rejected?.state === 'FAILED' && postAttempt(database, rejected, market.value, true)) result.push({ orderId: order.order_id, state: 'ENDED_NOT_APPLIED', evidence: observationId, confidence: 'proven', reason: 'Rejected request is absent from a later complete observation' });
+        // A request the book never showed but the history did (`bindSales`): the sale that bound it ends it.
+        else if (order.venue_order_id && order.side === 'SELL' && history.grade === 'SATISFIED' && this.profile.whyOracle === 'per-order-history') {
+          const sold = this.historyFacts(accountId, order.venue_order_id, order.opened_at).find((event) => event.event_type === 3 && event.purchase_id !== null);
+          if (sold) result.push({ orderId: order.order_id, state: 'ENDED_FILLED', evidence: history.observationId, confidence: 'proven',
+            reason: 'Per-order history records a sale of the asset the request sent', sale: { listingId: order.venue_order_id, purchaseId: sold.purchase_id!, occurredAt: sold.occurred_at } });
+        }
         continue;
       }
       // A buy order's ending is the book's to say and the walk writes it (`OrderStore.observeSteamBuyOrders`); only a request it never showed is graded here.
@@ -161,8 +314,7 @@ export class OrderService {
       let evidence = observationId;
       let reason = 'No fresh per-order evidence explains the disappearance';
       const facts = history.grade === 'SATISFIED' && this.profile.whyOracle === 'per-order-history'
-        ? database.raw().prepare(`SELECT event_type, purchase_id, occurred_at FROM market_history WHERE account_id=? AND listing_id=? AND observation_id=?
-          AND occurred_at>=? ORDER BY occurred_at DESC`).all(accountId, order.venue_order_id, history.observationId, order.opened_at) as Array<{ event_type: number; purchase_id: string | null; occurred_at: string }> : [];
+        ? this.historyFacts(accountId, order.venue_order_id!, order.opened_at) : [];
       // A sale is a type-3 event Steam gave a purchase id (§9.5): the id is what the ledger row is keyed by.
       const sale = facts.find((event) => event.event_type === 3 && event.purchase_id !== null);
       const cancel = facts.find((event) => event.event_type === 2);
@@ -194,11 +346,14 @@ export class OrderService {
    * Nothing of ours waits on a listing cancelled on the website, so no action asked for the
    * inventory walk that ends it (`heldAfterEnding`) and it waited out the surface's own cadence:
    * L-04's outside cancel read pending three minutes after the book let it go (2026-10-15), and
-   * would have for twenty in the background. Each asks from the walk that first missed it.
+   * would have for twenty in the background. Each asks from the walk that first missed it, for
+   * the inventory and for the history, which is what says *sold*; the convergence tick used to
+   * ask for the history itself, as a fresh need every heartbeat, which read through the hold a
+   * 429 had earned (2026-10-19). A proof demand asks on the proof intervals and waits a hold out.
    */
   standingNeeds(accountId: string): ProofDemand[] {
     return new OrderStore(this.context.database).goneUngraded(accountId, this.profile.venue)
-      .map((order) => ({ ref: ACCOUNT_INVENTORY, startedAfter: order.gone_started_at, since: order.gone_finished_at }));
+      .flatMap((order) => [ACCOUNT_INVENTORY, ACCOUNT_HISTORY].map((ref) => ({ ref, startedAfter: order.gone_started_at, since: order.gone_finished_at })));
   }
 
   /**
@@ -327,7 +482,7 @@ export class OrderService {
   historyExplainsEmpty(accountId: string, listingId: string): boolean {
     const obs = this.context.database.latestObservation(accountId, 'steam-market-history');
     return freshness(obs, 'steam-market-history', this.context.ports.clock.now()) === 'FRESH' && Boolean(this.context.database.raw()
-      .prepare(`SELECT 1 FROM market_history WHERE account_id=? AND listing_id=? AND observation_id=? AND event_type IN (2,3)`)
-      .get(accountId, listingId, obs!.id));
+      .prepare(`SELECT 1 FROM market_history WHERE account_id=? AND listing_id=? AND event_type IN (2,3)`)
+      .get(accountId, listingId));
   }
 }

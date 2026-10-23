@@ -10,12 +10,10 @@ import {
   type CheckoutRequest
 } from '@cslytics/adapters-steam';
 import { CsfloatAccountAdapter, CsfloatBuyOrderAdapter, CsfloatListingAdapter, CsfloatInventoryAdapter, CsfloatTradeAdapter, CsfloatTransport } from '@cslytics/adapters-csfloat';
-import { createRuntimeDispatch } from './runtime-dispatch.js';
+import { acquireRuntimeLock, createRuntimeDispatch, openTradingRecord, releaseRuntimeLock, RuntimeClock, type RuntimeCommand } from '@cslytics/runtime';
 import { clearAccount, purgeRequestFrom, type PurgeOutcome } from './account-clear.js';
-import { EngineDatabase, SchemaBackupError, SchemaNewerThanAppError, TradingEngine } from '@cslytics/engine';
-import type { ClockPort, CredentialVault, EnginePorts, StoreApprovalOutcome } from '@cslytics/ports';
-import type { EngineCommand } from '../../shared/api.js';
-import { acquireRuntimeLock, releaseRuntimeLock } from './runtime-lock.js';
+import { SchemaBackupError, SchemaNewerThanAppError, TradingEngine, type EngineDatabase } from '@cslytics/engine';
+import type { CredentialVault, EnginePorts, StoreApprovalOutcome } from '@cslytics/ports';
 
 // Electron documents this as `process.parentPort` in a utility process. The `'electron'`
 // module's .d.ts still lists a named export, but the ESM export map does not have one —
@@ -50,7 +48,7 @@ const lockFd = acquireRuntimeLock(lockPath);
  */
 async function openRecord(path: string): Promise<EngineDatabase> {
   try {
-    return new EngineDatabase(path, () => clock.now().toISOString());
+    return openTradingRecord(path, () => clock.now().toISOString());
   } catch (error) {
     if (!(error instanceof SchemaNewerThanAppError) && !(error instanceof SchemaBackupError)) throw error;
     releaseRuntimeLock(lockFd, lockPath);
@@ -60,11 +58,6 @@ async function openRecord(path: string): Promise<EngineDatabase> {
     // Never settles, so nothing below runs against a record that was refused.
     return await new Promise<EngineDatabase>(() => undefined);
   }
-}
-
-class RuntimeClock implements ClockPort {
-  now(): Date { return new Date(); }
-  async sleep(ms: number): Promise<void> { await new Promise<void>((resolve) => setTimeout(resolve, ms)); }
 }
 
 class ParentCheckoutHost implements CheckoutHost {
@@ -203,7 +196,8 @@ parentPort.on('message', (event) => {
     return;
   }
   if (message?.kind !== 'request') return;
-  void dispatch(message.command as EngineCommand)
+  // Main answers its own commands and forwards the rest, so what arrives here is a runtime command.
+  void dispatch(message.command as RuntimeCommand)
     .then((value) => parentPort.postMessage({ kind: 'response', id: message.id, ok: true, value }))
     .catch((error) => parentPort.postMessage({
       kind: 'response', id: message.id, ok: false, error: error instanceof Error ? error.message : String(error)

@@ -5,6 +5,7 @@ inventory and storage units, Steam Market listings and buy orders, trades, the i
 CSFloat listings, buy orders and deliveries.
 
 **[Download for Windows](https://cslytics.com/download)** ·
+[Guides](https://cslytics.com/guides) ·
 [Releases](https://github.com/Xpar65/cslytics-desktop/releases) ·
 [Road map](https://cslytics.com/#roadmap) ·
 [Discord](https://discord.gg/cHFQakqDRF)
@@ -49,6 +50,20 @@ The hash should match the release notes, and the file's *Digital Signatures* tab
 `Liam Cunneen`. The only official builds are the ones on cslytics.com and this repository's
 Releases.
 
+## How to do things with it
+
+Each guide on [cslytics.com/guides](https://cslytics.com/guides) starts with what Steam or CSFloat
+lets you do on your own and the limits that apply, then shows the same job done in bulk here, with
+screenshots and short recordings.
+
+- [Sell multiple CS2 items at once on the Steam Market](https://cslytics.com/guides/sell-multiple-items-steam-market)
+- [Manage CS2 storage units in bulk](https://cslytics.com/guides/cs2-storage-units)
+- [List CS2 items on CSFloat in bulk](https://cslytics.com/guides/csfloat-bulk-listing)
+- [Manage multiple Steam accounts for CS2 trading](https://cslytics.com/guides/multiple-steam-accounts-cs2)
+- [Move CS2 items between your own Steam accounts](https://cslytics.com/guides/transfer-cs2-items-between-accounts)
+- [Search your CS2 inventory by float, wear, pattern and storage unit](https://cslytics.com/guides/search-cs2-inventory)
+- [See what a CS2 skin is worth at its exact float](https://cslytics.com/guides/cs2-skin-price-by-float)
+
 ## Ideas, bugs and the road map
 
 What I'm working on next is on the [road map](https://cslytics.com/#roadmap). The best place for an
@@ -63,7 +78,6 @@ Windows, Node 22 and pnpm 10.
 pnpm install
 pnpm dev               # run from source
 pnpm package:desktop   # an unsigned installer in apps\desktop\dist
-pnpm smoke:packaged    # start the packaged app once and check it opens its record
 ```
 
 ## What is here
@@ -71,12 +85,13 @@ pnpm smoke:packaged    # start the packaged app once and check it opens its reco
 | Path | Is |
 |---|---|
 | `apps/desktop` | the Electron app: main process, the window, updates and the release policy |
+| `apps/host` | the same engine headless: a command line and an HTTP surface over one trading record, with the venues composed by a ports module you name |
 | `packages/engine` | desired state, observation and convergence; the only writer of the trading record |
 | `packages/ports` | the contract vocabulary between the engine and the outside world |
+| `packages/runtime` | the command schema and the one dispatch table the desktop and the host both answer from |
 | `packages/adapters-steam` | Steam: sign-in, the Game Coordinator, inventory, market, trades |
 | `packages/adapters-csfloat` | CSFloat |
 | `packages/catalogue` | item names and images, outside the engine |
-| `scripts` | packaging, the packaged smoke test and the release scripts |
 
 The engine never takes a reply as proof that something happened. A listing exists when a later
 read of the account shows it; a timeout means *unknown*, and the engine waits for the next complete

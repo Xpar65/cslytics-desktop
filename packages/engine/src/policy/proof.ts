@@ -68,9 +68,8 @@ export function proofDueAtMs(ref: SurfaceRef, demand: readonly ProofDemand[], la
   const name = surfaceName(ref);
   let due: number | undefined;
   for (const need of demand) {
-    // The scope as well as the name: every CSFloat listing reads as `csfloat-listing`, and one
-    // listing's need is not a reason to read another.
-    if (surfaceName(need.ref) !== name || (need.ref.scope.id ?? null) !== (ref.scope.id ?? null)) continue;
+    // The name carries the scope's id, so one listing's need is never a reason to read another.
+    if (surfaceName(need.ref) !== name) continue;
     const ageMs = nowMs - Date.parse(need.since);
     if (!(ageMs <= PROOF_BOUND_MS)) continue;
     if (lastStartedAt === undefined || lastStartedAt < need.startedAfter) return nowMs;

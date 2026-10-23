@@ -53,6 +53,8 @@ export type MarketHistoryEvent = {
   eventId: string;
   listingId: string;
   purchaseId?: string;
+  /** The asset the listing named, when the body carried it: what binds a sale to a request the book never showed. */
+  assetId?: string;
   eventType: number;
   occurredAt: string;
   raw: unknown;

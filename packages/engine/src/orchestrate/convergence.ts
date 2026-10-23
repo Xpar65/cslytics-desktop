@@ -115,12 +115,12 @@ export class ConvergenceService {
    * One read for the tick: a work need for a walk begun since the tick started (read broker plan
    * D11). The heartbeat is the most frequent automatic reader in the app; it used to read every
    * surface afresh on every beat whatever proof demand had just read, and before that went straight
-   * to the surfaces so nothing throttled it. Anything that is not a unit, the book or its history is
-   * read as main inventory, as it always was.
+   * to the surfaces so nothing throttled it. Anything that is not a unit or the book is read as
+   * main inventory, as it always was.
    */
   private async observe(accountId: string, ref: SurfaceRef, startedAfter: string): Promise<void> {
     const target: SurfaceRef = ref.surface === 'gc-casket' && ref.scope.id ? ref
-      : ref.surface === 'steam-market' || ref.surface === 'steam-market-history' ? { surface: ref.surface, scope: { kind: 'account' } }
+      : ref.surface === 'steam-market' ? { surface: ref.surface, scope: { kind: 'account' } }
         : { surface: 'gc-inventory', scope: { kind: 'account' } };
     await this.services.reads.need(accountId, { ref: target, startedAfter, priority: 'work' });
   }
@@ -149,8 +149,9 @@ export class ConvergenceService {
         if (held === undefined || moment > held) moments.set(this.key(ref), moment);
       };
       for (const step of plans) if (step.kind === 'OBSERVE') ask({ surface: step.surface, scope: step.scope }, tickStart);
-      const unexplained = database.raw().prepare(`SELECT 1 FROM venue_order WHERE account_id=? AND state='UNEXPLAINED' LIMIT 1`).get(accountId);
-      if (unexplained) ask({ surface: 'steam-market-history', scope: { kind: 'account' } }, tickStart);
+      // No ask for the history here. An order the book stopped showing demands it through
+      // `OrderService.standingNeeds`, on the proof intervals and through the broker's holds; a tick
+      // that asked for it afresh every heartbeat read through the hold a 429 had earned (2026-10-19).
       for (const action of database.actions(accountId, 'AWAITING_OBSERVATION')) {
         const moment = this.postdates(action, tickStart);
         if (moment === undefined) continue;
@@ -159,7 +160,10 @@ export class ConvergenceService {
           ask({ surface: 'gc-inventory', scope: { kind: 'account' } }, moment);
           ask({ surface: 'gc-casket', scope: { kind: 'casket', id: params.casketId } }, moment);
         } else if (action.kind === 'CREATE_SELL_LISTING' || action.kind === 'REMOVE_SELL_LISTING') {
+          // The book says whether the listing is there; the inventory is what proves a request
+          // that is not there never landed, rather than landed and sold (`MarketService.reconcile`).
           ask({ surface: 'steam-market', scope: { kind: 'account' } }, moment);
+          ask({ surface: 'gc-inventory', scope: { kind: 'account' } }, moment);
         }
       }
       const reads = this.deduplicate(refs).filter((ref) => !observed.has(surfaceName(ref)));

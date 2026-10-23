@@ -37,9 +37,11 @@ export class SteamMarketAdapter implements SteamMarketPort {
         if (typeof event.listingid !== 'string' || !event.listingid || !Number.isInteger(event.event_type)
           || !Number.isFinite(event.time_event) || event.time_event < 0) throw new Error('Malformed market history event');
         const purchaseId = typeof event.purchaseid === 'string' ? event.purchaseid : undefined;
+        const listingAsset = raw.listings?.[event.listingid]?.asset;
+        const assetId = typeof listingAsset?.id === 'string' && listingAsset.id ? listingAsset.id : undefined;
         return {
           eventId: [event.listingid, purchaseId ?? '', event.event_type, event.time_event, event.time_event_fraction ?? 0].join(':'),
-          listingId: event.listingid, ...(purchaseId ? { purchaseId } : {}), eventType: event.event_type,
+          listingId: event.listingid, ...(purchaseId ? { purchaseId } : {}), ...(assetId ? { assetId } : {}), eventType: event.event_type,
           occurredAt: new Date(event.time_event * 1000 + Math.floor(Number(event.time_event_fraction ?? 0) / 1_000_000)).toISOString(),
           raw: { event, listing: raw.listings?.[event.listingid] ?? null,
             purchase: purchaseId ? raw.purchases?.[`${event.listingid}_${purchaseId}`] ?? null : null,

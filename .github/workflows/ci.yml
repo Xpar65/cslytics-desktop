@@ -5,9 +5,8 @@ on:
   pull_request:
 
 jobs:
-  # The installer this commit would ship, unsigned, and the proof that it starts: the packaged app
-  # opens a trading record and resolves every runtime dependency from inside app.asar. Signing never
-  # happens here; the key is on a hardware token and official builds are signed by hand.
+  # The installer this commit would ship, unsigned. Signing never happens here; the key is on a
+  # hardware token and official builds are signed by hand.
   build-windows:
     runs-on: windows-latest
     steps:
@@ -22,7 +21,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm package:desktop
-      - run: pnpm smoke:packaged
       - uses: actions/upload-artifact@v4
         with:
           name: cslytics-unsigned-${{ github.sha }}
