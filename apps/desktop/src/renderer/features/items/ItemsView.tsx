@@ -1,10 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
+import type { StoredBook } from '@cslytics/market-data';
 import type { ItemHistory, ItemPage, ItemVariants } from '../../../shared/market.js';
-import { PageHeader } from '../../components/PageHeader.js';
 import { Button, Empty, Panel, Segmented, Skeleton, Thumbnail } from '../../components/ui.js';
 import { engine } from '../../lib/engine.js';
 import { recentItems, rememberItem, type RecentItem } from '../../lib/recent-items.js';
-import { BookPanel, CurvePanel, HistoryPanel, Quote, type Loaded } from './ItemPanels.js';
+import { BookPanel, CurvePanel, HistoryPanel, Quote, useBookChanges, type Loaded } from './ItemPanels.js';
 import { ItemSearch } from './ItemSearch.js';
 
 /**
@@ -18,15 +18,17 @@ import { ItemSearch } from './ItemSearch.js';
  * book), and what does its float do to the price (the curve, across the foot, for an item with a
  * float). Each part loads on its own behind a skeleton, so a slow fetch never holds the others back.
  *
- * Every read here is local or main's cache: the book is asked for on the demand lane and polled
- * every five seconds while the page is open, and the series and curves are fetched at most once a
- * day per name. Nothing here mutates anything.
+ * Every read here is local or main's cache: the book is live while the page is open, read on the
+ * demand lane at Steam's own five-second cadence, and the series and curves are fetched at most
+ * once a day per name. Nothing here mutates anything.
  */
 
+/** Steam's own cadence: its book changes about every five seconds, and its page reads it at that rate. */
 const WATCH_MS = 5_000;
-/** How often the page looks for its first book, before one or an absence has been recorded. */
-const FIRST_BOOK_MS = 1_000;
-const FIRST_BOOK_TRIES = 30;
+/** The shortest wait between two reads; the next is normally due five seconds after the last landed. */
+const WATCH_FLOOR_MS = 1_000;
+/** How soon the page asks again when a read lands before the page's own first answer has. */
+const PAGE_PENDING_MS = 250;
 
 export function ItemsView({ name, accountIds, onOpen, back }: {
   /** The market name open, or `null` for the search and recent items. */
@@ -70,7 +72,7 @@ function ItemsLanding({ onOpen }: { onOpen: (name: string) => void }): React.JSX
   const [recent] = useState<RecentItem[]>(recentItems);
   return recent.length === 0 ? (
     <Panel>
-      <Empty icon="search" title="Find an item" hint="A skin, a case, a sticker." />
+      <Empty icon="search" title="Find an item" />
     </Panel>
   ) : (
     <Panel className="items-recent">
@@ -116,55 +118,49 @@ function ItemDetail({ name, accountIds, onOpen }: { name: string; accountIds: re
     return () => { live = false; };
   }, [name, scope]);
 
-  // The book, every five seconds while the page is open: the server's own cadence, and one read per
-  // name per five seconds however often the page is opened (scheduler demandMinIntervalMs). Until a
-  // first book or an absence has been recorded, the whole page is read again each second instead:
-  // the demand read is on its way, and only the page carries an absence, the kept days and the
-  // conversions that come with a first book. Each of these is main's cache, never the network.
+  // The book, live while the page is open. `item.watch` answers once the read it asked for has
+  // landed, so each answer is the book Steam has just served, with its status and its conversions;
+  // the next read is due five seconds after that book was observed. That is Steam's cadence and the
+  // scheduler's floor for a name on screen (demandMinIntervalMs), so a page opened twenty times
+  // still costs one read per five seconds. Steam never answers a validator with 304 (corpus
+  // `steamcommunity.market.orderbook`, re-checked 2026-10-27), so every read is a whole book and a
+  // read that changed nothing marks nothing. An absence ends the watch: there is nothing to follow.
   const pageRef = useRef(page);
   pageRef.current = page;
   useEffect(() => {
-    const ids = scope === '' ? [] : scope.split('\0');
     let live = true;
-    let timer: ReturnType<typeof setTimeout>;
-    // Bounded: a market paused by Steam answers nothing for a while, and the page then waits at the
-    // ordinary cadence rather than reading itself every second until it is closed.
-    let quick = FIRST_BOOK_TRIES;
-    const waiting = (): boolean => {
-      const current = pageRef.current;
-      return quick > 0 && current.state === 'ready' && current.value.book === null && current.value.status?.kind !== 'absent';
-    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async (): Promise<void> => {
+      let next = WATCH_MS;
       try {
-        if (waiting() && ids.length > 0) {
-          quick -= 1;
-          const fresh = await engine.itemPage(name, ids);
-          if (live && (fresh.book !== null || fresh.status?.kind === 'absent')) setPage({ state: 'ready', value: fresh });
+        const answer = await engine.itemWatch(name);
+        if (!live) return;
+        if (pageRef.current.state === 'loading') {
+          // The page's own first answer is still on its way and would land over this one; the next
+          // ask answers at once from the read just made. With no account in scope the page is never
+          // asked for, so there is nothing to wait for.
+          if (scope !== '') next = PAGE_PENDING_MS;
         } else {
-          const book = await engine.itemWatch(name);
-          if (live && book !== null) {
-            setPage((current) => {
-              if (current.state !== 'ready') return current;
-              const held = current.value.book;
-              if (held !== null && held.observedAt === book.observedAt && held.etag === book.etag) return current;
-              return { state: 'ready', value: { ...current.value, book } };
-            });
-          }
+          setPage((current) => current.state !== 'ready' || (sameRead(current.value.book, answer.book) && current.value.status?.kind === answer.status?.kind)
+            ? current
+            : { state: 'ready', value: { ...current.value, book: answer.book, status: answer.status, converted: answer.converted } });
+          if (answer.book === null && answer.status?.kind === 'absent') return;
+          if (answer.book) next = Math.max(WATCH_FLOOR_MS, Date.parse(answer.book.observedAt) + WATCH_MS - Date.now());
         }
       } catch { /* the next tick asks again */ }
-      if (live) timer = setTimeout(() => { void tick(); }, waiting() ? FIRST_BOOK_MS : WATCH_MS);
+      if (live) timer = setTimeout(() => { void tick(); }, next);
     };
-    timer = setTimeout(() => { void tick(); }, FIRST_BOOK_MS);
+    void tick();
     return () => { live = false; clearTimeout(timer); };
   }, [name, scope]);
 
   const answer = page.state === 'ready' ? page.value : null;
+  const changes = useBookChanges(answer?.book ?? null);
   const floats = answer ? answer.holdings.map((row) => row.minWear).filter((wear): wear is number => wear !== null) : [];
   const current = variants?.variants.find((variant) => variant.name === name) ?? null;
 
   return (
     <div className="items-detail">
-      <PageHeader subtitle={name} />
       <Panel className="items-head">
         <div className="panel-body items-head-body" data-testid="item-head">
           {variants ? <Thumbnail url={variants.imageUrl} name={name} size={76} /> : <Skeleton width={76} height={76} className="skeleton-square" />}
@@ -193,17 +189,22 @@ function ItemDetail({ name, accountIds, onOpen }: { name: string; accountIds: re
               </div>
             ) : null}
           </div>
-          <Quote page={page} />
+          <Quote page={page} changes={changes} />
         </div>
       </Panel>
 
       <div className="items-grid">
         <HistoryPanel history={history} page={page} />
-        <BookPanel page={page} />
+        <BookPanel page={page} changes={changes} />
         <CurvePanel name={name} variants={variants} floats={floats} />
       </div>
     </div>
   );
+}
+
+/** True when two books are the same read of the market, so the page keeps the one it holds. */
+function sameRead(held: StoredBook | null, next: StoredBook | null): boolean {
+  return held === next || (held !== null && next !== null && held.observedAt === next.observedAt && held.currency === next.currency && held.etag === next.etag);
 }
 
 /** What the scope holds of this name, in a few words: the count, then where any of it is not. */

@@ -1,6 +1,7 @@
 import { SELECTION_KIND, type EngineDatabase } from '../../db/database.js';
 import { MEMBER_HOP_JOINS, MEMBER_REASON_SQL, MEMBER_STATE_SQL, STEP_ACTION_SQL, STEP_REASON_SQL, STEP_STATE_SQL } from '../../db/member-state.js';
 import { OPEN_STEP_STATES_SQL } from '../../db/work.js';
+import type { CommandAuthority } from '../../db/alphabets.js';
 import { attemptLimit, RETRY_POLICY, retryPlan } from '../../kernel/retry-policy.js';
 import { assertAccountScope, bounded, queryPage, type ScopedPageRequest } from './paging.js';
 
@@ -21,9 +22,12 @@ import { assertAccountScope, bounded, queryPage, type ScopedPageRequest } from '
  * uses (`kernel/retry-policy.ts`): on a `RETRYING` member, when the next send is due and which number
  * it will be; on a member sent more than once, which send it is waiting on. `null` on work with
  * no retry in its policy, so the panel says nothing about attempts for work that gets one.
+ *
+ * `authority` is whose the command is: a person's, or a strategy's acting for one (strategy
+ * authority plan D5). The panel labels a strategy's work; a person's needs no label.
  */
 export type WorkRow = {
-  accountId: string; commandId: string; commandKind: string; commandState: string;
+  accountId: string; commandId: string; commandKind: string; commandState: string; authority: CommandAuthority;
   submittedAt: string; memberId: string; memberState: string; quantity: number;
   localId: string | null; stackKey: string | null;
   defIndex: number; paintIndex: number | null; quality: number; paintWear: number | null;
@@ -37,21 +41,24 @@ export type WorkRow = {
 export type WorkPage = { rows: WorkRow[] };
 
 /** A source's row before the retry facts are added: what the carrying action's row says, when there is one. */
-type RawWorkRow = Omit<WorkRow, 'retryAt' | 'attempt' | 'attemptLimit'> & { actionResolution?: string | null; attempts?: number | null };
+type RawWorkRow = Omit<WorkRow, 'retryAt' | 'attempt' | 'attemptLimit'> & { actionResolution?: string | null; attempts?: number | null; retryAfter?: string | null };
 
-/** The two columns a source joins from `action` for `describeRetry`; `a` is the carrying action. */
-const RETRY_COLUMNS = `a.resolution AS actionResolution, (SELECT COUNT(*) FROM attempt t WHERE t.action_id=a.id) AS attempts`;
+/** The columns a source joins from `action` and its attempts for `describeRetry`; `a` is the carrying action. */
+const RETRY_COLUMNS = `a.resolution AS actionResolution, (SELECT COUNT(*) FROM attempt t WHERE t.action_id=a.id) AS attempts,
+    (SELECT t.retry_after FROM attempt t WHERE t.action_id=a.id ORDER BY t.rowid DESC LIMIT 1) AS retryAfter`;
 
 /**
  * Adds the retry facts to a row, from the same arithmetic the resender uses, so the panel's
  * countdown and the send it announces cannot disagree. A `READY` action a walk proved not
- * applied is waiting for `retryAt`; any other action sent more than once reports which send it
- * is on. Work whose policy allows one send says nothing.
+ * applied is waiting for `retryAt`; an action the venue refused for the moment is waiting for the
+ * instant the venue named, with no cap of ours (delivery retries plan D1); any other action sent
+ * more than once reports which send it is on. Work whose policy allows one send says nothing.
  */
 function describeRetry(row: RawWorkRow): WorkRow {
-  const { actionResolution, attempts, ...rest } = row;
+  const { actionResolution, attempts, retryAfter, ...rest } = row;
   const policy = row.actionKind ? RETRY_POLICY[row.actionKind] : undefined;
   const made = attempts ?? 0;
+  if (row.actionState === 'FAILED' && retryAfter) return { ...rest, retryAt: retryAfter, attempt: made + 1, attemptLimit: null };
   if (!policy || made === 0 || attemptLimit(policy) < 2) return { ...rest, retryAt: null, attempt: null, attemptLimit: null };
   if (row.actionState === 'READY' && actionResolution === 'OBSERVED_NOT_APPLIED') {
     const plan = retryPlan(policy, made, row.updatedAt);
@@ -108,7 +115,7 @@ function recentCommandsSql(marks: string): string {
 function memberOpenWork(database: EngineDatabase, accounts: readonly string[]): RawWorkRow[] {
   const marks = accounts.map(() => '?').join(',');
   return database.raw().prepare(`
-    SELECT m.account_id AS accountId, c.id AS commandId, c.kind AS commandKind, c.state AS commandState,
+    SELECT m.account_id AS accountId, c.id AS commandId, c.kind AS commandKind, c.state AS commandState, c.authority AS authority,
       c.created_at AS submittedAt, m.local_id AS memberId,
       ${MEMBER_STATE_SQL} AS memberState, ${RETRY_COLUMNS},
       m.quantity AS quantity,
@@ -167,7 +174,7 @@ function stepOpenWork(database: EngineDatabase, accounts: readonly string[]): Ra
   const marks = accounts.map(() => '?').join(',');
   return database.raw().prepare(`
     SELECT * FROM (
-      SELECT s.account_id AS accountId, s.command_id AS commandId, c.kind AS commandKind, c.state AS commandState,
+      SELECT s.account_id AS accountId, s.command_id AS commandId, c.kind AS commandKind, c.state AS commandState, c.authority AS authority,
         c.created_at AS submittedAt, COALESCE(s.local_id, s.id) AS memberId,
         ${STEP_STATE_SQL} AS memberState, ${RETRY_COLUMNS},
         1 AS quantity,

@@ -116,6 +116,8 @@ export type OracleAnswer<T> = { kind: 'value'; value: T } | { kind: 'absent' } |
 
 export class OracleMarketWorld {
   readonly books = new Map<string, OracleAnswer<OrderBook>>();
+  /** Names whose book moves on every read: each read answers the next book, then the first again. */
+  readonly cycles = new Map<string, { books: readonly OrderBook[]; next: number }>();
   readonly histories = new Map<string, OracleAnswer<PriceHistory>>();
   readonly curves = new Map<string, OracleAnswer<CurveDoc>>();
   fx: OracleAnswer<FxRates> = { kind: 'value', value: { base: 'USD', asOf: '2026-10-13', stale: false, rates: { USD: 1, AUD: 1.5, EUR: 0.9, GBP: 0.8, JPY: 150 } } };
@@ -148,6 +150,10 @@ export class OracleMarketWorld {
   }
 
   setBook(name: string, book: OrderBook): void { this.books.set(name, { kind: 'value', value: book }); }
+  setCycle(name: string, books: readonly OrderBook[]): void {
+    if (books.length === 0) throw new Error('a cycle needs at least one book');
+    this.cycles.set(name, { books, next: 0 });
+  }
   setAbsent(name: string): void { this.books.set(name, { kind: 'absent' }); }
   setStatus(name: string, status: number): void { this.books.set(name, { kind: 'status', status }); }
   setTransportFailure(name: string): void { this.books.set(name, { kind: 'transport' }); }
@@ -158,6 +164,12 @@ export class OracleMarketDataSource implements MarketDataSource {
 
   async book(name: string): Promise<Answer<OrderBook>> {
     this.world.requests.push({ kind: 'book', name });
+    const cycle = this.world.cycles.get(name);
+    if (cycle) {
+      const book = cycle.books[cycle.next % cycle.books.length]!;
+      cycle.next += 1;
+      return this.answer({ kind: 'value', value: book });
+    }
     const answer = this.world.books.get(name) ?? (this.world.strict ? { kind: 'absent' as const } : { kind: 'value' as const, value: this.world.syntheticBook(name) });
     return this.answer(answer);
   }

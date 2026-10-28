@@ -17,6 +17,12 @@ export type DefinitivelyRejected = {
   kind: 'DEFINITIVELY_REJECTED';
   reason: string;
   raw: unknown;
+  /**
+   * The venue's own word on when the same request may be made again, in milliseconds from the
+   * reply: a rate limit read from its headers, a cap on outstanding work. The refusal is of the
+   * moment, not of the request. Absent, the refusal stands until a person acts.
+   */
+  retryAfterMs?: number;
 };
 
 export type Submitted = {

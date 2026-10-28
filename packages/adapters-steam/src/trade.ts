@@ -201,15 +201,26 @@ export class SteamTradeAdapter implements SteamTradePort {
     };
   }
 
+  /**
+   * One page of executed trades, newest first.
+   *
+   * Steam pages this log by keyset: the previous page's last row, its `time_init` and `tradeid`,
+   * is the cursor for the next, older page, and a first page names no cursor at all.
+   * `navigating_back` is the other direction. Valve's reference describes it as "the user wants the
+   * previous page of results, so return the previous max_trades trades before the start time and
+   * ID", the page a reader scrolling back up wants; sent with the page's own oldest row as the
+   * cursor, it answers the same page again, and a walk that did so read one page twenty-five times
+   * on every pass until Steam refused it (corpus `steam-webapi.ieconservice.get-trade-history`,
+   * correction of 2026-10-28). It is never sent.
+   */
   async getTradeHistoryPage(accountId: AccountId, cursor: TradeHistoryCursor): Promise<TradeHistoryPage> {
     if (!Number.isInteger(cursor.maxTrades) || cursor.maxTrades < 1 || cursor.maxTrades > 500) {
       throw new Error('maxTrades must be between 1 and 500');
     }
+    const first = cursor.afterTradeId === '' && cursor.afterTimeSeconds === 0;
     const raw = await this.get(accountId, 'GetTradeHistory/v1', {
       max_trades: String(cursor.maxTrades),
-      start_after_time: String(cursor.afterTimeSeconds),
-      start_after_tradeid: cursor.afterTradeId,
-      navigating_back: '1',
+      ...(first ? {} : { start_after_time: String(cursor.afterTimeSeconds), start_after_tradeid: cursor.afterTradeId }),
       get_descriptions: '1',
       include_failed: '1',
       include_total: '1'
@@ -218,13 +229,22 @@ export class SteamTradeAdapter implements SteamTradePort {
     if (!response || typeof response !== 'object') throw new Error('GetTradeHistory returned no response object');
     const descriptions = describeIndex((response as { descriptions?: unknown }).descriptions);
     const total = (response as { total_trades?: unknown }).total_trades;
-    if (!Array.isArray((response as any).trades) && (response as any).trades !== undefined) throw new Error('Malformed trade history bucket');
+    const totalTrades = typeof total === 'number' && Number.isSafeInteger(total) && total >= 0 ? total : null;
+    const trades = (response as { trades?: unknown }).trades;
+    if (trades !== undefined && !Array.isArray(trades)) throw new Error('Malformed trade history bucket');
+    // Under a burst Steam answers HTTP 200 with a bare `{"response":{}}`, and a large page can carry
+    // the total with no rows (corpus, captured by 2026-05-14). Neither is the end of the history,
+    // and a walk that read one as the end wrote a complete observation of nothing (rule 5). A page
+    // with no rows is well formed only when Steam says the account has no trades, or when it is
+    // an older page past the last one.
+    if (!Array.isArray(trades) && totalTrades !== 0) throw new Error('GetTradeHistory returned no trades: an empty envelope is not the end of the history');
+    if (Array.isArray(trades) && trades.length === 0 && first && (totalTrades ?? 1) > 0) throw new Error('GetTradeHistory returned a total with no trades');
     if ((response as any).more !== undefined && typeof (response as any).more !== 'boolean') throw new Error('Malformed trade history continuation');
     return {
       success: true,
-      trades: array((response as { trades?: unknown }).trades).map((trade) => normalizeTrade(trade, descriptions)),
+      trades: array(trades).map((trade) => normalizeTrade(trade, descriptions)),
       more: (response as { more?: unknown }).more === true,
-      totalTrades: typeof total === 'number' && Number.isSafeInteger(total) ? total : null
+      totalTrades
     };
   }
 
@@ -304,6 +324,8 @@ function normalizeTrade(raw: any, descriptions: Map<string, any>): ExecutedTrade
     initiatedAt: seconds(raw?.time_init) ?? new Date(0).toISOString(),
     ...(seconds(raw?.time_mod) ? { updatedAt: seconds(raw.time_mod)! } : {}),
     ...(seconds(raw?.time_settlement) ? { settledAt: seconds(raw.time_settlement)! } : {}),
+    // The return of a trade-protection rollback names the trade it reverses (captured 2026-10-27).
+    ...(raw?.rollback_trade ? { rollbackOf: String(raw.rollback_trade) } : {}),
     given: array(raw?.assets_given).map((line) => describeLine(normalizeLine(line), descriptions)),
     received: array(raw?.assets_received).map((line) => describeLine(normalizeLine(line), descriptions)),
     raw

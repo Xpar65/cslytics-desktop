@@ -43,8 +43,10 @@ const VENUE_LABEL: Record<MarketplaceStatus['status'], { text: string; tone: Ton
   NOT_CONNECTED: { text: 'Not connected', tone: 'quiet' }
 };
 
-export function AccountOverview({ account, connection, connecting, venue, holding, busy, launch, onOpen, onAction, onSignOut, onClear }: {
+export function AccountOverview({ account, remote, connection, connecting, venue, holding, busy, launch, onOpen, onAction, onSignOut, onClear }: {
   account: AccountCard;
+  /** The account is a connected engine host's (remote engine host plan D5): its sessions and its data are the host's. */
+  remote: boolean;
   connection: AccountConnection | undefined;
   connecting: boolean;
   venue: MarketplaceStatus | null;
@@ -59,7 +61,7 @@ export function AccountOverview({ account, connection, connecting, venue, holdin
   onClear: (mode: 'remove' | 'reset') => Promise<void>;
 }): React.JSX.Element {
   const summary = describeConnection(connection);
-  const attention = accountAttention({ connection, connecting, venue, launch });
+  const attention = accountAttention({ connection, connecting, venue, launch, remote });
   const [clearing, setClearing] = useState<'remove' | 'reset' | null>(null);
   // Asked as the dialog opens, so a transfer still waiting on another account is explained before
   // anyone types the name, rather than after the engine has restarted to find out.
@@ -190,25 +192,34 @@ export function AccountOverview({ account, connection, connecting, venue, holdin
         </button>
       </div>
 
-      <Panel>
+      {remote ? (
+        <Panel>
+          <PanelHeader icon="globe" title="On the engine host" />
+          <div className="panel-body stack" data-testid="account-host-note">
+            <p className="quiet">
+              This account is held by the engine host, which manages its sign-in, sessions, data and removal.
+            </p>
+          </div>
+        </Panel>
+      ) : null}
+
+      {remote ? null : <Panel>
         <PanelHeader icon="database" title="Data on this computer" />
         <div className="panel-body stack">
           <div className="settings-action">
             <div className="settings-action-text">
               <div className="settings-action-title">Reset account data</div>
-              <div className="settings-action-hint">Deletes what CSlytics has recorded for this account and reads it all again from Steam. It stays signed in.</div>
             </div>
             <Button icon="undo" disabled={busy} onClick={() => setClearing('reset')}>Reset data…</Button>
           </div>
           <div className="settings-action">
             <div className="settings-action-text">
               <div className="settings-action-title">Remove account</div>
-              <div className="settings-action-hint">Deletes the account and all of its data from this computer, including its saved sign-ins.</div>
             </div>
             <Button variant="danger" icon="trash" disabled={busy} onClick={() => setClearing('remove')}>Remove account…</Button>
           </div>
         </div>
-      </Panel>
+      </Panel>}
 
       <ConfirmDialog
         open={clearing === 'reset'}
@@ -227,7 +238,7 @@ export function AccountOverview({ account, connection, connecting, venue, holdin
           <li>work still in progress — Steam may still finish it</li>
         </ul>
         <p>The Steam sign-in, the CSFloat key and this account's settings stay. Nothing on Steam or CSFloat is cancelled. History Steam no longer shows, such as old trades, cannot be read back.</p>
-        <p className="quiet">CSlytics restarts its engine to do this, so your other accounts reconnect a moment later. Backups taken before an app upgrade keep a copy until newer ones replace them.</p>
+        <p className="quiet">CSlytics restarts its engine to do this, so your other accounts reconnect a moment later.</p>
       </ConfirmDialog>
 
       <ConfirmDialog
@@ -247,10 +258,10 @@ export function AccountOverview({ account, connection, connecting, venue, holdin
           <li>its settings here, and work still in progress — Steam may still finish it</li>
         </ul>
         <p>Nothing on Steam or CSFloat is cancelled. Adding the account again means signing in with Steam Guard or a QR code, and history Steam no longer shows cannot be read back.</p>
-        <p className="quiet">CSlytics restarts its engine to do this, so your other accounts reconnect a moment later. Backups taken before an app upgrade keep a copy until newer ones replace them.</p>
+        <p className="quiet">CSlytics restarts its engine to do this, so your other accounts reconnect a moment later.</p>
       </ConfirmDialog>
 
-      {signedIn ? (
+      {signedIn && !remote ? (
         <footer className="settings-foot">
           <Button variant="ghost" icon="log-out" disabled={busy || connecting} onClick={onSignOut} title="Ends the session in this window. The saved sign-in is kept.">
             Sign out

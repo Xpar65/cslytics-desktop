@@ -39,6 +39,8 @@ export function accountAttention(input: {
   venue: MarketplaceStatus | null | undefined;
   /** How `settings.json` opens this account. Absent is the default, signed in to both. */
   launch?: AccountLaunch | undefined;
+  /** The account is a connected engine host's: its sessions are the host's to make, so nothing here asks for one. */
+  remote?: boolean | undefined;
 }): Attention[] {
   const items: Attention[] = [];
   const summary = describeConnection(input.connection);
@@ -47,7 +49,8 @@ export function accountAttention(input: {
     hasSavedCredential: input.connection?.hasSavedCredential ?? false,
     connecting: input.connecting
   });
-  if (action === 'sign-in') items.push({ id: 'steam-sign-in', tone: 'warn', icon: 'log-in', text: 'Steam needs a new sign-in', action: { label: 'Sign in', kind: 'sign-in' } });
+  if (input.remote) { /* the host signs in; a row offering to would act on its sessions */ }
+  else if (action === 'sign-in') items.push({ id: 'steam-sign-in', tone: 'warn', icon: 'log-in', text: 'Steam needs a new sign-in', action: { label: 'Sign in', kind: 'sign-in' } });
   else if (action === 'connect' && !asOpened(input.connection?.phase, input.launch)) items.push({ id: 'steam-connect', tone: 'warn', icon: 'link', text: 'Not connected to Steam', action: { label: 'Connect', kind: 'connect' } });
   if (summary.tone === 'blocked') items.push({ id: 'gc-blocked', tone: 'warn', icon: 'monitor', text: 'CS2 is open on another computer', action: null });
 

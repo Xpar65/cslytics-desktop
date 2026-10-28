@@ -105,25 +105,6 @@ importers:
         specifier: ^7.1.3
         version: 7.3.6(@types/node@24.13.3)(jiti@2.7.0)(tsx@4.23.13)
 
-  apps/host:
-    dependencies:
-      zod:
-        specifier: ^4.1.5
-        version: 4.5.4
-    devDependencies:
-      '@cslytics/engine':
-        specifier: workspace:*
-        version: link:../../packages/engine
-      '@cslytics/ports':
-        specifier: workspace:*
-        version: link:../../packages/ports
-      '@cslytics/runtime':
-        specifier: workspace:*
-        version: link:../../packages/runtime
-      esbuild:
-        specifier: ^0.25.0
-        version: 0.25.12
-
   packages/adapters-csfloat:
     dependencies:
       '@cslytics/ports':
@@ -132,6 +113,9 @@ importers:
 
   packages/adapters-steam:
     dependencies:
+      '@cslytics/market-data':
+        specifier: workspace:*
+        version: link:../market-data
       '@cslytics/ports':
         specifier: workspace:*
         version: link:../ports

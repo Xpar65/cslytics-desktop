@@ -1,16 +1,22 @@
 import type { EngineDatabase } from '../../db/database.js';
 import { assertAccountScope, bounded } from './paging.js';
+import type { CommandAuthority } from '../../db/alphabets.js';
 
 /**
  * Everything a walk has observed to be waiting on the person rather than on this app.
  *
  * This is the other half of `pageOpenWork`, and the distinction is the whole reason it exists.
  * Open work is what the *engine* is doing: it drains by itself, and the person is a spectator.
- * These rows drain only when a human opens the Steam mobile app and taps. Rule 2 means this
- * product may never hold the Guard secret that signs a confirmation, so it can never make that
- * tap — a pending confirmation is a permanent hand-off, not a transient state the next tick
- * clears. (The secret is named nowhere in shipped source, including here: `check:secrets` scans
- * comments too, and that is the point of it.)
+ * These rows drain only when someone confirms them on Steam. Rule 2 means the desktop may never
+ * hold the Guard secret that signs a confirmation, so there it can never make that tap — a pending
+ * confirmation is a permanent hand-off, not a transient state the next tick clears. A host that
+ * confirms through its own gateway composes a confirmation port, and the engine then confirms the
+ * rows its own hops made (`orchestrate/confirmation.ts`); every row still waits here until a walk
+ * shows it confirmed. (The secret is named nowhere in shipped source, including here:
+ * `check:secrets` scans comments too, and that is the point of it.)
+ *
+ * Each row says whose it is (`commandId`, `authority`): a listing or an offer no command of ours
+ * made carries none, and nothing confirms it but the person.
  *
  * Reported together because the obligation is one thing, not two. A seller who has listed six
  * items and sent one trade offer owes seven taps, and being told about the listings on the
@@ -94,7 +100,23 @@ export type WaitingRow = {
   /** The walk that last saw it, and whether that walk finished (rule 5). */
   observedAt: string | null;
   observationComplete: number;
+  /**
+   * The command whose hop made this listing or sent this offer, and whose that command is (strategy
+   * authority and confirmations plan D13). `null` when no command of ours made it: listed or sent
+   * by hand, on the site, or by anything else holding the account's session. The engine never
+   * confirms such a row, and a host confirming on its own must not either.
+   */
+  commandId: string | null;
+  authority: CommandAuthority | null;
+  /**
+   * The engine's own confirmation of it, where a host composed the port: the hop's state, how many
+   * presses went out, the last one, and why it is waiting or stopped. `null` where there is none,
+   * which on the desktop is always.
+   */
+  confirmation: WaitingConfirmation | null;
 };
+
+export type WaitingConfirmation = { state: string; presses: number; lastPressedAt: string | null; reason: string | null };
 
 /** What each half of the answer rests on, per account. `observedAt: null` is "never walked". */
 export type WaitingCoverageRow = {
@@ -141,14 +163,18 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
       COALESCE(m.currency, (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=m.account_id ORDER BY w.id DESC LIMIT 1)) AS currency,
       NULL AS counterparty, 1 AS items, 1 AS distinctItems,
       first.finished_at AS waitingSince, NULL AS expiresAt,
-      last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete
+      last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete,
+      mc.id AS commandId, mc.authority AS authority, ${CONFIRMATION_COLUMNS}
     FROM venue_order m
     JOIN steam_order s ON s.account_id=m.account_id AND s.order_id=m.order_id
+    LEFT JOIN work_step ms ON ms.action_id=m.action_id
+    LEFT JOIN command mc ON mc.id=ms.command_id
+    LEFT JOIN work_step k ON k.account_id=m.account_id AND k.kind='CONFIRM' AND k.target_id=m.venue_order_id
     LEFT JOIN item i ON i.account_id=m.account_id AND i.local_id=m.local_id
     LEFT JOIN observation last ON last.id=m.last_seen_obs
     LEFT JOIN observation first ON first.id=m.first_seen_obs
     WHERE m.account_id IN (${marks}) AND m.venue='steam' AND m.side='SELL' AND m.state='PENDING_EXTERNAL' AND m.gone_obs IS NULL
-  `).all(...accounts) as WaitingRow[];
+  `).all(...accounts) as RawWaitingRow[];
 
   /*
    * `direction='SENT'` is load-bearing. A *received* offer also waits on the person, but it waits
@@ -174,7 +200,8 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
         FROM trade_line l LEFT JOIN item li ON li.account_id=l.account_id AND li.local_id=l.local_id
         WHERE l.account_id=t.account_id AND l.offer_id=t.offer_id AND l.side='GIVE') AS distinctItems,
       first.finished_at AS waitingSince, t.expires_at AS expiresAt,
-      last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete
+      last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete,
+      oc.id AS commandId, oc.authority AS authority, ${CONFIRMATION_COLUMNS}
     FROM trade_offer t
     LEFT JOIN trade_line g ON g.account_id=t.account_id AND g.offer_id=t.offer_id AND g.side='GIVE'
       AND g.line_key=(SELECT MIN(l.line_key) FROM trade_line l
@@ -182,12 +209,16 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
     LEFT JOIN item i ON i.account_id=g.account_id AND i.local_id=g.local_id
     LEFT JOIN observation last ON last.id=t.last_seen_obs
     LEFT JOIN observation first ON first.id=t.first_seen_obs
+    LEFT JOIN work_step os ON os.id=(SELECT h.id FROM work_step h WHERE h.account_id=t.account_id AND h.offer_id=t.offer_id
+      AND h.kind IN ('SEND','CSFLOAT_SEND') ORDER BY h.created_at LIMIT 1)
+    LEFT JOIN command oc ON oc.id=os.command_id
+    LEFT JOIN work_step k ON k.account_id=t.account_id AND k.kind='CONFIRM' AND k.target_id=t.offer_id
     WHERE t.account_id IN (${marks}) AND t.direction='SENT' AND t.status='PENDING_CONFIRMATION'
-  `).all(...accounts) as WaitingRow[];
+  `).all(...accounts) as RawWaitingRow[];
 
   // A row whose first walk has no finished time sorts last rather than first: "unknown" is not
   // "longest waiting", and guessing the urgent end of the list is the one place it would matter.
-  const rows = [...listings, ...offers]
+  const rows = [...listings, ...offers].map(withConfirmation)
     .sort((left, right) => order(left.waitingSince).localeCompare(order(right.waitingSince))
       || left.accountId.localeCompare(right.accountId)
       || left.id.localeCompare(right.id))
@@ -199,6 +230,18 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
     coverage.push(evidence(database, accountId, OFFERS_SURFACE));
   }
   return bounded({ kind: 'page' as const, rows, coverage });
+}
+
+/** The engine's confirmation of a row, when it has one (D13): the hop, how many attempts it made, the last. */
+const CONFIRMATION_COLUMNS = `k.state AS confirmState, k.reason AS confirmReason,
+      (SELECT COUNT(*) FROM attempt p WHERE p.action_id=k.action_id) AS confirmPresses,
+      (SELECT MAX(p.started_at) FROM attempt p WHERE p.action_id=k.action_id) AS confirmLastAt`;
+
+type RawWaitingRow = Omit<WaitingRow, 'confirmation'> & { confirmState: string | null; confirmReason: string | null; confirmPresses: number; confirmLastAt: string | null };
+
+function withConfirmation(row: RawWaitingRow): WaitingRow {
+  const { confirmState, confirmReason, confirmPresses, confirmLastAt, ...rest } = row;
+  return { ...rest, confirmation: confirmState === null ? null : { state: confirmState, presses: confirmPresses, lastPressedAt: confirmLastAt, reason: confirmReason } };
 }
 
 function order(at: string | null): string {

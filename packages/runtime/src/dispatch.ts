@@ -27,7 +27,8 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
     }
     case 'csfloat.reprice':
     case 'csfloat.cancel': {
-      const op = await engine.csfloatSelling.submitEdit(command.accountId,command.commandId,command.listingId,command.type === 'csfloat.reprice' ? command.priceCents : undefined);
+      const op = await engine.csfloatSelling.submitEdit(command.accountId,command.commandId,command.listingId,
+        command.type === 'csfloat.reprice' ? command.priceCents : undefined, command.type === 'csfloat.reprice' ? command.force ?? false : false, command.authority ?? 'HUMAN');
       return { id: op.id, accountId: op.account_id, state: op.state };
     }
     case 'csfloat.buyOrderEdit': {
@@ -43,14 +44,30 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
     }
     case 'csfloat.deliver': {
       await ensureGc(command.accountId);
-      await engine.csfloatSelling.refresh(command.accountId,true);
+      await engine.csfloatDelivery.readEvidence(command.accountId);
       const delivery = engine.csfloatDelivery.queue(command.accountId,command.commandId,command.tradeId);
       await engine.csfloatDelivery.advance(delivery.id);
       return null;
     }
+    case 'csfloat.deliverMany': {
+      // One read of the evidence, one bulk accept for the queued sales among them, then each delivery advanced as a
+      // single deliver would be. A sale the record does not know yet is left for the pass that has read it.
+      await ensureGc(command.accountId);
+      await engine.csfloatDelivery.readEvidence(command.accountId);
+      const ids: string[] = [];
+      const refused: Array<{ tradeId: string; reason: string }> = [];
+      for (const delivery of command.deliveries) {
+        try { ids.push(engine.csfloatDelivery.queue(command.accountId,delivery.commandId,delivery.tradeId).id); }
+        catch (error) { refused.push({ tradeId: delivery.tradeId, reason: error instanceof Error ? error.message : String(error) }); }
+      }
+      // A sale the bulk call accepted waits for the next pass to send, as one `csfloat.deliver` would; the rest advance now.
+      const accepted = await engine.csfloatDelivery.acceptQueued(command.accountId,ids);
+      for (const id of ids) if (!accepted.has(id)) await engine.csfloatDelivery.advance(id);
+      return { queued: ids, refused };
+    }
     case 'csfloat.deliveryRefresh': {
       if (csfloatOperationAccount(engine.database, command.operationId) !== command.accountId) throw new Error('Delivery belongs to another account');
-      await engine.csfloatSelling.refresh(command.accountId,true);
+      await engine.csfloatDelivery.readEvidence(command.accountId);
       await engine.csfloatDelivery.advance(command.operationId);
       return null;
     }
@@ -181,7 +198,10 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
     // Two read-only relays. Main interprets neither: `work.open` rows are decorated with names on
     // the way out and nothing more, and eligibility is the engine's answer verbatim.
     case 'work.open': return engine.views.pageOpenWork({ accountIds: command.accountIds });
+    case 'facts.since': return engine.views.factsSince(definedFields(command));
     case 'waiting.open': return engine.views.pageWaiting({ accountIds: command.accountIds });
+    case 'authority.read': return engine.views.holdingAuthority({ accountId: command.accountId, localIds: command.localIds });
+    case 'authority.set': return engine.setAuthority(command.accountId, command.localIds, command.authority);
     case 'csfloat.eligibility': return engine.views.csfloatEligibility(command.accountId, command.localIds);
     case 'history.page': return engine.pageHistory({ ...definedFields(command), ...(command.filter ? { filter: definedFields(command.filter) } : {}) });
     case 'activity.page': return engine.pageActivity(definedFields(command));
@@ -230,7 +250,9 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
           accountId: command.accountId,
           localId,
           destinationCasketId: command.casketId
-        }))
+        })),
+        // Whose the move is: a strategy's own retrieve must not mark the item as a person's.
+        ...(command.authority ? { authority: command.authority } : {})
       });
     case 'storage.retrieve':
       return submitApprovedCommand({
@@ -240,7 +262,8 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
           accountId: command.accountId,
           localId,
           sourceCasketId: command.casketId
-        }))
+        })),
+        ...(command.authority ? { authority: command.authority } : {})
       });
     case 'storage.rename': {
       await ensureGc(command.accountId);
@@ -341,7 +364,11 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
         ...(command.manifestRevision ? { manifestRevision: command.manifestRevision } : {}),
         ...(command.destinations ? { destinations: command.destinations } : {}),
         ...(command.priceReceiveCents ? { priceReceiveCents: command.priceReceiveCents } : {}),
-        ...(command.consent?.length ? { consent: command.consent } : {})
+        ...(command.consent?.length ? { consent: command.consent } : {}),
+        // Both reach the engine's admission: a person's forced reprice (dropped here until
+        // 2026-10-23, so a forced Steam reprice was judged as unforced) and whose the command is.
+        ...(command.force ? { force: true } : {}),
+        ...(command.authority ? { authority: command.authority } : {})
       });
     case 'listing.remove': {
       const action = engine.queueDelist(command.accountId, command.listingId);
@@ -373,6 +400,9 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
       return engine.executeCancelBuyOrder(action.id);
     }
     case 'portfolio.read': return engine.portfolio(command.accountIds);
+    // The account's own read of a book, from its port and kept by nothing: the one price that
+    // passes through here (portfolio and pricing plan D17). The engine has no verb for it.
+    case 'steam.orderBook': return engine.ports.market.getOrderBook(command.accountId, command.name);
     case 'session.status': {
       const rows = [];
       for (const accountId of command.accountIds) {
@@ -407,9 +437,11 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
       return { refusal: engine.accountClearRefusal(command.accountId) };
     case 'refresh.status':
       return command.accountIds.map((accountId) => engine.refreshStatus(accountId));
+    case 'history.coverage':
+      return engine.views.historyCoverage(command.accountId);
     case 'refresh.scope':
-      engine.setActiveAccount(command.accountId);
-      return { kind: 'scoped', accountId: command.accountId };
+      engine.setActiveAccounts(command.accountIds);
+      return { kind: 'scoped', accountIds: command.accountIds };
     // A caller answers its own commands (the desktop's `release.*`, `settings.*`, `cslytics.*` and
     // price commands) and never forwards them. Anything else that reaches here is a command this table does not
     // know, and the answer is a refusal by name rather than `undefined`: a caller reading a field

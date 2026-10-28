@@ -17,7 +17,10 @@ export const SECTION_IDS = [
   'buy-orders',
   'records',
   'store',
-  'settings'
+  'settings',
+  // A page a connected engine host serves, shown in a view (remote engine host plan D12). Which
+  // one is the shell's state; the id is the slot they share.
+  'host-page'
 ] as const;
 
 export type Section = (typeof SECTION_IDS)[number];
@@ -31,7 +34,8 @@ export const RECORD_TABS = ['orders', 'history', 'trades', 'ledger'] as const;
 export type RecordTab = (typeof RECORD_TABS)[number];
 
 /**
- * The pages of Settings: this desktop's, an account's overview, and one per marketplace, named by
- * its id in `MARKETPLACES`. A page that offers to set up a venue opens its page by that id.
+ * The pages of Settings: this desktop's (general, the CSlytics sign-in, the engine host), an
+ * account's overview, and one per marketplace, named by its id in `MARKETPLACES`. A page that
+ * offers to set up a venue opens its page by that id.
  */
-export type SettingsPage = 'general' | 'cslytics' | 'overview' | VenueId;
+export type SettingsPage = 'general' | 'cslytics' | 'engine' | 'overview' | VenueId;

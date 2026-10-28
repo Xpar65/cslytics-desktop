@@ -44,7 +44,7 @@ export function CurrencyPanel(): React.JSX.Element {
 
   return (
     <Panel>
-      <PanelHeader title="Currency" icon="wallet" subtitle="What currency figures are shown in. Remembered on this computer." />
+      <PanelHeader title="Currency" icon="wallet" />
       <div className="panel-body stack">
         <div className="currency-setting">
           <label className="currency-setting-label" htmlFor="base-currency">Base currency</label>
@@ -71,9 +71,6 @@ export function CurrencyPanel(): React.JSX.Element {
             disabled={saving}
             onChange={(on) => void save(() => setAccountPagesInBase(on))}
             label="Show account pages in base currency"
-            hint={settings.showAccountPagesInBase
-              ? `An account's own figures are converted to ${base} too, each keeping its original on hover.`
-              : 'An account\'s own pages stay in that account\'s currencies: its Steam wallet currency, and USD on CSFloat.'}
           />
           <InfoToggle topic="pages" open={open === 'pages'} onToggle={toggle} label="About account pages in the base currency" />
         </div>

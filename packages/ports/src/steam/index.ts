@@ -12,6 +12,7 @@ export type * from './market.js';
 export type * from './trade.js';
 export type * from './in-game-store.js';
 export type * from './persona.js';
+export type * from './confirmation.js';
 
 /** Everything one Steam account needs, composed once per process. */
 export type SteamPorts = {

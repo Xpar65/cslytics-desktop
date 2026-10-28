@@ -73,10 +73,13 @@ function TradeDetails({ entry, account, peer }: { entry: NamedTradeEntry; accoun
   steam.push({ label: 'Created', value: formatDateTime(entry.createdAt), copy: false });
   if (entry.acceptedAt) steam.push({ label: 'Accepted', value: formatDateTime(entry.acceptedAt), copy: false });
   if (entry.settlesAt) {
-    // Only a trade settled after it was accepted had a reversal period to end.
-    const label = !hadReversalPeriod(entry) ? 'Settled' : entry.stage === 'reversal-period' ? 'Reversal period ends' : 'Reversal period ended';
+    // Only a trade settled after it was accepted had a reversal period to end; a reversed one was reversible until then.
+    const label = !hadReversalPeriod(entry) ? 'Settled' : entry.stage === 'reversal-period' ? 'Reversal period ends'
+      : entry.stage === 'reversed' ? 'Was reversible until' : 'Reversal period ended';
     steam.push({ label, value: formatDateTime(entry.settlesAt), copy: false });
   }
+  if (entry.reversedByTradeId) steam.push({ label: 'Returned by trade', value: entry.reversedByTradeId, mono: true });
+  if (entry.reversesTradeId) steam.push({ label: 'Reverses trade', value: entry.reversesTradeId, mono: true });
   if (entry.offerUpdatedAt) steam.push({ label: 'Offer last changed', value: formatDateTime(entry.offerUpdatedAt), copy: false });
   if (entry.expiresAt) steam.push({ label: 'Expires', value: formatDateTime(entry.expiresAt), copy: false });
   if (entry.escrowUntil) steam.push({ label: 'Held until', value: formatDateTime(entry.escrowUntil), copy: false });
@@ -105,7 +108,7 @@ function TradeDetails({ entry, account, peer }: { entry: NamedTradeEntry; accoun
     origin.push({ label: `CSFloat item${n}`, value: link.hashName ?? link.name, copy: false });
     if (link.priceCents !== null) origin.push({ label: `CSFloat price${n}`, value: formatUsd(link.priceCents), copy: false });
     if (link.floatValue !== null) origin.push({ label: `CSFloat float${n}`, value: String(link.floatValue), mono: true });
-    origin.push({ label: `CSFloat state${n}`, value: humanize(link.state), copy: false });
+    origin.push({ label: `CSFloat state${n}`, value: link.ending === 'reversed' ? 'Reversed: Steam returned the item and CSFloat refunded the buyer' : humanize(link.state), copy: false });
     origin.push({ label: `CSFloat listing${n}`, value: link.listingId, mono: true });
     origin.push({ label: `Evidence${n}`, value: EVIDENCE[link.evidence] ?? link.evidence, copy: false });
   });
@@ -137,8 +140,7 @@ function TradeDetails({ entry, account, peer }: { entry: NamedTradeEntry; accoun
               {entry.timeline.map((event, index) => (
                 <li key={`${event.source}:${event.at}:${event.raw}:${index}`}>
                   <span className="num">{formatDateTime(event.at)}</span>
-                  <span>{event.source === 'offer' ? 'Offer' : 'Trade'} {stateLabel(TRADE_STATUS, event.status).label.toLowerCase()}</span>
-                  <span className="quiet mono">code {event.raw}</span>
+                  <span title={`Steam code ${event.raw}`}>{event.source === 'offer' ? 'Offer' : 'Trade'} {stateLabel(TRADE_STATUS, event.status).label.toLowerCase()}</span>
                 </li>
               ))}
             </ol>

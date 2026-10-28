@@ -1,5 +1,5 @@
 import type { EngineDatabase } from '../../db/database.js';
-import { CsfloatStore, type StoredCsfloatTrade } from '../../db/csfloat.js';
+import { CsfloatStore, type CsfloatTradeRow, type StoredCsfloatTrade } from '../../db/csfloat.js';
 import { HoldingsStore } from '../../db/holdings.js';
 import { AssetEvidenceStore } from '../../db/asset-evidence.js';
 import type { WorkStepRow } from '../../db/work.js';
@@ -7,7 +7,9 @@ import type { CsfloatListingItem } from '@cslytics/ports';
 
 export type CsfloatBook = 'inventory' | 'listings' | 'sales' | 'operations';
 export type CsfloatPageRow = { id: string; name: string; localId: string | null; state: string; priceCents: number | null;
-  observedAt: string | null; deadlineAt: string | null; offerId: string | null; tradable: boolean; reason: string | null };
+  observedAt: string | null; deadlineAt: string | null; offerId: string | null; tradable: boolean; reason: string | null;
+  /** How a sale ended beyond the venue's word: `reversed` for a `failed` sale whose buyer had taken the item on Steam (`CsfloatStore.saleEnding`). */
+  ending: 'reversed' | null };
 export type CsfloatPage = { accountId: string; book: CsfloatBook; rows: CsfloatPageRow[]; nextCursor: string | null; stalePage: boolean };
 
 /**
@@ -49,19 +51,20 @@ export function pageCsfloat(db: EngineDatabase, accountId: string, book: Csfloat
       const step = row as unknown as WorkStepRow;
       const params = JSON.parse(step.params_json ?? '{}') as { priceCents?: number | null; maxPriceCents?: number | null };
       return { id: step.id,name: step.kind.toLowerCase(),localId: step.local_id,state: step.state,priceCents: params.priceCents ?? params.maxPriceCents ?? null,
-        observedAt: step.updated_at,deadlineAt: step.deadline_at,offerId: step.offer_id,tradable: false,reason: step.reason };
+        observedAt: step.updated_at,deadlineAt: step.deadline_at,offerId: step.offer_id,tradable: false,reason: step.reason,ending: null };
     }
     if (book === 'sales') {
       const trade = JSON.parse(row['data_json'] as string) as StoredCsfloatTrade;
       return { id: trade.tradeId,name: trade.listing.item.marketHashName,localId: row['local_id'] as string | null,state: trade.state,
         priceCents: trade.listing.priceCents,observedAt,deadlineAt: trade.deadlineAt,offerId: trade.offerId,tradable: false,
-        reason: trade.sellerSteamId === db.account(accountId)?.steam_id64 ? null : 'Purchase' };
+        reason: trade.sellerSteamId === db.account(accountId)?.steam_id64 ? null : 'Purchase',
+        ending: store.saleEnding(accountId,row as unknown as CsfloatTradeRow) };
     }
     const item = JSON.parse(row['item_json'] as string) as CsfloatListingItem;
     const localId = store.associate(accountId,item);
     return { id: row[key] as string,name: item.marketHashName,localId,state: book === 'inventory' ? 'inventory' : row['state'] as string,
       priceCents: typeof row['price_cents'] === 'number' ? row['price_cents'] : null,observedAt,deadlineAt: null,offerId: null,
-      tradable: item.tradable === 1 && localId !== null,reason: localId === null ? 'Item identity unresolved' : null };
+      tradable: item.tradable === 1 && localId !== null,reason: localId === null ? 'Item identity unresolved' : null,ending: null };
   });
   return { accountId,book,rows,stalePage: false,nextCursor: raw.length > 100 ? Buffer.from(JSON.stringify({accountId,book,snapshot,after:raw[99]![key]})).toString('base64url') : null };
 }

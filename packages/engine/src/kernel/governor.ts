@@ -123,7 +123,11 @@ export class CircuitBreaker {
  */
 export const MUTATION_BUDGET: Readonly<Record<string, { key: string; capacity: number; refillPerSecond: number }>> = {
   STORE_IN_CASKET: { key: 'STORE_IN_CASKET', capacity: 3, refillPerSecond: 8 },
-  RETRIEVE_FROM_CASKET: { key: 'RETRIEVE_FROM_CASKET', capacity: 3, refillPerSecond: 8 }
+  RETRIEVE_FROM_CASKET: { key: 'RETRIEVE_FROM_CASKET', capacity: 3, refillPerSecond: 8 },
+  // A confirmation's targets are pressed by one call, which the confirmation service paces at one
+  // per account per minute (strategy authority and confirmations plan D12); each target's attempt
+  // is bookkeeping after that call, and is not paced again.
+  CONFIRM: { key: 'CONFIRM', capacity: 25, refillPerSecond: 25 }
 };
 
 /**
@@ -149,12 +153,40 @@ export function laneOf(transport: Transport): 'gc' | 'steam-web' | 'csfloat' {
 export type BucketSpec = { capacity: number; refillPerSecond: number };
 
 /**
+ * One scope's own budget, where the transport's default is not its pace: `perScope` replaces the
+ * transport's per-scope bucket for this scope and account, and `sharedPerScope` adds one bucket for
+ * this scope across every account in the process, for an endpoint whose refusal lands on the next
+ * account that asks (history backfill plan D3).
+ */
+export type ScopeBudget = { perScope?: BucketSpec; sharedPerScope?: BucketSpec };
+
+/**
  * One transport's budget. `perScope` is one bucket per account and scope, which for an HTTP venue
  * is one per endpoint, the thing the venue counts; `perAccount` one per account across every scope
- * of the transport; `shared` one across every account in the process. A transport with none is
- * unmetered: coalesced by scope, never paced.
+ * of the transport; `shared` one across every account in the process; `scopes` the endpoints whose
+ * pace is their own. A transport with none is unmetered: coalesced by scope, never paced.
  */
-export type TransportBudget = Readonly<Record<Transport, { perScope?: BucketSpec; perAccount?: BucketSpec; shared?: BucketSpec }>>;
+export type TransportBudget = Readonly<Record<Transport, {
+  perScope?: BucketSpec; perAccount?: BucketSpec; shared?: BucketSpec; scopes?: Readonly<Record<string, ScopeBudget>>;
+}>>;
+
+/**
+ * A page of executed trades: one every fifteen seconds, per account and across them.
+ *
+ * `GetTradeHistory` drew HTTP 429 after twenty to thirty consecutive pages at the desktop's own
+ * pace, under a second apart, every time it was tried; fifteen to twenty seconds between pages is
+ * the spacing a walk of the same endpoint found it tolerated (corpus
+ * `steam-webapi.ieconservice.get-trade-history`). Whether the refusal counts by account, token or
+ * address is unmeasured, so the same pace is also kept across every account in the process.
+ */
+export const TRADE_HISTORY_PAGE_BUDGET: BucketSpec = { capacity: 1, refillPerSecond: 1 / 15 };
+
+/**
+ * A page of market history across accounts: the per-scope burst and pace, once for the process.
+ * A 429 on `myhistory` landed on a second account straight after a twenty-page walk on the first
+ * (corpus `steamcommunity.market.myhistory`), so two accounts' backfills share one endpoint's pace.
+ */
+export const MARKET_HISTORY_SHARED_BUDGET: BucketSpec = { capacity: 4, refillPerSecond: 0.2 };
 
 /**
  * The read budgets, by transport.
@@ -171,7 +203,13 @@ export type TransportBudget = Readonly<Record<Transport, { perScope?: BucketSpec
 export const TRANSPORT_BUDGET: TransportBudget = {
   'gc-cache': {},
   'gc-wire': { perAccount: { capacity: 3, refillPerSecond: 5 } },
-  'steam-web': { perScope: { capacity: 4, refillPerSecond: 0.2 }, shared: { capacity: 8, refillPerSecond: 2 } },
+  'steam-web': {
+    perScope: { capacity: 4, refillPerSecond: 0.2 }, shared: { capacity: 8, refillPerSecond: 2 },
+    scopes: {
+      'steam-trade-history': { perScope: TRADE_HISTORY_PAGE_BUDGET, sharedPerScope: TRADE_HISTORY_PAGE_BUDGET },
+      'steam-market-history': { sharedPerScope: MARKET_HISTORY_SHARED_BUDGET }
+    }
+  },
   csfloat: { perScope: { capacity: 4, refillPerSecond: 0.2 }, shared: { capacity: 8, refillPerSecond: 2 } }
 };
 
@@ -232,10 +270,13 @@ export class AccountEndpointGovernors {
 
   private readBuckets(accountId: string, transport: Transport, scope: string): TokenBucket[] {
     const budget = this.transports[transport];
+    const own = budget.scopes?.[scope];
+    const perScope = own?.perScope ?? budget.perScope;
     const buckets: TokenBucket[] = [];
     if (budget.shared) buckets.push(this.bucket(`read:${transport}`, budget.shared));
+    if (own?.sharedPerScope) buckets.push(this.bucket(`read:${transport}:${scope}`, own.sharedPerScope));
     if (budget.perAccount) buckets.push(this.bucket(`${accountId}:read:${transport}`, budget.perAccount));
-    if (budget.perScope) buckets.push(this.bucket(`${accountId}:read:${transport}:${scope}`, budget.perScope));
+    if (perScope) buckets.push(this.bucket(`${accountId}:read:${transport}:${scope}`, perScope));
     return buckets;
   }
 

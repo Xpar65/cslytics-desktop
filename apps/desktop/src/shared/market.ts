@@ -120,8 +120,22 @@ export type ItemPage = {
   status: NameStatus | null;
   daily: DailyTop[];
   base: string;
-  /** The book's figures converted to the page's currency, when a rate exists. */
-  converted: { mid: Converted | null; ask: Converted | null; bid: Converted | null };
+  converted: BookConverted;
+};
+
+/** A book's top figures converted to the page's currency; each is `null` when the book is already in it or no rate exists. */
+export type BookConverted = { mid: Converted | null; ask: Converted | null; bid: Converted | null };
+
+/**
+ * What `item.watch` answers, once the read it asked for has landed: the book with its figures
+ * converted, and the name's status, which is how the open page learns of an absence.
+ */
+export type ItemBook = {
+  book: StoredBook | null;
+  status: NameStatus | null;
+  /** True when `book` is the account's own read, in its wallet's currency; false for the anonymous book, in the egress's (plan D17). */
+  own: boolean;
+  converted: BookConverted;
 };
 
 export type ItemHistory = StoredHistory | null;

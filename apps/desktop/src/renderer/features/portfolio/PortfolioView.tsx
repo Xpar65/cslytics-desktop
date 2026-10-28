@@ -248,7 +248,6 @@ export function AccountsTable({ holdings, valuation, avatars, now = new Date(), 
                   <Avatar name={row.accountName} size={30} photo={avatars?.[row.accountId]} />
                   <span className="grow">
                     <span className="group-name">{row.accountName}</span>
-                    <span className="cell-sub">Steam ID {row.steamId64}</span>
                   </span>
                 </span>
                 <span className="num account-holdings" data-settled={row.market.settled} data-complete={total?.complete}>

@@ -1,4 +1,5 @@
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 /**
  * Single-writer lock for the Engine Runtime.
@@ -13,25 +14,17 @@ import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSyn
  */
 export function acquireRuntimeLock(path: string): number {
   try {
-    const fd = openSync(path, 'wx', 0o600);
-    writeFileSync(fd, String(process.pid));
-    return fd;
+    return take(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    let stalePid = Number(readFileSync(path, 'utf8'));
-    let alive = Number.isInteger(stalePid) && stalePid > 0;
-    if (alive) {
-      try { process.kill(stalePid, 0); } catch { alive = false; }
-    }
-    if (alive) throw new Error(`Another Engine Runtime owns ${path}`);
+    if (ownerAlive(Number(readFileSync(path, 'utf8')), path)) throw new Error(`Another Engine Runtime owns ${path}`);
     unlinkSync(path);
-    const fd = openSync(path, 'wx', 0o600);
-    writeFileSync(fd, String(process.pid));
-    return fd;
+    return take(path);
   }
 }
 
 export function releaseRuntimeLock(fd: number, path: string): void {
+  if (held.get(resolve(path)) === fd) held.delete(resolve(path));
   try {
     closeSync(fd);
   } catch {
@@ -75,13 +68,32 @@ export function reapRuntimeLock(path: string): void {
     try { unlinkSync(path); } catch { /* gone */ }
     return;
   }
-  if (Number.isInteger(owner) && owner > 0) {
-    try {
-      process.kill(owner, 0);
-      return;
-    } catch {
-      /* process is gone */
-    }
-  }
+  if (ownerAlive(owner, path)) return;
   try { unlinkSync(path); } catch { /* gone */ }
+}
+
+/**
+ * The locks this process holds now, by path, with the descriptor that holds each. A lock naming
+ * this process's own pid is live only if it is one of these: a container starts its runtime as
+ * the same pid (PID 1) on every restart, so a lock a crashed predecessor left behind names the
+ * new process itself, and `kill(pid, 0)` alone would refuse every restart for ever.
+ */
+const held = new Map<string, number>();
+
+function take(path: string): number {
+  const fd = openSync(path, 'wx', 0o600);
+  writeFileSync(fd, String(process.pid));
+  held.set(resolve(path), fd);
+  return fd;
+}
+
+function ownerAlive(pid: number, path: string): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return held.has(resolve(path));
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

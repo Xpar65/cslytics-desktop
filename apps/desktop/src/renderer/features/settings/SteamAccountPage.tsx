@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { AccountLaunch } from '../../../shared/api.js';
 import type { AccountCard } from '../accounts/AccountsPanel.js';
 import { Icon, type IconName } from '../../components/Icon.js';
-import { Button, IconButton, KeyValue, Metric, Notice, Panel, PanelHeader, StatusBadge, Switch } from '../../components/ui.js';
+import { Button, IconButton, KeyValue, Metric, Notice, Panel, PanelHeader, ProgressBar, StatusBadge, Switch } from '../../components/ui.js';
+import { Tip } from '../../components/Tip.js';
+import { engine, type HistoryCoverageRow, type ScopeStatusRow } from '../../lib/engine.js';
 import { VenueMark } from '../../components/VenueMark.js';
 import { accountAction, describeConnection, type ConnectionTone } from '../../lib/connection.js';
 import { formatAmount } from '../../lib/money.js';
@@ -78,8 +80,10 @@ const SESSION_INFO = (
   </>
 );
 
-export function SteamAccountPage({ account, connection, connecting, holding, lastError, busy, launch, onLaunch, onConnect, onSignIn, onSignOut }: {
+export function SteamAccountPage({ account, remote, connection, connecting, holding, lastError, busy, launch, onLaunch, onConnect, onSignIn, onSignOut }: {
   account: AccountCard;
+  /** The account is a connected engine host's (remote engine host plan D5, D6): nothing here connects, signs in or out. */
+  remote: boolean;
   connection: AccountConnection | undefined;
   connecting: boolean;
   holding: AccountHoldings | undefined;
@@ -126,11 +130,13 @@ export function SteamAccountPage({ account, connection, connecting, holding, las
             </div>
           </div>
 
-          {!connecting && lastError && action === 'sign-in' ? (
+          {!connecting && lastError && action === 'sign-in' && !remote ? (
             <Notice tone="unknown" role="status" title="Steam would not accept the saved session">{lastError}</Notice>
           ) : null}
 
-          <div className="toolbar">
+          {remote ? (
+            <p className="quiet" data-testid="steam-host-note">Managed by the engine host.</p>
+          ) : <div className="toolbar">
             {action === 'connect' ? <Button variant="primary" icon="link" disabled={busy} onClick={onConnect}>{signedIn ? 'Connect CS2' : 'Connect'}</Button> : null}
             {action === 'sign-in' ? <Button variant="primary" icon="log-in" disabled={busy} onClick={onSignIn}>Sign in</Button> : null}
             {action === 'connecting' ? <Button variant="primary" loading disabled>Connecting</Button> : null}
@@ -141,19 +147,21 @@ export function SteamAccountPage({ account, connection, connecting, holding, las
             {signedIn ? (
               <Button variant="ghost" icon="log-out" disabled={busy || connecting} onClick={onSignOut} title="Ends the session in this window. The saved sign-in is kept.">Sign out</Button>
             ) : null}
-          </div>
+          </div>}
         </div>
       </Panel>
 
-      <LaunchPanel launch={launch} onLaunch={onLaunch} />
+      {remote ? null : <LaunchPanel launch={launch} onLaunch={onLaunch} />}
 
       <div className="metrics">
-        <Metric label="Wallet" icon="wallet" tone="accent" value={formatAmount(holding?.wallet?.balanceCents ?? null, holding?.currency ?? null)} note={holding?.wallet ? age.label : 'not observed yet'} />
+        <Metric label="Wallet" icon="wallet" tone="accent" value={formatAmount(holding?.wallet?.balanceCents ?? null, holding?.currency ?? null)} note={holding?.wallet ? age.label : undefined} />
         <Metric label="Inventory" icon="package" value={(held?.main ?? 0).toLocaleString()} />
         <Metric label="Storage" icon="archive" value={(held?.crated ?? 0).toLocaleString()} note={`in ${plural(holding?.counts.storageUnits ?? 0, 'unit')}`} />
         <Metric label="Listed" icon="tag" value={holding ? (holding.counts.listingsActive + holding.counts.listingsOnHold).toLocaleString() : '—'} />
         <Metric label="Buy orders" icon="receipt" value={(holding?.counts.buyOrdersActive ?? 0).toLocaleString()} />
       </div>
+
+      <HistoryPanel accountId={account.accountId} />
 
       <Panel>
         <PanelHeader icon="user" title="Identity" />
@@ -182,6 +190,93 @@ export function SteamAccountPage({ account, connection, connecting, holding, las
       </Panel>
     </div>
   );
+}
+
+const HISTORIES: ReadonlyArray<{ surface: HistoryCoverageRow['surface']; label: string; unit: string }> = [
+  { surface: 'steam-market-history', label: 'Market history', unit: 'events' },
+  { surface: 'steam-trade-history', label: 'Trade history', unit: 'trades' }
+];
+
+const HISTORY_INFO = (
+  <>
+    <p>
+      Steam keeps every sale, purchase and trade this account ever made. The record reads each log
+      from the newest entry down, a few pages every couple of minutes, because Steam refuses an
+      account that asks for its whole history at once. The figure is how much of Steam's own count
+      the record holds so far.
+    </p>
+    <p>
+      Reading pauses when Steam asks this account to slow down, and carries on by itself. Refresh
+      now reads what is new; it never hurries the older pages.
+    </p>
+  </>
+);
+
+/**
+ * How much of each history the record holds, and whether it is still reading.
+ *
+ * Two logs, two meters, each from `history.coverage` and the broker's own word on the scope
+ * (`refresh.status`): a meter alone would show a backfill the venue has paused as merely slow. The
+ * figures are Steam's and move as new entries land, so a complete history can read as owed again
+ * for a minute after a sale. Re-read on every change notice for the account, because a walk that
+ * failed sends none, and on a slow tick for the same reason.
+ */
+function HistoryPanel({ accountId }: { accountId: string }): React.JSX.Element {
+  const [rows, setRows] = useState<HistoryCoverageRow[]>([]);
+  const [scopes, setScopes] = useState<ScopeStatusRow[]>([]);
+  useEffect(() => {
+    let live = true;
+    const read = (): void => {
+      void engine.readHistoryCoverage(accountId).then((next) => { if (live) setRows(next); }).catch(() => undefined);
+      void engine.readRefreshStatus([accountId]).then(([status]) => { if (live) setScopes(status?.scopes ?? []); }).catch(() => undefined);
+    };
+    read();
+    const unsubscribe = engine.subscribeToChanges((notice) => { if (notice.accountId === accountId) read(); });
+    const tick = setInterval(read, 30_000);
+    return () => { live = false; unsubscribe(); clearInterval(tick); };
+  }, [accountId]);
+
+  return (
+    <Panel>
+      <PanelHeader icon="history" title="History" info={{ label: 'How history is read', content: HISTORY_INFO }} />
+      <div className="panel-body history-rows" data-testid="history-coverage">
+        {HISTORIES.map(({ surface, label, unit }) => {
+          const row = rows.find((candidate) => candidate.surface === surface);
+          const scope = scopes.find((candidate) => candidate.ref.surface === surface && candidate.ref.scope.kind === 'account');
+          const state = historyState(row, scope);
+          const covered = row?.covered ?? 0;
+          const total = row?.total ?? null;
+          return (
+            <div key={surface} className="history-row" data-surface={surface} data-state={state.kind}>
+              <div className="history-head">
+                <span className="history-name">{label}</span>
+                <span className="history-figure num">{total === null ? covered.toLocaleString() : `${covered.toLocaleString()} of ${total.toLocaleString()}`} {unit}</span>
+              </div>
+              <ProgressBar value={covered} max={total ?? Math.max(covered, 1)} tone={state.tone} label={`${label}: ${covered} of ${total ?? 'unknown'} ${unit}`} />
+              <div className="history-state quiet">
+                {state.detail ? <Tip content={state.detail}>{state.text}</Tip> : state.text}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+type HistoryState = { kind: 'unread' | 'reading' | 'paused' | 'stopped' | 'complete'; text: string; detail?: string; tone: 'accent' | 'positive' | 'warn' };
+
+/** The state a meter shows under it: the broker's hold first, then the coverage's own word. */
+export function historyState(row: HistoryCoverageRow | undefined, scope: ScopeStatusRow | undefined): HistoryState {
+  if (!row || row.observedAt === null) return { kind: 'unread', text: 'not read yet', tone: 'accent' };
+  if (scope?.state === 'held' && scope.until) {
+    const until = new Date(scope.until);
+    const text = `paused until ${until.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    return { kind: 'paused', text, tone: 'warn', ...(scope.reason ? { detail: `Steam answered: ${scope.reason}. Reading carries on by itself.` } : {}) };
+  }
+  if (row.stopped) return { kind: 'stopped', text: 'stopped before the end', detail: `The older pages could not be followed (${row.stopped}). A later read of new entries starts them again.`, tone: 'warn' };
+  if (row.remaining === null || row.remaining > 0) return { kind: 'reading', text: 'reading older pages', tone: 'accent' };
+  return { kind: 'complete', text: `complete, ${freshness(row.observedAt).label}`, tone: 'positive' };
 }
 
 /**
@@ -217,14 +312,14 @@ function LaunchPanel({ launch, onLaunch }: {
           checked={launch?.signIn ?? true}
           disabled={launch === null || saving}
           label="Sign in to Steam"
-          hint="Uses the saved sign-in. Off, the account stays signed out until you press Connect, and nothing signs it in on its own."
+          hint="Off, nothing signs in until you press Connect."
           onChange={(signIn) => { if (launch) void change({ ...launch, signIn }); }}
         />
         <Switch
           checked={(launch?.signIn ?? true) && (launch?.cs2 ?? true)}
           disabled={launch === null || saving || !launch.signIn}
           label="Connect to CS2"
-          hint="Needed for inventory and storage units. Turn it off if you play CS2 on this account on another computer; listings, buy orders and trades still refresh."
+          hint="Needed for inventory and storage units."
           onChange={(cs2) => { if (launch) void change({ ...launch, cs2 }); }}
         />
         {error ? <Notice tone="error" role="status">{error}</Notice> : null}

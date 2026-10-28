@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { ListingVenue } from '@cslytics/engine';
 import { formatAmount } from '../../lib/money.js';
-import { dollars, type PricedEntry, type StagedEntry, type WorkspaceIntent } from '../../components/ListingWorkspace.js';
+import { dollars, type PricedEntry, type StagedEntry, type WorkspaceIntent } from '../../components/listing-workspace-store.js';
 import { listingKey, listingTitle, type NamedListing } from './listing-parts.js';
 import { VENUE_ID } from '../../lib/marketplaces.js';
 import type { Message } from '../../components/ui.js';
@@ -61,11 +61,13 @@ export function stageListing(row: NamedListing): StagedListing {
     key: listingKey(row),
     accountId: row.accountId,
     name: listingTitle(row),
+    // A CSFloat listing is sold under Steam's market name too, so its Steam book is the one to show.
+    marketHashName: row.hashName,
     imageUrl: row.imageUrl,
     paintWear: row.paintWear,
     localId: row.localId,
     place: { icon: 'tag', label: `Listed at ${formatAmount(row.buyerPriceCents, row.currency)}` },
-    ...(row.venue === 'STEAM' ? { caption: { icon: 'smartphone' as const, text: 'Steam has no price edit: the listing is removed and a new one created, which asks for a phone confirmation.' } } : {}),
+    ...(row.venue === 'STEAM' ? { caption: { icon: 'smartphone' as const, short: 'Phone confirm', text: 'Steam has no price edit: the listing is removed and a new one created, which asks for a phone confirmation.' } } : {}),
     venues: [VENUE_ID[row.venue]],
     seed: listed === null
       ? { price: dollars(row.buyerPriceCents), basis: 'buyer' }
@@ -82,6 +84,7 @@ export function stageListing(row: NamedListing): StagedListing {
 export const REPRICE_INTENT: WorkspaceIntent<StagedListing> = {
   verb: 'Reprice',
   noun: 'listing',
+  icon: 'pencil',
   refused: 'the new price',
   batches(rows) {
     const steam = rows.filter((row) => row.venue === 'steam');

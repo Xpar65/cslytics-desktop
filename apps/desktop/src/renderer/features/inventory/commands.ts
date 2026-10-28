@@ -62,6 +62,8 @@ export function buildCommand(kind: CommandKind, selection: InventorySelection, o
     commandId,
     kind,
     ...(consent?.length ? { consent } : {}),
+    // A person pressing Reprice is a decision: the price-change interval is for whatever repeats itself.
+    ...(kind === 'REPRICE' ? { force: true } : {}),
     // A frozen selection travels as its token: the engine resolved those handles once, at a
     // revision, and re-deriving members here would hand it a different set under the same name.
     ...(selection.manifest

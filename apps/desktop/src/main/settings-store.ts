@@ -2,13 +2,16 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
   DEFAULT_CSFLOAT, DEFAULT_CURRENCY,
+  DEFAULT_ENGINE,
   DEFAULT_LAUNCH,
   DEFAULT_SETTINGS,
+  engineConnectionSchema,
   settingsSchema,
   type AccountLaunch,
   type AppearanceSettings,
   type CurrencySettings,
-  type DesktopSettings
+  type DesktopSettings,
+  type EngineConnection
 } from '../shared/api.js';
 import { THEME_PREFERENCES } from '../shared/themes/index.js';
 
@@ -79,6 +82,11 @@ export class SettingsStore {
   /** Replaces the currency section, the same way. A chosen base is recorded as chosen. */
   writeCurrency(currency: CurrencySettings): DesktopSettings {
     return this.write({ ...this.settings, currency });
+  }
+
+  /** Which engine this desktop drives, the same way (remote engine host plan D2). The token is the vault's, never this file's. */
+  writeEngine(engine: EngineConnection): DesktopSettings {
+    return this.write({ ...this.settings, engine });
   }
 
   /**
@@ -152,6 +160,9 @@ const storedCsfloat = z.object({
   protection: z.boolean().catch(DEFAULT_CSFLOAT.protection)
 }).catch(DEFAULT_CSFLOAT);
 
+/** A connection this build cannot read is the local engine: the one every desktop always drove. */
+const storedEngine = engineConnectionSchema.catch(DEFAULT_ENGINE);
+
 /** A parsed file as settings, or null when it is not a settings file at all. */
 export function settingsFrom(raw: unknown): DesktopSettings | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -162,6 +173,7 @@ export function settingsFrom(raw: unknown): DesktopSettings | null {
     appearance: storedAppearance.parse(file.appearance ?? {}),
     accounts: storedAccounts(file.accounts),
     currency: storedCurrency.parse(file.currency ?? {}),
-    csfloat: storedCsfloat.parse(file.csfloat ?? {})
+    csfloat: storedCsfloat.parse(file.csfloat ?? {}),
+    engine: storedEngine.parse(file.engine ?? {})
   };
 }

@@ -35,7 +35,7 @@ export function TradeItems({ entry, view, subject, onSubject, revision, peer }: 
   peer: string | null;
 }): React.JSX.Element {
   if (entry.giveQuantity + entry.receiveQuantity === 0) {
-    return <Empty icon="package" title="No items recorded for this trade" hint="Steam's offer and history reads named no items in it." />;
+    return <Empty icon="package" title="No items recorded for this trade" />;
   }
   // Both sides, always. A side with nothing on it says so: a sale that takes nothing back, a
   // purchase that gives nothing, a transfer between the person's own accounts — the empty side is

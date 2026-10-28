@@ -1,4 +1,4 @@
-import type { ActionRow, EngineDatabase, ItemRow, ObservationRow, ScopeKind } from '../db/database.js';
+import type { ActionRow, AttemptRow, EngineDatabase, ItemRow, ObservationRow, ScopeKind } from '../db/database.js';
 import { marketplaceBlock, type MarketplaceConsent } from './marketplace-commitments.js';
 import { committedSql } from '../db/commitment.js';
 import { CsfloatStore } from '../db/csfloat.js';
@@ -35,7 +35,9 @@ export type Evidence<T> =
  * `surfaces/buy-orders` admits real money against (requirements N-BUY-06).
  */
 export const FRESHNESS: Record<Surface, { maxAgeMs: number; scope: ScopeKind; proves: 'presence' | 'set' }> = {
-  'csfloat-inventory': { maxAgeMs: 5 * 60_000, scope: 'account', proves: 'presence' },
+  // CSFloat allows about 120 inventory reads a day: trusted for five minutes, a steady listing loop read it 288
+  // times a day and spent the day by late morning (2026-10-25). Fifteen keeps it near 96 (CSF-51).
+  'csfloat-inventory': { maxAgeMs: 15 * 60_000, scope: 'account', proves: 'presence' },
   'csfloat-trades': { maxAgeMs: 5 * 60_000, scope: 'account', proves: 'set' },
   'csfloat-trade': { maxAgeMs: 5 * 60_000, scope: 'item', proves: 'presence' },
   'csfloat-listing': { maxAgeMs: 5 * 60_000, scope: 'item', proves: 'presence' },
@@ -106,10 +108,14 @@ export function satisfied<T>(value: T, obs: ObservationRow): Evidence<T> {
 export function postAttempt(database: EngineDatabase, action: ActionRow, obs: ObservationRow, absence: boolean): boolean {
   const attempt = database.latestAttempt(action.id);
   if (!attempt || obs.account_id !== action.account_id) return false;
-  const watermark = attempt.request_ref ? (JSON.parse(attempt.request_ref) as { observationWatermark?: number }).observationWatermark ?? 0 : 0;
-  if (obs.id <= watermark) return false;
+  if (obs.id <= attemptWatermark(attempt)) return false;
   if (absence) return Boolean(attempt.finished_at && obs.started_at > attempt.finished_at);
   return obs.started_at >= attempt.started_at;
+}
+
+/** The newest observation the record held when the attempt began (`startAttempt`): nothing at or below it can have seen its effect. */
+export function attemptWatermark(attempt: AttemptRow): number {
+  return attempt.request_ref ? (JSON.parse(attempt.request_ref) as { observationWatermark?: number }).observationWatermark ?? 0 : 0;
 }
 
 /** When an action's last attempt returned: the moment the walks that prove it must begin after. */

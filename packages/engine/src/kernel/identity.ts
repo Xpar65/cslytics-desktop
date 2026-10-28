@@ -79,11 +79,20 @@ export function variantToken(item: RawEconItem): string {
  */
 export const ATTRIBUTE_CANNOT_TRADE = 2;
 
+/**
+ * Econ quality 14, Valve's `volatile`: an unsealed terminal. Unsealing keeps the def and moves the
+ * unit here, and Valve says it is then "non-tradable and non-marketable", yet the unit carries no
+ * attribute 2 (captured 2026-10-28). So the
+ * quality is the mark.
+ */
+export const QUALITY_VOLATILE = 14;
+
 /** The restriction token of a unit Valve marks `cannot trade`. Permanent, so it outranks any lock. */
 export const UNTRADABLE_RESTRICTION = 'untradable';
 
-/** True when the unit itself carries `cannot trade` with a non-zero value. */
-export function cannotTrade(item: Pick<RawEconItem, 'attributes'>): boolean {
+/** True when the unit carries `cannot trade` with a non-zero value, or is a volatile unit. */
+export function cannotTrade(item: Pick<RawEconItem, 'attributes' | 'quality'>): boolean {
+  if (item.quality === QUALITY_VOLATILE) return true;
   const attribute = item.attributes?.find((candidate) => candidate.defIndex === ATTRIBUTE_CANNOT_TRADE);
   if (!attribute) return false;
   const value = attributeValue(attribute);

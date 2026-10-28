@@ -8,6 +8,7 @@ export { CLIENT_LOGON_TIMEOUT_MS, SteamClientSessionPool } from './client-sessio
 export type { ConnectedSteamClient, SteamClient, SteamClientFactory, SteamClientWebSession } from './client-session.js';
 export { SteamMarketAdapter } from './market.js';
 export { SteamTradeAdapter, accessTokenFromCookies, tradeMutationOutcome } from './trade.js';
+export { OFFER_LIMIT_RETRY_MS } from './trade-outcome.js';
 export { MemoryCredentialVault, refreshTokenKey } from './vault.js';
 export type { CredentialVault } from './vault.js';
 export { decodePriceSheet, decodeValveLzma, parseBinaryKeyValues, parsePriceSheet, readValveLzmaHeader, StoreSheetError } from './in-game-store-sheet.js';

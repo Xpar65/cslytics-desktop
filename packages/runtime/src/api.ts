@@ -4,7 +4,7 @@ import { z } from 'zod';
  * The commands an Engine Runtime answers, and the one notice it sends unprompted.
  *
  * This is the narrow waist between the engine and whatever drives it: the desktop's main process
- * over an Electron utility-process port, or the headless host over HTTP. Both validate with this
+ * over an Electron utility-process port, or a test harness in process. Both validate with this
  * schema and dispatch through `createRuntimeDispatch`, so a command takes the same path whoever
  * sent it. The desktop adds its own commands beside these (names, prices, settings, releases),
  * answers them itself and never forwards them.
@@ -14,6 +14,12 @@ import { z } from 'zod';
  */
 
 const accountScope = z.array(z.string().min(1)).min(1).max(32);
+/**
+ * Whose a command is: a person's (the default, and all the desktop ever sends) or a strategy's
+ * acting for one. A strategy's is refused on an item a person acted on until they hand it over
+ * (`authority.set`), and may never force a price change.
+ */
+const authority = z.enum(['HUMAN', 'STRATEGY']).optional();
 const pageSize = z.number().int().positive().max(250).optional();
 const cursor = z.string().min(1).max(4096).optional();
 /** `offer:<tradeofferid>` or `trade:<tradeid>`, as `trades.list` issued it. Steam ids are digits; seeded ones are not. */
@@ -127,9 +133,10 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('csfloat.protection'), enabled: z.boolean() }).strict(),
   z.object({ type: z.literal('csfloat.list'), commandId: z.string().uuid(), members: z.array(
     z.object({ accountId: z.string().min(1), localId: z.string().min(1).max(128), priceCents: z.number().int().min(3).max(Number.MAX_SAFE_INTEGER) }).strict()
-  ).min(1).max(100) }).strict(),
-  z.object({ type: z.literal('csfloat.reprice'), commandId: z.string().uuid(), accountId: z.string().min(1), listingId: z.string().min(1).max(64), priceCents: z.number().int().min(3).max(Number.MAX_SAFE_INTEGER) }).strict(),
-  z.object({ type: z.literal('csfloat.cancel'), commandId: z.string().uuid(), accountId: z.string().min(1), listingId: z.string().min(1).max(64) }).strict(),
+  ).min(1).max(100), authority }).strict(),
+  // `force` is a person's decision to change the price inside the venue's price-change interval; without it an early ask is refused with the next allowed time.
+  z.object({ type: z.literal('csfloat.reprice'), commandId: z.string().uuid(), accountId: z.string().min(1), listingId: z.string().min(1).max(64), priceCents: z.number().int().min(3).max(Number.MAX_SAFE_INTEGER), force: z.boolean().optional(), authority }).strict(),
+  z.object({ type: z.literal('csfloat.cancel'), commandId: z.string().uuid(), accountId: z.string().min(1), listingId: z.string().min(1).max(64), authority }).strict(),
   // A change to, or a cancel of, one of the account's own CSFloat buy orders. The price is the
   // buyer's limit per item in USD cents. `constraints`, when sent, is the order's whole new filter
   // set, as the site's edit dialog sends it; when absent the engine carries the order's own through
@@ -140,6 +147,9 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('csfloat.buyOrderCancel'), commandId: z.string().uuid(), accountId: z.string().min(1), orderId: z.string().min(1).max(64) }).strict(),
   z.object({ type: z.literal('csfloat.deliver'), commandId: z.string().uuid(), accountId: z.string().min(1), tradeId: z.string().min(1).max(64) }).strict(),
   z.object({ type: z.literal('csfloat.deliveryRefresh'), accountId: z.string().min(1), operationId: z.string().max(128) }).strict(),
+  // The sales queued together, accepted by one bulk call and then each advanced (CSF-SEND-10).
+  z.object({ type: z.literal('csfloat.deliverMany'), accountId: z.string().min(1),
+    deliveries: z.array(z.object({ commandId: z.string().uuid(), tradeId: z.string().min(1).max(64) }).strict()).min(1).max(100) }).strict(),
   z.object({ type: z.literal('csfloat.cannotDeliver'), accountId: z.string().min(1), operationId: z.string().min(1).max(128) }).strict(),
   // The in-game store. A purchase names sheet entries and quantities; the caller resolves each
   // entry's def index before forwarding (`defIndex` is what a catalogue adds, never what a window
@@ -223,11 +233,20 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('inventory.positions'), accountIds: accountScope, filter: inventoryFilterSchema.optional() }).strict(),
   // Everything in flight for a scope. Read-only, account-scoped like every other read (rule 8).
   z.object({ type: z.literal('work.open'), accountIds: accountScope }).strict(),
+  // The facts the bell carries — a sale Steam reversed, a buy order filled — as the `event` rows the
+  // walks wrote, after the cursor the desktop keeps in a file of its own (notifications plan §7.2).
+  // The record holds what happened; the window holds what it told the person; nothing here is a `seen`.
+  z.object({ type: z.literal('facts.since'), accountId: z.string().min(1),
+    after: z.object({ at: z.string(), id: z.string() }).strict().nullable(), limit: z.number().int().min(1).max(100).optional() }).strict(),
   // What is waiting on the person rather than on the app: listings and sent offers Steam is
   // holding for a phone tap this product may never make (rule 2). A scope and nothing else —
   // there is no `seen` or `dismissed` to send, because an obligation is discharged by the tap
   // and removed by the walk that observes it, never by a window deciding it has been read.
   z.object({ type: z.literal('waiting.open'), accountIds: accountScope }).strict(),
+  // Who may act on each item: a person, a strategy, or nobody yet. `authority.set` is a person's
+  // word, handing items to a strategy or keeping them; a strategy must never send it.
+  z.object({ type: z.literal('authority.read'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).min(1).max(1000) }).strict(),
+  z.object({ type: z.literal('authority.set'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).min(1).max(1000), authority: z.enum(['HUMAN', 'STRATEGY']) }).strict(),
   z.object({ type: z.literal('csfloat.eligibility'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).max(100) }).strict(),
   z.object({
     type: z.literal('history.page'),
@@ -332,8 +351,8 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('command.stop'), commandId: z.string().uuid() }).strict(),
   z.object({ type: z.literal('storage.sync'), accountId: z.string().min(1) }).strict(),
   z.object({ type: z.literal('storage.read'), accountId: z.string().min(1) }).strict(),
-  z.object({ type: z.literal('storage.store'), accountId: z.string().min(1), localIds: z.array(z.string().uuid()).max(1000), casketId: z.string().min(1) }).strict(),
-  z.object({ type: z.literal('storage.retrieve'), accountId: z.string().min(1), localIds: z.array(z.string().uuid()).max(1000), casketId: z.string().min(1) }).strict(),
+  z.object({ type: z.literal('storage.store'), accountId: z.string().min(1), localIds: z.array(z.string().uuid()).max(1000), casketId: z.string().min(1), authority }).strict(),
+  z.object({ type: z.literal('storage.retrieve'), accountId: z.string().min(1), localIds: z.array(z.string().uuid()).max(1000), casketId: z.string().min(1), authority }).strict(),
   // The schema bound is the first refusal; `policy/casket-name.ts` in the engine is the one that decides.
   z.object({ type: z.literal('storage.rename'), accountId: z.string().min(1), casketId: z.string().min(1), name: z.string().min(1).max(20) }).strict(),
   z.object({ type: z.literal('market.sync'), accountId: z.string().min(1) }).strict(),
@@ -363,7 +382,10 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
     destinations: z.record(z.string(), z.string()).optional(),
     priceReceiveCents: z.number().int().positive().optional(),
     // What the person agreed to store despite, when the pre-check named it (bulk storage plan D9).
-    consent: z.array(z.enum(['csfloat-listed', 'csfloat-owed', 'trade-pledged'])).max(3).optional()
+    consent: z.array(z.enum(['csfloat-listed', 'csfloat-owed', 'trade-pledged'])).max(3).optional(),
+    // A person's decision to reprice inside the venue's price-change interval; read by a REPRICE only.
+    force: z.boolean().optional(),
+    authority
   }).strict().refine((command) => Boolean((command.members && command.members.length > 0) || command.manifestToken), {
     message: 'command.submit needs members or a manifest token'
   }),
@@ -388,6 +410,10 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   // because nothing in the runtime has a current account to fall back on (rule 8) — the caller
   // showing two signed-in accounts is the only thing that knows which two.
   z.object({ type: z.literal('portfolio.read'), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
+  // The account's own read of a name's order book, from its market port with its session: the one
+  // price the runtime passes through, kept by nothing (portfolio and pricing plan D5, D17). Main
+  // asks it only for a wallet whose currency the anonymous book is not priced in.
+  z.object({ type: z.literal('steam.orderBook'), accountId: z.string().min(1), name: z.string().min(1).max(200) }).strict(),
   // Connection state per account, for an indicator. Named accounts for the same reason
   // `portfolio.read` names them: there is no current account to fall back on.
   z.object({ type: z.literal('session.status'), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
@@ -404,7 +430,10 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   // already keeping current, and never signs in one that was left signed out.
   z.object({ type: z.literal('refresh.resume') }).strict(),
   z.object({ type: z.literal('refresh.status'), accountIds: accountScope }).strict(),
-  z.object({ type: z.literal('refresh.scope'), accountId: z.string().min(1).nullable() }).strict()
+  // How much of each history the record holds for one account, and what its walks still owe.
+  z.object({ type: z.literal('history.coverage'), accountId: z.string().min(1) }).strict(),
+  // The accounts in view, kept on the active cadence; an empty list is the all-accounts scope.
+  z.object({ type: z.literal('refresh.scope'), accountIds: z.array(z.string().min(1)).max(32) }).strict()
 ]);
 
 export type RuntimeCommand = z.infer<typeof runtimeCommandSchema>;

@@ -54,6 +54,14 @@ export const CANCEL_RETRY_DELAYS_MS: readonly number[] = [5_000, 30_000, 60_000]
  */
 export const CASKET_ROUND_DELAYS_MS: readonly number[] = [2_000, 10_000, 30_000];
 
+/**
+ * After a walk shows a confirmation still waiting (strategy authority and confirmations plan
+ * D10): two minutes, then four, then every eight; twelve presses in all, about an hour and a half.
+ * The pace is Steam's: each press lists what awaits confirmation, which Steam limits per account and
+ * which a delivery's offer needs more than a relist does.
+ */
+export const CONFIRM_RETRY_DELAYS_MS: readonly number[] = [120_000, 240_000, ...Array.from({ length: 9 }, () => 480_000)];
+
 /** Why a kind is `never`, or carries the limit it does, when the row alone does not say. */
 export const RETRY_POLICY: Readonly<Record<string, RetryPolicy>> = {
   REMOVE_SELL_LISTING: { resend: 'retry-service', delaysMs: CANCEL_RETRY_DELAYS_MS },
@@ -80,7 +88,19 @@ export const RETRY_POLICY: Readonly<Record<string, RetryPolicy>> = {
   // CSF-46: a CSFloat edit the listing read proves not applied fails and is never re-sent. Its
   // own orchestrator would be the sender; flipping this row is the day that is wanted.
   CSFLOAT_CANCEL: { resend: 'never' },
-  CSFLOAT_REPRICE: { resend: 'never' }
+  CSFLOAT_REPRICE: { resend: 'never' },
+  // A confirmation is a tap, and a second tap on what is already confirmed changes nothing, so it
+  // earns the full schedule. Its owner presses every due one of an account in one call (D12).
+  CONFIRM: { resend: 'owner', owner: 'the confirmation service', limit: CONFIRM_RETRY_DELAYS_MS.length + 1, delaysMs: CONFIRM_RETRY_DELAYS_MS },
+  // The two hops of a CSFloat delivery a press proves, never the loop (delivery retries plan D3,
+  // D4, D5): the trade read every press makes shows an accept still `queued`, and the offers walk
+  // the send demands shows no offer for the sale. Neither carries a delay: presses pace them. An
+  // accept is harmless to repeat (CSFloat refuses a trade that is not queued), so it earns the
+  // cancel's four sends. A send is a create, and its proof is a complete set walk begun after the
+  // attempt, so it earns one more than a listing create; a walk showing more than one offer for
+  // the sale never resends at all.
+  CSFLOAT_ACCEPT: { resend: 'owner', owner: 'the CSFloat delivery, on its next press', limit: 4 },
+  CSFLOAT_SEND: { resend: 'owner', owner: 'the CSFloat delivery, on the press that proved it', limit: 3 }
 };
 
 /** The policy for a kind this table does not name: proof of absence ends it. */

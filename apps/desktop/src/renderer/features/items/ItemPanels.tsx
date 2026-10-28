@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { BookLevel } from '@cslytics/market-data';
+import type { BookLevel, StoredBook } from '@cslytics/market-data';
 import type { ItemCurve, ItemHistory, ItemPage, ItemVariants } from '../../../shared/market.js';
+import { Tip } from '../../components/Tip.js';
 import { Empty, Notice, Panel, PanelHeader, Pill, Segmented, Skeleton } from '../../components/ui.js';
 import { engine } from '../../lib/engine.js';
 import { amountParts, conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick } from '../../lib/money.js';
 import { freshness } from '../../lib/portfolio.js';
 import { curveWears } from './curve-math.js';
 import { FloatCurveChart, type CurveLayers, type CurveWear } from './FloatCurveChart.js';
+import { ageLabel, bookChanges, liveness, midOf, type BookChanges, type LevelChange, type Move } from './live-book.js';
 import { PriceChart, type ChartSeries } from './PriceChart.js';
 
 /**
@@ -14,6 +16,10 @@ import { PriceChart, type ChartSeries } from './PriceChart.js';
  * beside the price history, and the float curve across the foot. Each waits for its own answer
  * behind a skeleton of its own shape, and each names its currency once, in its header; the amounts
  * inside a ladder or on an axis carry the symbol only.
+ *
+ * The book and the quote are live: the order book's header says so, and each read marks what it
+ * changed for a moment (a level's units, a side's total, the ask, the bid, the mid), so a trader
+ * sees the market move rather than a number that is silently different.
  */
 
 const BOOK_ROWS = 10;
@@ -22,8 +28,21 @@ const DAY_S = 86_400;
 /** A panel's answer: loading, failed, or here (which may be an honest nothing). */
 export type Loaded<T> = { state: 'loading' } | { state: 'failed'; error: string } | { state: 'ready'; value: T };
 
+/**
+ * What the newest read changed against the read before it, kept until the next read so the marks
+ * outlive any re-render in between. The page holds one book object per read, so identity is the
+ * read; the first read of a page, and a read in another currency, mark nothing.
+ */
+export function useBookChanges(book: StoredBook | null): BookChanges | null {
+  const [seen, setSeen] = useState<{ book: StoredBook | null; changes: BookChanges | null }>({ book, changes: null });
+  if (seen.book === book) return seen.changes;
+  const changes = book === null ? null : bookChanges(seen.book, book, BOOK_ROWS);
+  setSeen({ book, changes });
+  return changes;
+}
+
 /** What a trader reads first: the lowest ask, the highest bid and the mid between them. */
-export function Quote({ page }: { page: Loaded<ItemPage> }): React.JSX.Element | null {
+export function Quote({ page, changes }: { page: Loaded<ItemPage>; changes: BookChanges | null }): React.JSX.Element | null {
   const answer = page.state === 'ready' ? page.value : null;
   const book = answer?.book ?? null;
   const settled = answer !== null && (book !== null || answer.status?.kind === 'absent' || answer.status?.kind === 'unknown');
@@ -35,30 +54,74 @@ export function Quote({ page }: { page: Loaded<ItemPage> }): React.JSX.Element |
       </div>
     );
   }
-  const mid = book.lowestAskCents !== null && book.highestBidCents !== null ? Math.round((book.lowestAskCents + book.highestBidCents) / 2) : null;
+  const read = book.observedAt;
   return (
     <div className="items-quote" data-testid="item-quote">
-      <Figure label="Ask" tone="ask" testId="item-book-ask" cents={book.lowestAskCents} currency={book.currency} converted={answer.converted.ask} />
-      <Figure label="Bid" tone="bid" testId="item-book-bid" cents={book.highestBidCents} currency={book.currency} converted={answer.converted.bid} />
-      <Figure label="Mid" testId="item-book-mid" cents={mid} currency={book.currency} converted={answer.converted.mid} minor />
+      <Figure label="Ask" tone="ask" testId="item-book-ask" cents={book.lowestAskCents} currency={book.currency} converted={answer.converted.ask} move={changes?.ask ?? null} read={read} />
+      <Figure label="Bid" tone="bid" testId="item-book-bid" cents={book.highestBidCents} currency={book.currency} converted={answer.converted.bid} move={changes?.bid ?? null} read={read} />
+      <Figure label="Mid" testId="item-book-mid" cents={midOf(book)} currency={book.currency} converted={answer.converted.mid} move={changes?.mid ?? null} read={read} minor />
     </div>
   );
 }
 
-function Figure({ label, tone, testId, cents, currency, converted, minor }: {
-  label: string; tone?: 'ask' | 'bid' | undefined; testId: string; cents: number | null; currency: number; converted: ItemPage['converted']['mid']; minor?: boolean | undefined;
+function Figure({ label, tone, testId, cents, currency, converted, move, read, minor }: {
+  label: string; tone?: 'ask' | 'bid' | undefined; testId: string; cents: number | null; currency: number; converted: ItemPage['converted']['mid'];
+  move: Move; read: string; minor?: boolean | undefined;
 }): React.JSX.Element {
   const parts = amountParts(cents, currency);
   return (
-    <div className="items-figure" data-testid={testId} data-tone={tone} data-minor={minor || undefined}>
+    <div className="items-figure" data-testid={testId} data-tone={tone} data-minor={minor || undefined} data-move={move ?? undefined}>
       <div className="holdings-label">{label}</div>
-      <div className="items-amount num">{parts.amount}{parts.code ? <span className="items-code">{parts.code}</span> : null}</div>
+      <div className="items-amount num">
+        <Flash change={move} read={read} />
+        {parts.amount}{parts.code ? <span className="items-code">{parts.code}</span> : null}
+        {move ? <span key={read} className="items-move" aria-hidden="true">{move === 'up' ? '▲' : '▼'}</span> : null}
+      </div>
       {converted ? <div className="cell-sub num" title={conversionNote(converted)}>{formatConverted(converted)}</div> : null}
     </div>
   );
 }
 
-export function BookPanel({ page }: { page: Loaded<ItemPage> }): React.JSX.Element {
+/**
+ * A wash behind a figure that a read changed, fading out. Keyed by the read, so a figure that moves
+ * on two reads in a row flashes twice, and absent on a read that left it alone.
+ */
+function Flash({ change, read }: { change: LevelChange; read: string }): React.JSX.Element | null {
+  return change ? <span key={read} className="items-flash" data-change={change} aria-hidden="true" /> : null;
+}
+
+/** The wall clock, re-read once a second, so a live mark turns to an age when the reads stop. */
+function useNow(): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
+
+/** "Live" with a beating dot while reads keep arriving, and the book's age once they stop. */
+function LiveMark({ book }: { book: StoredBook }): React.JSX.Element {
+  const { live, ageMs } = liveness(book.observedAt, useNow());
+  const code = currencyCodeOf(book.currency);
+  const age = ageLabel(ageMs);
+  return (
+    <span className="items-live" data-testid="item-book-live" data-live={live}>
+      <span className="conn-dot" data-tone={live ? 'live' : 'partial'} aria-hidden="true" />
+      <Tip
+        label="About the live book"
+        content={live
+          ? `Steam's order book, read every 5 s while this page is open. Last read ${age}, from this connection, in ${code}. What a read changes flashes.`
+          : `Last read ${age} (${new Date(book.observedAt).toLocaleString()}), in ${code}. No newer read has landed since; the page keeps asking every 5 s.`}
+      >
+        {live ? 'Live' : `Delayed · ${age}`}
+      </Tip>
+      <span className="items-live-code">{code}</span>
+    </span>
+  );
+}
+
+export function BookPanel({ page, changes }: { page: Loaded<ItemPage>; changes: BookChanges | null }): React.JSX.Element {
   const answer = page.state === 'ready' ? page.value : null;
   const book = answer?.book ?? null;
   const code = book ? currencyCodeOf(book.currency) : '';
@@ -69,9 +132,7 @@ export function BookPanel({ page }: { page: Loaded<ItemPage> }): React.JSX.Eleme
       <PanelHeader
         title="Order book"
         icon="layers"
-        subtitle={page.state === 'loading' ? <Skeleton width={90} height={12} /> : book
-          ? <span title={`Observed ${new Date(book.observedAt).toLocaleString()} from this connection; read again every 5 s while this page is open`}>{code} · {freshness(book.observedAt, new Date()).label}</span>
-          : null}
+        subtitle={page.state === 'loading' ? <Skeleton width={90} height={12} /> : book ? <LiveMark book={book} /> : null}
       />
       <div className="panel-body" data-testid="item-book" data-state={page.state === 'ready' ? (book ? 'book' : absent ? 'absent' : 'waiting') : page.state} data-currency={code || undefined} data-observed-at={book?.observedAt}>
         {/* The skeleton stands while the first book is on its way. A read that failed says so
@@ -79,12 +140,12 @@ export function BookPanel({ page }: { page: Loaded<ItemPage> }): React.JSX.Eleme
         {page.state === 'loading' || (answer && book === null && !absent && !unknown) ? <LadderSkeleton /> : null}
         {page.state === 'failed' ? <Notice tone="error" role="status">{page.error}</Notice> : null}
         {answer && book === null && (absent || unknown) ? (
-          <Empty icon="layers" title={absent ? 'No market for this item' : 'Steam did not answer yet'} hint={absent ? 'Never valued at zero.' : 'Asked again on its own.'} />
+          <Empty icon="layers" title={absent ? 'No market for this item' : 'Steam did not answer yet'} />
         ) : null}
         {book ? (
           <div className="items-sides">
-            <Side title="Bids" total={book.bidUnits} levels={book.bids} currency={book.currency} tone="bid" />
-            <Side title="Asks" total={book.askUnits} levels={book.asks} currency={book.currency} tone="ask" />
+            <Side title="Bids" total={book.bidUnits} levels={book.bids} currency={book.currency} tone="bid" changes={changes?.bids} totalMove={changes?.bidUnits ?? null} read={book.observedAt} />
+            <Side title="Asks" total={book.askUnits} levels={book.asks} currency={book.currency} tone="ask" changes={changes?.asks} totalMove={changes?.askUnits ?? null} read={book.observedAt} />
           </div>
         ) : null}
       </div>
@@ -105,15 +166,27 @@ function LadderSkeleton(): React.JSX.Element {
   );
 }
 
-function Side({ title, total, levels, currency, tone }: { title: string; total: number; levels: readonly BookLevel[]; currency: number; tone: 'bid' | 'ask' }): React.JSX.Element {
+/**
+ * One side of the ladder. Rows are keyed by price, so a level that survives a read keeps its row
+ * and its bar grows or shrinks to its new size; a changed level flashes, green for more units, red
+ * for fewer, the accent for a price that was not resting before.
+ */
+function Side({ title, total, levels, currency, tone, changes, totalMove, read }: {
+  title: string; total: number; levels: readonly BookLevel[]; currency: number; tone: 'bid' | 'ask';
+  changes: BookChanges['bids'] | undefined; totalMove: Move; read: string;
+}): React.JSX.Element {
   const shown = levels.slice(0, BOOK_ROWS);
   const most = Math.max(1, ...shown.map((level) => level.quantity));
   return (
     <div className="items-side" data-tone={tone}>
-      <div className="items-side-head"><span className="holdings-label">{title}</span><span className="cell-sub num">{total.toLocaleString()}</span></div>
+      <div className="items-side-head">
+        <span className="holdings-label">{title}</span>
+        <span className="items-side-total cell-sub num" data-move={totalMove ?? undefined}><Flash change={totalMove} read={read} />{total.toLocaleString()}</span>
+      </div>
       {shown.length === 0 ? <div className="cell-sub">none</div> : shown.map((level) => (
-        <div key={level.priceCents} className="items-level" title={`${level.quantity.toLocaleString()} at ${formatAmount(level.priceCents, currency)}`}>
-          <span className="items-level-bar" aria-hidden="true"><span style={{ width: `${(level.quantity / most) * 100}%` }} /></span>
+        <div key={level.priceCents} className="items-level" data-price={level.priceCents} data-change={changes?.get(level.priceCents)} title={`${level.quantity.toLocaleString()} at ${formatAmount(level.priceCents, currency)}`}>
+          <Flash change={changes?.get(level.priceCents) ?? null} read={read} />
+          <span className="items-level-bar" aria-hidden="true"><span style={{ transform: `scaleX(${level.quantity / most})` }} /></span>
           <span className="num">{formatTick(level.priceCents, currency)}</span>
           <span className="cell-sub num">{level.quantity.toLocaleString()}</span>
         </div>
@@ -137,9 +210,9 @@ export function ChartSkeleton({ testId, height }: { testId?: string | undefined;
   );
 }
 
-type Span = '30d' | '90d' | '1y' | 'all';
+type Span = '7d' | '30d' | '90d' | '1y' | 'all';
 const SPANS: ReadonlyArray<{ id: Span; days: number | null }> = [
-  { id: '30d', days: 30 }, { id: '90d', days: 90 }, { id: '1y', days: 365 }, { id: 'all', days: null }
+  { id: '7d', days: 7 }, { id: '30d', days: 30 }, { id: '90d', days: 90 }, { id: '1y', days: 365 }, { id: 'all', days: null }
 ];
 
 /** The span's start, counted back from the series' own last point rather than the clock: a series fetched yesterday still has 90 days. */
@@ -210,9 +283,9 @@ export function HistoryPanel({ history, page }: { history: Loaded<ItemHistory>; 
         {mode === 'sales' && history.state === 'loading' ? <ChartSkeleton testId="item-history-skeleton" /> : null}
         {mode === 'sales' && history.state === 'failed' ? <Notice tone="error" role="status">{history.error}</Notice> : null}
         {mode === 'sales' && history.state === 'ready' && (series === null || !enough) ? (
-          <Empty icon="trending-up" title={series === null ? 'No history yet' : 'Not enough sales in this span'} hint={series === null ? undefined : 'Pick a longer span.'} />
+          <Empty icon="trending-up" title={series === null ? 'No history yet' : 'Not enough sales in this span'} />
         ) : null}
-        {mode === 'book' && !enough ? <Empty icon="trending-up" title="Not enough days in this span" hint="Pick a longer span." /> : null}
+        {mode === 'book' && !enough ? <Empty icon="trending-up" title="Not enough days in this span" /> : null}
         {currency !== null && enough ? (
           <PriceChart
             testId="item-history-chart"
@@ -287,7 +360,7 @@ export function CurvePanel({ name, variants, floats }: { name: string; variants:
       <div className="panel-body" data-testid="item-curve" data-state={state} data-venue={venue}>
         {state === 'loading' ? <ChartSkeleton testId="item-curve-skeleton" height={300} /> : null}
         {state === 'failed' && failure?.state === 'failed' ? <Notice tone="error" role="status">{failure.error}</Notice> : null}
-        {state === 'absent' ? <Empty icon="activity" title="No curve published" hint={venue === 'steam' ? 'Try CSFloat.' : 'Try Steam.'} /> : null}
+        {state === 'absent' ? <Empty icon="activity" title="No curve published" /> : null}
         {state === 'ok' && own ? (
           <>
             <div className="curve-toolbar" role="group" aria-label="Layers">

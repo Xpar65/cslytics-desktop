@@ -50,9 +50,11 @@ const TRADE_STATES: Readonly<Record<number, TradeStatus>> = {
   10: 'ESCROW',
   11: 'ROLLED_BACK',
   // TradeProtectionRollback, which Valve does not document: the CSFloat extension's constants name it
-  // (csgomarketv3 trade-offer-state-endpoints.md). Steam marks the original trade 12 and returns the
-  // items in a *new* complete trade, so the reversal's economics are that second trade's postings —
-  // which is why this is not ROLLED_BACK, whose correction would count the return twice.
+  // (csgomarketv3 trade-offer-state-endpoints.md). Steam marks the original trade 12, drops its
+  // settlement, and returns the items in a *separate* complete trade whose `rollback_trade` names the
+  // original — under the same asset ids, and with the offer left at 3 for ever (captured 2026-10-27;
+  // corpus ieconservice.get-trade-status, get-trade-history). The reversal's economics are that second
+  // trade's postings, which is why this is not ROLLED_BACK, whose correction would count the return twice.
   12: 'REVERSED'
 };
 

@@ -69,7 +69,7 @@ export function storePrecheck(context: EngineContext, trades: TradeService, requ
     if (item.location === 'CASKET') { out('already in storage'); continue; }
     if (item.location !== 'MAIN' || !item.asset_id) { out('not in inventory'); continue; }
     if (item.trade_protected_until && item.trade_protected_until > now) { out('trade-protected'); continue; }
-    if (storedCannotTrade(item.attributes_json)) { out('marked untradable by Steam'); continue; }
+    if (storedCannotTrade(item)) { out('marked untradable by Steam'); continue; }
     const steam = orders.commitment(accountId, localId, item.asset_id, 'steam');
     if (steam?.venue === 'steam') { out('listed on the Steam market'); continue; }
 

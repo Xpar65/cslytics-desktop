@@ -77,6 +77,11 @@ export class HoldingCounts {
     return { counts: entry.counts ?? undefined, pending: entry.loading !== null };
   }
 
+  /** The engine itself changed (remote engine host plan D3): nothing read from the old one describes the new. */
+  forgetAll(): void {
+    this.entries.clear();
+  }
+
   /** The engine reported a change on this account: every set holding it is read again when next asked. */
   forget(accountId: string): void {
     for (const entry of this.entries.values()) {

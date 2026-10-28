@@ -305,16 +305,12 @@ export function SignIn({
                         <Avatar name={saved.accountName} size={32} presence={connected ? 'live' : undefined} photo={saved.avatarRef} />
                         <span className="signin-account-text">
                           <span className="signin-account-name">{saved.accountName}</span>
-                          <span className="signin-account-meta">
-                            {connected ? 'Already connected in this window' : 'Reconnect with the saved session'}
-                          </span>
                         </span>
                         {connected ? <Icon name="check-circle" size={16} /> : <Icon name="chevron-right" size={16} />}
                       </button>
                     );
                   })}
                 </div>
-                <span className="field-hint">Uses the refresh token stored for that Steam username. Steam still has to accept it.</span>
               </div>
             ) : null}
 
@@ -357,7 +353,6 @@ export function SignIn({
                     <Field
                       label="Steam username"
                       icon="user"
-                      hint={account ? 'Fixed: this screen was opened from that account’s card.' : undefined}
                     >
                       <input
                         ref={usernameInput}
@@ -371,7 +366,7 @@ export function SignIn({
                         autoFocus={account === undefined}
                       />
                     </Field>
-                    <Field label="Password" icon="lock" hint="Held only for this attempt, then discarded for a refresh token.">
+                    <Field label="Password" icon="lock" hint="Not saved.">
                       <input
                         className="input"
                         type="password"
@@ -527,9 +522,6 @@ function QrPanel({
           <div className="progress-label">{progress.title}</div>
           <div className="progress-detail">{progress.detail}</div>
         </div>
-      </div>
-      <div className="field-hint">
-        This authorises login only — market-listing confirmations still happen on your phone.
       </div>
       <Button variant="ghost" icon="x" onClick={onCancel}>Cancel</Button>
     </div>

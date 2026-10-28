@@ -17,6 +17,7 @@ import { CurrencyPanel } from './CurrencyPanel.js';
 import { AccountOverview } from './AccountOverview.js';
 import { CsfloatAccountPage } from './CsfloatAccountPage.js';
 import { CslyticsAccountPage } from './CslyticsAccountPage.js';
+import { EngineHostPanel } from './EngineHostPanel.js';
 import { SteamAccountPage } from './SteamAccountPage.js';
 
 /**
@@ -36,7 +37,8 @@ export type { SettingsPage };
 
 const DESKTOP_PAGES: ReadonlyArray<{ id: SettingsPage; label: string; icon: IconName }> = [
   { id: 'general', label: 'General', icon: 'sliders' },
-  { id: 'cslytics', label: 'CSlytics account', icon: 'user' }
+  { id: 'cslytics', label: 'CSlytics account', icon: 'user' },
+  { id: 'engine', label: 'Engine host', icon: 'globe' }
 ];
 const ACCOUNT_PAGES: ReadonlyArray<{ id: SettingsPage; label: string; icon?: IconName; venue?: VenueId }> = [
   { id: 'overview', label: 'Overview', icon: 'user' },
@@ -66,11 +68,13 @@ function rememberedPage(hasAccount: boolean): SettingsPage {
 }
 
 export function SettingsView({
-  accounts, loaded, account, connection, connecting, lastError, holding, venue, onVenue, busy,
+  accounts, loaded, remote, account, connection, connecting, lastError, holding, venue, onVenue, busy,
   launch, onLaunch, onClear, onSelectAccount, onConnect, onSignIn, onSignOut, sidebarPinned, onSidebarPinned
 }: {
   accounts: readonly AccountCard[];
   loaded: boolean;
+  /** The engine is a connected host's (remote engine host plan D5): its accounts' sessions, data and the one engine preference are its own. */
+  remote: boolean;
   /** The account the bar has selected; null is every account. */
   account: AccountCard | null;
   connection: AccountConnection | undefined;
@@ -106,7 +110,7 @@ export function SettingsView({
     rememberSettingsPage(next);
   };
 
-  const attention = account ? accountAttention({ connection, connecting, venue, launch: launch ?? undefined }) : [];
+  const attention = account ? accountAttention({ connection, connecting, venue, launch: launch ?? undefined, remote }) : [];
 
   async function act(kind: AttentionAction): Promise<void> {
     if (!account) return;
@@ -198,23 +202,23 @@ export function SettingsView({
                   checked={sidebarPinned}
                   onChange={onSidebarPinned}
                   label="Keep the navigation open"
-                  hint="Otherwise it folds to icons when you click into a page. Remembered on this computer."
                 />
               </div>
             </Panel>
-            <ListingProtection accountId={accounts[0]?.accountId ?? null} />
+            <ListingProtection accountId={accounts[0]?.accountId ?? null} remote={remote} />
             <AboutPanel />
           </>
         ) : null}
 
         {page === 'cslytics' ? <CslyticsAccountPage /> : null}
+        {page === 'engine' ? <EngineHostPanel /> : null}
 
         {isAccountPage(page) && account === null ? (
           <Panel>
             <Empty
               icon={loaded ? 'users' : 'loader'}
               title={loaded ? (accounts.length === 0 ? 'No accounts yet' : 'Pick an account') : 'Loading your accounts…'}
-              hint={loaded ? (accounts.length === 0 ? 'Add a Steam account first.' : 'Select one on the left, or in the bar above.') : undefined}
+              hint={loaded && accounts.length === 0 ? 'Add a Steam account first.' : undefined}
             />
           </Panel>
         ) : null}
@@ -224,6 +228,7 @@ export function SettingsView({
             {notice ? <Notice tone={notice.tone} role="status">{notice.text}</Notice> : null}
             <AccountOverview
               account={account}
+              remote={remote}
               connection={connection}
               connecting={connecting}
               venue={venue}
@@ -241,6 +246,7 @@ export function SettingsView({
         {account && page === 'steam' ? (
           <SteamAccountPage
             account={account}
+            remote={remote}
             connection={connection}
             connecting={connecting}
             holding={holding}
@@ -269,7 +275,7 @@ export function SettingsView({
  * rides on the CSFloat overview, so any account answers it. After a change the switch shows what
  * the engine reads back, not what was asked for.
  */
-function ListingProtection({ accountId }: { accountId: string | null }): React.JSX.Element {
+function ListingProtection({ accountId, remote }: { accountId: string | null; remote: boolean }): React.JSX.Element {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
@@ -313,9 +319,11 @@ function ListingProtection({ accountId }: { accountId: string | null }): React.J
         ) : (
           <Switch
             checked={enabled ?? false}
-            disabled={busy || enabled === null}
+            disabled={busy || enabled === null || remote}
             label="Protect against double listing"
-            hint="Refuses to list the same item on Steam and CSFloat at once. Applies to every account."
+            hint={remote
+              ? 'Set on the engine host. Refuses to list the same item on Steam and CSFloat at once.'
+              : 'Refuses to list the same item on Steam and CSFloat at once.'}
             onChange={(next) => void change(next)}
           />
         )}

@@ -94,6 +94,11 @@ export type ExecutedTrade = {
   updatedAt?: string;
   /** `time_settlement`: an escrow hold's release, not the moment of acceptance. */
   settledAt?: string;
+  /**
+   * `rollback_trade`: the trade this one reverses, on the row that returned its items. A trade
+   * reversed under trade protection reads status 12 itself and says nothing; the return names it.
+   */
+  rollbackOf?: string;
   given: TradeLine[];
   received: TradeLine[];
   raw: unknown;

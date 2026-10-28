@@ -6,12 +6,21 @@ import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { MarketplaceStore } from '../db/marketplace.js';
 import type { ActionRow, ObservationRow } from '../db/database.js';
 import { WorkStore, type WorkStepRow } from '../db/work.js';
-import { attemptReturned, locationEvidence, postAttempt, type ProofNeed, type Surface, type SurfaceRef } from '../kernel/evidence.js';
+import { attemptReturned, attemptWatermark, locationEvidence, postAttempt, type ProofNeed, type Surface, type SurfaceRef } from '../kernel/evidence.js';
+
+/** The listing id a create's answer named, as CSFloat writes one (a digit string); null when the answer named none. */
+function namedListingId(answer: Record<string, unknown>): string | null {
+  return typeof answer['id'] === 'string' && /^\d+$/.test(answer['id']) ? answer['id'] : null;
+}
 import { AccountLock, errorMessage } from '../kernel/support.js';
+import { priceChangeRefusal } from '../kernel/price-cadence.js';
 import { HoldingsStore } from '../db/holdings.js';
+import { TransferStore } from '../db/transfers.js';
 import { STEAM_LISTED_SQL } from '../db/commitment.js';
+import type { CommandAuthority } from '../db/alphabets.js';
+import { claimForPerson, strategyRefusal, type AuthorityMember } from '../policy/authority.js';
 import {
-  CSFLOAT_LIST_EVIDENCE, CSFLOAT_LIST_LIMIT, CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, VISIBILITY_DEADLINE_MS, VISIBILITY_READ_OFFSETS_MS,
+  CREATE_CLOCK_TOLERANCE_MS, CSFLOAT_LIST_EVIDENCE, CSFLOAT_LIST_LIMIT, CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, VISIBILITY_DEADLINE_MS, VISIBILITY_READ_OFFSETS_MS,
   type CsfloatSellGroupMember, type CsfloatSellMember, type CsfloatSellRequest
 } from '../policy/csfloat-selling.js';
 import type { CsfloatListingService } from '../surfaces/csfloat-listings.js';
@@ -61,6 +70,8 @@ export type CsfloatListingStepParams = {
   /** The CSFloat connection the terms were admitted under; a walk of another generation proves nothing about them. */
   generation: number;
   policyVersion: number;
+  /** A reprice a person asked for inside the price-change interval (`kernel/price-cadence.ts`): recorded as the decision it was. */
+  force?: true;
 };
 
 /** The shortest sleep of the wait for CSFloat, so a refused read can never spin. */
@@ -141,9 +152,9 @@ export class CsfloatSellingService {
    * judges the contract's own observation and refuses one older than its window, then it is
    * queued and sent behind the reply.
    */
-  async submitEdit(accountId: string, commandId: string, listingId: string, priceCents?: number): Promise<WorkStepRow> {
+  async submitEdit(accountId: string, commandId: string, listingId: string, priceCents?: number, force = false, authority: CommandAuthority = 'HUMAN'): Promise<WorkStepRow> {
     if (!this.work.step(commandId)) await this.listing(accountId, listingId, 'person');
-    const step = this.queueEdit(accountId,commandId,listingId,priceCents);
+    const step = this.queueEdit(accountId,commandId,listingId,priceCents,force,authority);
     this.schedule(accountId);
     return step;
   }
@@ -210,13 +221,13 @@ export class CsfloatSellingService {
           try { db.addEvent(accountId,'csfloat-dispatch-error',{ operationId: id, message: errorMessage(error) },this.context.now()); } catch { /* closed under us */ }
           continue;
         }
-        // The listing the edit was about, read again, so a cancel can be proved: the stall no
+        // The listing the hop is about, read again, so it can be proved: for a cancel the stall no
         // longer holds it, and only the listing's own read says whether that is because it was
-        // delisted. This is the first such read, not the only one: until one settles it the
-        // refresh loop keeps reading (`needs`). A create is proved by the stall walk
-        // `mutation-settled` asks for.
+        // delisted; for a create, the listing the answer named. This is the first such read, not
+        // the only one: until one settles an edit the refresh loop keeps reading (`needs`), and a
+        // create is also proved by the stall walk `mutation-settled` asks for, which its cadence repeats.
         const step = this.work.step(id);
-        if (step?.target_id && step.kind !== CSFLOAT_CREATE) await this.listing(accountId, step.target_id, 'work');
+        if (step?.target_id) await this.listing(accountId, step.target_id, 'work');
       }
     });
     this.running.set(accountId,work);
@@ -278,6 +289,9 @@ export class CsfloatSellingService {
         })) throw new Error('Command id was already used for different terms');
         return existing.sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id));
       }
+      const refusal = this.authorityProblem(request.authority, false, request.members.map(member => 'localId' in member
+        ? { accountId: member.accountId, localId: member.localId } : { accountId: member.accountId, stackKey: member.stackKey }));
+      if (refusal) throw new Error(refusal);
       const selected = new Set<string>();
       const slots = new Map<string, number>();
       const frozen = this.unitsOf(request).map(member => {
@@ -295,11 +309,22 @@ export class CsfloatSellingService {
         if (selected.has(key)) throw new Error('Item selected more than once');
         selected.add(key); return { ...member,assetId,casketId };
       });
-      this.work.adoptCommand(request.commandId, CSFLOAT_CREATE, this.context.now());
-      return frozen.map((member,i) => this.insert({ id: `${request.commandId}:${i}`, commandId: request.commandId, accountId: member.accountId,
+      this.work.adoptCommand(request.commandId, CSFLOAT_CREATE, this.context.now(), request.authority ?? 'HUMAN');
+      const steps = frozen.map((member,i) => this.insert({ id: `${request.commandId}:${i}`, commandId: request.commandId, accountId: member.accountId,
         localId: member.localId, assetId: member.assetId, priceCents: member.priceCents, kind: CSFLOAT_CREATE,
         ...(member.casketId ? { casketId: member.casketId } : {}) }));
+      claimForPerson(db, request.authority, request.commandId, frozen, this.context.now());
+      return steps;
     });
+  }
+
+  /**
+   * Why a strategy may not send this listing work (strategy authority and confirmations plan D3), or
+   * `null`; a person's is never refused here. Isolated so a saboteur can let a strategy act on a
+   * listing a person made.
+   */
+  protected authorityProblem(authority: CommandAuthority | undefined, force: boolean, members: readonly AuthorityMember[]): string | null {
+    return strategyRefusal(this.context.database, { authority, force, members });
   }
 
   /** The request as units, in its own order: an item as named, a group as the units picked for it. */
@@ -340,7 +365,7 @@ export class CsfloatSellingService {
     throw new Error(`Only ${picked.length} of the ${member.quantity} asked for from this group can be listed on CSFloat now${refusal ? `; the rest: ${refusal}` : ''}`);
   }
 
-  queueEdit(accountId: string, commandId: string, listingId: string, priceCents?: number): WorkStepRow {
+  queueEdit(accountId: string, commandId: string, listingId: string, priceCents?: number, force = false, authority: CommandAuthority = 'HUMAN'): WorkStepRow {
     const kind = priceCents === undefined ? CSFLOAT_CANCEL : CSFLOAT_REPRICE;
     return this.context.database.transaction(() => {
       const existing = this.work.step(commandId);
@@ -349,15 +374,20 @@ export class CsfloatSellingService {
         if (existing.account_id !== accountId || existing.target_id !== listingId || existing.kind !== kind || params.priceCents !== (priceCents ?? null)) throw new Error('Command id was already used for different terms');
         return existing;
       }
-      this.validateEdit(accountId,listingId,priceCents);
+      // Whose the listing's holding is comes first: a strategy refused here is refused whatever the listing's read says.
+      const refusal = this.authorityProblem(authority, force, [{ accountId, localId: this.store.contract(accountId,listingId)?.local_id ?? undefined }]);
+      if (refusal) throw new Error(refusal);
+      this.validateEdit(accountId,listingId,priceCents,force);
       const listing = this.store.contract(accountId,listingId)!;
-      this.work.adoptCommand(commandId, kind, this.context.now());
-      return this.insert({ id: commandId, commandId, accountId, localId: listing.local_id, assetId: listing.asset_id, listingId,
-        priceCents: priceCents ?? null, kind });
+      this.work.adoptCommand(commandId, kind, this.context.now(), authority);
+      const step = this.insert({ id: commandId, commandId, accountId, localId: listing.local_id, assetId: listing.asset_id, listingId,
+        priceCents: priceCents ?? null, kind, ...(kind === CSFLOAT_REPRICE && force ? { force: true as const } : {}) });
+      claimForPerson(this.context.database, authority, commandId, [{ accountId, localId: listing.local_id ?? undefined }], this.context.now());
+      return step;
     });
   }
 
-  protected validateEdit(accountId: string, listingId: string, priceCents?: number): void {
+  protected validateEdit(accountId: string, listingId: string, priceCents?: number, force = false): void {
     const listing = this.store.contract(accountId,listingId);
     const observation = listing && this.context.database.observation(accountId,listing.observation_id);
     const connection = new MarketplaceStore(this.context.database).connection(accountId,'csfloat');
@@ -367,6 +397,13 @@ export class CsfloatSellingService {
     // A listing must have been in the authenticated own book; public known-id lookup cannot confer authority.
     if (!this.store.inStall(accountId,listingId)) throw new Error('Listing is no longer in the authenticated own book');
     if (priceCents !== undefined && (!Number.isSafeInteger(priceCents) || priceCents < 3)) throw new Error('CSFloat listing price must be at least 3 USD cents');
+    // The price-change cadence (`kernel/price-cadence.ts`): the last change is the last reprice of
+    // this listing that a read proved, and a listing never repriced may change now.
+    if (priceCents !== undefined) {
+      const cadence = priceChangeRefusal({ venue: 'csfloat', lastChangedAt: this.store.lastPriceChangeAt(accountId,listingId), currentCents: listing.price_cents,
+        requestedCents: priceCents, now: this.context.now(), force });
+      if (cadence) throw new Error(cadence);
+    }
   }
 
   protected paramsOf(step: WorkStepRow): CsfloatListingStepParams {
@@ -381,12 +418,12 @@ export class CsfloatSellingService {
    * action on `item:<localId>` would hold the resource against the retrieve.
    */
   private insert(input: { id: string; commandId: string; accountId: string; localId: string | null; assetId: string | null;
-    listingId?: string; priceCents: number | null; kind: CsfloatListingKind; casketId?: string }): WorkStepRow {
+    listingId?: string; priceCents: number | null; kind: CsfloatListingKind; casketId?: string; force?: true }): WorkStepRow {
     const db = this.context.database, now = this.context.now();
     const connection = new MarketplaceStore(db).connection(input.accountId,'csfloat');
     if (!connection?.credential_ref) throw new Error('Connect CSFloat first');
     const params: CsfloatListingStepParams = { operationId: input.id, assetId: input.assetId, listingId: input.listingId ?? null, priceCents: input.priceCents,
-      generation: connection.generation, policyVersion: this.store.policy().version };
+      generation: connection.generation, policyVersion: this.store.policy().version, ...(input.force ? { force: true as const } : {}) };
     const common = { commandId: input.commandId, accountId: input.accountId, localId: input.localId, now };
     if (input.casketId) {
       const retrieve = this.work.insert({ ...common, id: listingHopId(input.id, 'retrieve'), ordinal: 0, kind: 'RETRIEVE', params: { ...params, casketId: input.casketId } });
@@ -420,7 +457,7 @@ export class CsfloatSellingService {
         if (step.kind === CSFLOAT_CREATE) {
           const asset = this.services.policy.validate({ accountId: step.account_id,localId: step.local_id!,priceCents: params.priceCents! },step.id);
           if (asset !== params.assetId) throw new Error('Item asset changed; submit a new selection');
-        } else this.validateEdit(step.account_id,step.target_id!,step.kind === CSFLOAT_REPRICE ? params.priceCents! : undefined);
+        } else this.validateEdit(step.account_id,step.target_id!,step.kind === CSFLOAT_REPRICE ? params.priceCents! : undefined,params.force ?? false);
       };
       const admission = { rejected: null as Error | null };
       const admit = () => { try { validate(); } catch (error) { admission.rejected = error instanceof Error ? error : new Error(String(error)); throw admission.rejected; } };
@@ -441,8 +478,28 @@ export class CsfloatSellingService {
         throw error;
       }
       this.work.setState(step.id,outcome.kind === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION',this.context.now(),outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : null);
+      if (step.kind === CSFLOAT_CREATE && outcome.kind === 'SUBMITTED') this.noteNamedListing(step,action);
       return outcome;
     });
+  }
+
+  /**
+   * Keeps the listing id the create's answer named on the hop, as the id the read must show
+   * (delivery retries plan D6). Nothing trusts it until a complete read does: `reconcile` judges
+   * that one contract and still checks it names the hop's asset. Until this, a create learned its
+   * id only when the record held exactly one contract for the holding, which a holding with any
+   * earlier contract (refunded, delisted, sold) never did again: the relist's hop stayed open for
+   * good, blocking its sale's delivery and a person's delist (captured 2026-10-26). Isolated
+   * so a saboteur can ignore the answer as before.
+   */
+  protected noteNamedListing(step: WorkStepRow, action: ActionRow): void {
+    const named = this.namedListing(action);
+    if (named && this.work.step(step.id)?.target_id === null) this.work.update(step.id,{ target_id: named },this.context.now());
+  }
+
+  /** The listing id the create's answer named, read from its attempt; a seam for a saboteur that ignores the answer. */
+  protected namedListing(action: ActionRow): string | null {
+    return namedListingId(new TransferStore(this.context.database).attemptResponse(action.id));
   }
 
   // --- listing from a storage unit ------------------------------------------------------------
@@ -695,7 +752,16 @@ export class CsfloatSellingService {
     return { readAt, deadline: Math.min(...waiting.map(step => Date.parse(step.deadline_at!))) };
   }
 
-  /** Called after reads and on restart. It never sends, even when absence is proven. */
+  /**
+   * Called after reads and on restart. It never sends, even when absence is proven.
+   *
+   * A create is judged on the one contract its answer named, written to the hop at the send and
+   * re-derived from the attempt here when a restart lost that write. With no id (a lost answer),
+   * its candidates are the contracts that could be its product: created by the venue at or after
+   * the attempt began, allowing for the venue's clock, and shown by no stall walk before it. A
+   * listing that existed before the attempt is never the one it made, however many the holding
+   * has had (delivery retries plan D6).
+   */
   reconcile(accountId: string): void {
     const db = this.context.database;
     for (const step of this.work.openOf(accountId, CSFLOAT_LISTING_KINDS, CSFLOAT_LISTING_KINDS)) {
@@ -704,10 +770,16 @@ export class CsfloatSellingService {
       if (!action || !['RUNNING','AWAITING_OBSERVATION'].includes(action.state)) continue;
       if (step.state !== 'AWAITING_OBSERVATION') this.work.setState(step.id,'AWAITING_OBSERVATION',this.context.now());
       const params = this.paramsOf(step);
-      const candidates = step.target_id ? [this.store.contract(accountId,step.target_id)].filter((row): row is CsfloatContract => row !== undefined)
-        : this.store.contractsFor(accountId,step.local_id,params.assetId);
+      const named = step.target_id ?? (step.kind === CSFLOAT_CREATE ? this.namedListing(action) : null);
+      if (named && !step.target_id) this.work.update(step.id,{ target_id: named },this.context.now());
+      const attempt = db.latestAttempt(action.id);
+      const candidates = named ? [this.store.contract(accountId,named)].filter((row): row is CsfloatContract => row !== undefined)
+        : this.store.contractsFor(accountId,step.local_id,params.assetId,attempt ? {
+          createdAfter: new Date(Date.parse(attempt.started_at) - CREATE_CLOCK_TOLERANCE_MS).toISOString(), knownBefore: attemptWatermark(attempt) } : undefined);
       const listing = candidates.length === 1 ? candidates[0] : undefined;
       if (!listing) continue;
+      // A listing the answer named that is not about the hop's asset is not this create's, whatever the venue said.
+      if (step.kind === CSFLOAT_CREATE && listing.asset_id !== params.assetId) continue;
       const obs = db.observation(accountId,listing.observation_id);
       if (!obs?.complete || obs.error || obs.generation !== params.generation || !postAttempt(db,action,obs,false)) continue;
       const applied = step.kind === CSFLOAT_CANCEL ? ['delisted','cancelled'].includes(listing.state)

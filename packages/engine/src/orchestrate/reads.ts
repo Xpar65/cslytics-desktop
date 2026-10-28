@@ -5,7 +5,7 @@ import { FRESHNESS, surfaceName, type Surface, type SurfaceRef } from '../kernel
 import type { EngineSignal } from '../kernel/signals.js';
 import { errorMessage } from '../kernel/support.js';
 import { laneOf, type Transport } from '../kernel/governor.js';
-import { BackoffLedger, BLOCKED_ELSEWHERE_RETRY_MS } from '../policy/backoff.js';
+import { BackoffLedger, isRateLimitReason, BLOCKED_ELSEWHERE_RETRY_MS } from '../policy/backoff.js';
 import { baseIntervalMs, hasOpenCommitment, isDue, latestFor, SURFACE_ORDER, type DueVerdict, type Tier } from '../policy/cadence.js';
 import { proofDueAtMs, type ProofDemand } from '../policy/proof.js';
 import type { InventoryService } from '../surfaces/inventory.js';
@@ -245,7 +245,7 @@ export class ReadBroker implements Reading {
     if (!account) return;
     account.kept = false;
     account.held = undefined;
-    this.backoff.forget(accountId);
+    this.backoff.forget(accountId, true);
     for (const scope of account.scopes.values()) {
       for (const entry of [...scope.needs]) if (entry.state === 'queued') this.withdraw(scope, entry);
     }
@@ -271,8 +271,19 @@ export class ReadBroker implements Reading {
    * screen is exactly the request storm LANE-06 forbids.
    */
   setActiveAccount(accountId: AccountId | null): void {
-    for (const account of this.accounts.values()) account.tier = account.accountId === accountId ? 'ACTIVE' : 'BACKGROUND';
-    if (accountId) { const account = this.accounts.get(accountId); if (account) this.wake(account); }
+    this.setActiveAccounts(accountId === null ? [] : [accountId]);
+  }
+
+  /**
+   * The accounts on the active cadence, as a set: a window showing two accounts side by side
+   * names both. The set is the whole answer every time, so an account left out drops to the
+   * background and nothing accumulates; the empty set is the all-accounts scope above. The
+   * caller keeps the set small for the reason above, and the desktop passes at most one.
+   */
+  setActiveAccounts(accountIds: readonly AccountId[]): void {
+    const active = new Set(accountIds);
+    for (const account of this.accounts.values()) account.tier = active.has(account.accountId) ? 'ACTIVE' : 'BACKGROUND';
+    for (const accountId of active) { const account = this.accounts.get(accountId); if (account) this.wake(account); }
   }
 
   /** Drops every account to background — a hidden window, or a machine going to sleep. */
@@ -364,9 +375,7 @@ export class ReadBroker implements Reading {
   async refreshNow(accountId: AccountId, options: { contents?: boolean } = {}): Promise<readonly Surface[]> {
     await this.awaitHandshake(accountId);
     const account = this.account(accountId);
-    this.backoff.forget(accountId);
-    account.held = undefined;
-    for (const scope of account.scopes.values()) scope.holdReason = undefined;
+    this.liftHolds(account);
     const refs = this.scopes(accountId, this.demand(accountId)).filter((ref) => options.contents !== false || ref.surface !== 'gc-casket');
     const startedAfter = this.context.now();
     const outcomes = await Promise.all(refs.map((ref) => this.need(accountId, { ref, startedAfter, priority: 'person' })));
@@ -505,6 +514,26 @@ export class ReadBroker implements Reading {
   }
 
   /**
+   * Whether a history walk should hand its lane back now: a person's or a command's need is queued
+   * on another scope of the same lane. A backfill is the one walk that chooses how long it runs,
+   * and a page it does not read is read next time, so the listings someone is looking at are never
+   * behind five pages of old trades (history backfill plan D4). Isolated so a saboteur can hold the
+   * lane to the last page.
+   */
+  protected yieldsTo(accountId: AccountId, ref: SurfaceRef): () => boolean {
+    return () => {
+      const account = this.accounts.get(accountId);
+      if (!account) return false;
+      const lane = laneOf(TRANSPORT_OF[ref.surface]);
+      for (const scope of account.scopes.values()) {
+        if (scope.ref.surface === ref.surface || laneOf(scope.transport) !== lane) continue;
+        if (scope.needs.some((entry) => entry.state === 'queued' && entry.need.priority !== 'cadence')) return true;
+      }
+      return false;
+    };
+  }
+
+  /**
    * Whether a Game Coordinator need waits for the session to come up rather than being refused.
    * It never does: one waited for would be raised again by its cadence and waited for again, and
    * *Refresh now* on a Steam-only account would never answer. Isolated so a saboteur can wait.
@@ -513,14 +542,28 @@ export class ReadBroker implements Reading {
     return false;
   }
 
-  /** Whether a queued entry reads through its scope's hold now: pressing, and not already carried by a walk that failed. */
-  private presses(entry: NeedEntry): boolean {
-    return entry.state === 'queued' && this.pressing(entry.need) && (!entry.walked || this.pressesAgain(entry.need));
+  /**
+   * Whether a queued entry reads through its scope's hold now: pressing, not already carried by a
+   * walk that failed, and not held by the venue's own refusal, which nobody reads through.
+   */
+  private presses(account: AccountEntry, scope: ScopeEntry, entry: NeedEntry): boolean {
+    return !this.rateLimited(account, scope) && entry.state === 'queued' && this.pressing(entry.need) && (!entry.walked || this.pressesAgain(entry.need));
   }
 
   private heldNow(account: AccountEntry, scope: ScopeEntry): boolean {
     const hold = this.backoff.state(account.accountId, scope.name);
     return hold !== undefined && hold.notBeforeMs > this.context.ports.clock.now().getTime();
+  }
+
+  /** Whether the venue refused this scope for its pace and the hold it earned still stands. */
+  private rateLimited(account: AccountEntry, scope: ScopeEntry): boolean {
+    return this.backoff.rateLimited(account.accountId, scope.name, this.context.ports.clock.now().getTime());
+  }
+
+  /** What a need refused for a rate limit is told: the venue's words and when the read is asked again. */
+  private holdDetail(account: AccountEntry, scope: ScopeEntry): string {
+    const hold = this.backoff.state(account.accountId, scope.name);
+    return [scope.holdReason ?? 'rate-limited', hold ? `until ${new Date(hold.notBeforeMs).toISOString()}` : undefined].filter((part) => part !== undefined).join('; ');
   }
 
   /**
@@ -618,8 +661,16 @@ export class ReadBroker implements Reading {
         for (const entry of [...scope.needs]) if (entry.state === 'queued') this.answer(scope, entry, refused('breaker', this.refusalDetail(account, scope, 'breaker')));
         continue;
       }
-      // A held scope is walked only for a need that reads through the hold; the cadence waits.
-      if (this.heldNow(account, scope) && !scope.needs.some((entry) => this.presses(entry))) continue;
+      // A held scope is walked only for a need that reads through the hold; the cadence waits. A
+      // rate limit's hold nobody reads through: a need somebody waits on is answered at once with
+      // the venue's words, and a want waits the hold out (history backfill plan D5).
+      if (this.heldNow(account, scope)) {
+        if (this.rateLimited(account, scope)) {
+          for (const entry of [...scope.needs]) if (entry.state === 'queued' && entry.resolve) this.answer(scope, entry, refused('incomplete', this.holdDetail(account, scope)));
+          continue;
+        }
+        if (!scope.needs.some((entry) => this.presses(account, scope, entry))) continue;
+      }
       // The bucket is the endpoint's, not the scope's: a venue counts calls to a route, so a
       // hundred listings read one at a time share one route's budget.
       if (!this.context.governors.tryAdmitRead(account.accountId, scope.transport, scope.ref.surface)) continue;
@@ -746,9 +797,26 @@ export class ReadBroker implements Reading {
   }
 
   private clearHold(account: AccountEntry, scope: ScopeEntry): void {
-    this.backoff.clear(account.accountId, scope.name);
+    if (!this.backoff.at(this.context.ports.clock.now().getTime()).clear(account.accountId, scope.name)) return;
     scope.holdReason = undefined;
     if (account.held && account.held.reason !== 'blocked-elsewhere' && account.held.reason !== 'gc-disconnected') account.held = undefined;
+  }
+
+  /**
+   * Lifts every hold a person may lift, as *Refresh now* and the reconnect sweep do. A rate
+   * limit's hold stands, and the account's own hold then names it, so the window still says why
+   * one surface is not being read.
+   */
+  private liftHolds(account: AccountEntry): void {
+    this.backoff.at(this.context.ports.clock.now().getTime()).forget(account.accountId);
+    let standing: ScopeEntry | undefined;
+    for (const scope of account.scopes.values()) {
+      if (this.rateLimited(account, scope)) standing ??= scope;
+      else scope.holdReason = undefined;
+    }
+    account.held = standing
+      ? { until: this.backoff.state(account.accountId, standing.name)!.notBeforeMs, reason: standing.holdReason ?? 'rate-limited', surface: standing.ref.surface }
+      : undefined;
   }
 
   /**
@@ -763,7 +831,7 @@ export class ReadBroker implements Reading {
     for (const scope of account.scopes.values()) {
       if (scope.walk || !this.readable(scope.ref, gc) || !scope.needs.some((entry) => entry.state === 'queued')) continue;
       const hold = this.backoff.state(account.accountId, scope.name);
-      if (hold && hold.notBeforeMs > nowMs && !scope.needs.some((entry) => this.presses(entry))) { earliest = Math.min(earliest, hold.notBeforeMs); continue; }
+      if (hold && hold.notBeforeMs > nowMs && !scope.needs.some((entry) => this.presses(account, scope, entry))) { earliest = Math.min(earliest, hold.notBeforeMs); continue; }
       const resetsAtMs = this.context.governors.breakerFor(account.accountId, scope.name).resetsAtMs();
       if (resetsAtMs !== null) { earliest = Math.min(earliest, resetsAtMs); continue; }
       if (scope.hintUntilMs > nowMs) { earliest = Math.min(earliest, scope.hintUntilMs); continue; }
@@ -847,7 +915,7 @@ export class ReadBroker implements Reading {
         const result = await services.market.sync(accountId);
         return walked(result.observationId, result.complete);
       }
-      case 'steam-market-history': return walked(await services.market.orders.syncHistory(accountId));
+      case 'steam-market-history': return walked(await services.market.orders.syncHistory(accountId, undefined, { yield: this.yieldsTo(accountId, ref) }));
       case 'steam-wallet': return walked(await services.market.syncWallet(accountId));
       case 'steam-trade-inventory': return walked(await services.trades.syncEligibility(accountId));
       case 'steam-trade-offers': {
@@ -856,9 +924,9 @@ export class ReadBroker implements Reading {
       }
       case 'steam-trade-history': {
         // Completeness here means contiguous coverage, not "the request returned": an incomplete
-        // history walk leaves the checkpoint alone and holds the scope, so the next walk re-reads
-        // the gap rather than stepping over it.
-        const result = await services.trades.syncHistory(accountId);
+        // top leaves the checkpoint alone and holds the scope, so the next walk re-reads the gap
+        // rather than stepping over it; an incomplete backfill keeps the pages it read.
+        const result = await services.trades.syncHistory(accountId, undefined, { yield: this.yieldsTo(accountId, ref) });
         return walked(result.observationId, result.complete);
       }
       case 'csfloat-account-status': {
@@ -952,7 +1020,8 @@ export class ReadBroker implements Reading {
       hasOpenCommitment: hasOpenCommitment(this.context.database, accountId),
       transferIntervalMs,
       proofDueAtMs: proofDueAtMs(ref, demand, observation?.started_at, now.getTime()),
-      backfillPending: ref.surface === 'steam-market-history' && this.services.market.orders.backfillPending(accountId)
+      backfillPending: (ref.surface === 'steam-market-history' && this.services.market.orders.backfillPending(accountId))
+        || (ref.surface === 'steam-trade-history' && this.services.trades.backfillPending(accountId))
     });
   }
 
@@ -977,13 +1046,19 @@ export class ReadBroker implements Reading {
     return refs;
   }
 
-  /** Backs a scope off after a failed or incomplete walk, from its own interval, and says why in the window's words. */
+  /**
+   * Backs a scope off after a failed or incomplete walk, from its own interval, and says why in the
+   * window's words. A walk the venue refused for its pace earns the rate limit's hold instead: flat,
+   * long, and lifted by nothing but time (`RATE_LIMIT_HOLD_MS`).
+   */
   protected decay(accountId: AccountId, ref: SurfaceRef, reason: string): void {
     const name = this.scopeKey(ref);
     const nowMs = this.context.ports.clock.now().getTime();
     const account = this.account(accountId);
     const base = baseIntervalMs(ref.surface, account.tier);
-    const state = this.backoff.fail(accountId, name, Number.isFinite(base) ? base : 60_000, nowMs);
+    const state = isRateLimitReason(reason)
+      ? this.backoff.rateLimit(accountId, name, nowMs)
+      : this.backoff.fail(accountId, name, Number.isFinite(base) ? base : 60_000, nowMs);
     this.scope(account, ref).holdReason = reason;
     account.held = { until: state.notBeforeMs, reason, surface: ref.surface };
   }
@@ -1026,8 +1101,7 @@ export class ReadBroker implements Reading {
         // The reconnect sweep. The gap is the one window in which the world could have moved
         // with nobody watching (continuous freshness plan §1), so everything is suspect, contents
         // included: a person need for each, which lifts every hold as *Refresh now* does.
-        this.backoff.forget(accountId);
-        account.held = undefined;
+        this.liftHolds(account);
         const startedAfter = this.context.now();
         for (const ref of this.scopes(accountId, this.demand(accountId))) this.want(accountId, { ref, startedAfter, priority: 'person' });
       }

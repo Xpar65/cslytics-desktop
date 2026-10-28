@@ -143,9 +143,13 @@ export class TransferStore {
     return this.db.raw().prepare(`SELECT asset_id,quantity,app_id,context_id,attributes_json FROM trade_line WHERE account_id=? AND offer_id=? AND side=? AND line_key LIKE 'offer:%'`)
       .all(accountId,offerId,side) as Array<{ asset_id: string; quantity: number; app_id: number; context_id: string; attributes_json: string }>;
   }
+  /** The venue's answer to the action's latest attempt, as the fields it named; `{}` when it named none (a lost answer is recorded as `null`). */
   attemptResponse(actionId: string): Record<string, unknown> {
     const row = this.db.raw().prepare('SELECT response_ref FROM attempt WHERE action_id=? ORDER BY rowid DESC LIMIT 1').get(actionId) as { response_ref: string | null } | undefined;
-    try { return JSON.parse(row?.response_ref ?? '{}') as Record<string, unknown>; } catch { return {}; }
+    try {
+      const parsed: unknown = JSON.parse(row?.response_ref ?? '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+    } catch { return {}; }
   }
   assetBaseline(accountId: string): string[] {
     return [...this.db.raw().prepare(`SELECT asset_id AS id FROM item WHERE account_id=? AND location<>'MISSING' AND asset_id IS NOT NULL`).all(accountId)]

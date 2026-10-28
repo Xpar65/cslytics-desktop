@@ -61,7 +61,11 @@ producers/*.ts  ──raise / assert / resolve──▶  NotificationProvider.ts
 - `NotificationProvider.tsx` — holds the reducer in context, exposes `useNotifications()`, mounts
   every producer once, and owns the one timer that makes toasts leave.
 - `producers/` — one hook per thing that knows a fact. A producer lives beside what it knows
-  about, calls `assert`/`resolve` or `raise`, and decides nothing about delivery.
+  about, calls `assert`/`resolve` or `raise`, and decides nothing about delivery. `producers/engine.ts`
+  is the one that reads facts the engine wrote as `event` rows (a sale Steam reversed, a buy order
+  filled) through `facts.since` and the watermark main keeps per account in
+  `notifications-state.json` (plan §7.2): each is raised once per profile and never again after a
+  relaunch, and a profile never looked at takes what the record already holds as history.
 - `../../lib/sections.ts` — the page ids a `Route` may name, so a kind can say "Open Settings"
   without importing the shell.
 

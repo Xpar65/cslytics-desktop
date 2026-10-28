@@ -19,6 +19,8 @@ export const CSFLOAT_BASE = 'https://csfloat.com/api/v1';
 const CSFLOAT_HOST = 'csfloat.com';
 
 export type CsfloatRate = {
+  /** The route's bucket, when the venue says. */
+  limit: number | null;
   /** Remaining requests, when the venue says. Header names match case-insensitively. */
   remaining: number | null;
   /** Reset instant as epoch milliseconds, when the venue says. */
@@ -49,6 +51,13 @@ export type CsfloatRequest = {
   body?: unknown;
 };
 
+/**
+ * The share of a route's bucket left unspent. CSFloat's website draws on the account's buckets too: on 2026-10-25 a
+ * run that spent `/me/trades` to zero locked the account out of its own trades page ("too many requests ... 20").
+ * Rounded down, so a bucket too small to share (a buy-order edit, two a minute) keeps none.
+ */
+export const CSFLOAT_HEADROOM = 0.1;
+
 export class CsfloatTransport {
   private readonly cooldowns = new Map<string, number>();
   constructor(
@@ -65,7 +74,7 @@ export class CsfloatTransport {
     const lane = `${request.accountId ?? 'transport-contract'}:${request.method}:${route}`;
     const notBefore = this.cooldowns.get(lane) ?? 0;
     if (notBefore > Date.now()) return { kind: 'response', status: 429, ok: false, body: null, text: '',
-      rate: {remaining:0,resetAtMs:notBefore,retryAfterMs:notBefore-Date.now()} };
+      rate: {limit:null,remaining:0,resetAtMs:notBefore,retryAfterMs:notBefore-Date.now()} };
     const headers = new Headers({ Accept: 'application/json', Authorization: request.key });
     if (request.body !== undefined) headers.set('Content-Type', 'application/json');
     let response: Response;
@@ -95,7 +104,8 @@ export class CsfloatTransport {
       return { kind: 'failure', cause: 'transport', detail: error instanceof Error ? error.message : String(error) };
     }
     const rate = readRate(response.headers, Date.now());
-    if (response.status === 429 || rate.remaining === 0) this.cooldowns.set(lane,Math.max(Date.now()+(rate.retryAfterMs ?? 60_000),rate.resetAtMs ?? 0));
+    const reserve = rate.limit === null ? 0 : Math.floor(rate.limit * CSFLOAT_HEADROOM);
+    if (response.status === 429 || (rate.remaining !== null && rate.remaining <= reserve)) this.cooldowns.set(lane,Math.max(Date.now()+(rate.retryAfterMs ?? 60_000),rate.resetAtMs ?? 0));
     return { kind: 'response', status: response.status, ok: response.ok, body: parseJson(text), text, rate };
   }
 }
@@ -153,6 +163,7 @@ export function parseJson(text: string): unknown {
  */
 export function readRate(headers: Headers, nowMs: number): CsfloatRate {
   return {
+    limit: nonNegativeInteger(headers.get('x-ratelimit-limit')),
     remaining: nonNegativeInteger(headers.get('x-ratelimit-remaining')),
     resetAtMs: resetInstant(headers.get('x-ratelimit-reset'), nowMs),
     retryAfterMs: retryAfter(headers.get('retry-after'), nowMs)

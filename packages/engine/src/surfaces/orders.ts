@@ -7,6 +7,7 @@ import { OrderStore, type VenueOrderRow } from '../db/orders.js';
 import { errorMessage } from '../kernel/support.js';
 import { LedgerStore } from '../db/ledger.js';
 import type { ProofDemand } from '../policy/proof.js';
+import { PRICE_CHANGE, type PriceChangeRule } from '../kernel/price-cadence.js';
 
 export type { OrderState } from '../db/alphabets.js';
 export type { VenueOrderRow } from '../db/orders.js';
@@ -16,6 +17,8 @@ export type VenueProfile = {
   pendingKind: 'phone-confirm' | 'trade-offer' | 'escrow' | 'none';
   identityModel: 'asset-reissue' | 'stable-asset';
   whyOracle: 'per-order-history' | 'aggregate-only' | 'none'; settlementDelayDays: number;
+  /** How often one listing's price may change on this venue (`kernel/price-cadence.ts`). */
+  priceChange: PriceChangeRule;
 };
 /**
  * `identityModel` is measured, not assumed: a Steam list → cancel round-trip keeps the asset id
@@ -26,7 +29,8 @@ export type VenueProfile = {
  */
 export const STEAM_PROFILE: VenueProfile = {
   venue: 'steam', supportsPriceEdit: false, ordersExpire: false, pendingKind: 'phone-confirm',
-  identityModel: 'stable-asset', whyOracle: 'per-order-history', settlementDelayDays: 0
+  identityModel: 'stable-asset', whyOracle: 'per-order-history', settlementDelayDays: 0,
+  priceChange: PRICE_CHANGE.steam
 };
 export type OrderClassification = {
   orderId: string; state: OrderState; evidence: number; confidence: OrderConfidence; reason: string;
@@ -155,7 +159,7 @@ export class OrderService {
    * only when it joins the coverage, so a row's presence is also its membership of the covered
    * segment, which is what lets the next walk's top page recognise it.
    */
-  async syncHistory(accountId: string, pageSize = 500): Promise<number> {
+  async syncHistory(accountId: string, pageSize = 500, options: { yield?: () => boolean } = {}): Promise<number> {
     const { database } = this.context;
     const startedAt = this.context.now();
     const previous = this.coverage(accountId);
@@ -207,8 +211,9 @@ export class OrderService {
         rebased = previous !== undefined;
         coverage = { coveredCount: newer, boundaryEventId: oldestFresh.eventId, boundaryAt: oldestFresh.occurredAt, remaining: Math.max(0, total! - newer) };
       }
-      // 2. Older pages, each anchored on the boundary, while the walk's pages last.
-      while (coverage && coverage.remaining > 0 && !coverage.stopped && pages < this.pagesPerWalk()) {
+      // 2. Older pages, each anchored on the boundary, while the walk's pages last and nobody
+      // waits for the lane: a page the walk does not read is read next time (history backfill plan D4).
+      while (coverage && coverage.remaining > 0 && !coverage.stopped && pages < this.pagesPerWalk() && !options.yield?.()) {
         const page = await read(Math.max(0, coverage.coveredCount - 1));
         const at = page.events.findIndex((event) => event.eventId === coverage!.boundaryEventId);
         const older = at === -1 ? [] : page.events.slice(at + 1).filter((event) => !seen.has(event.eventId));

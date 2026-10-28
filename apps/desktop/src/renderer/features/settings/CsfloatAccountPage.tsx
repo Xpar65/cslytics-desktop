@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import type { MarketplaceStatus } from '@cslytics/engine';
 import { engine } from '../../lib/engine.js';
 import { Icon, type IconName } from '../../components/Icon.js';
-import { Button, IconButton, Metric, Notice, Panel, PanelHeader, ProgressBar, Switch } from '../../components/ui.js';
+import { Badge, Button, IconButton, Metric, Notice, Panel, PanelHeader, ProgressBar, Switch } from '../../components/ui.js';
 import { formatDateTime, formatRelative, formatUsd, humanize, plural } from '../../lib/labels.js';
 import { MarketplacePanel } from './MarketplacePanel.js';
 import { STANDING_SCALE, feeRate, pendingCounts, readinessRows, standingView, statisticRows, type ReadinessTone } from './csfloat-profile.js';
@@ -113,7 +113,7 @@ export function CsfloatAccountPage({ accountId, status, onChanged }: {
           <PanelHeader
             icon="shield-check"
             title="Standing"
-            subtitle={rating ? `as CSFloat rates it · ${formatRelative(rating.observedAt)}` : 'not read yet'}
+            badge={rating ? <Badge tone="quiet" icon="clock">{formatRelative(rating.observedAt)}</Badge> : null}
           />
           <div className="panel-body stack" data-testid="csfloat-standing">
             {/* The venue's own scale, every step named, the current one lit. */}
@@ -163,7 +163,7 @@ export function CsfloatAccountPage({ accountId, status, onChanged }: {
           <Metric label="Available" icon="dollar-sign" tone="accent" value={formatUsd(status.availableCents)} note={status.observedAt ? formatRelative(status.observedAt) : 'not read yet'} />
           <Metric label="Pending" icon="hourglass" value={formatUsd(status.pendingCents)} />
           <Metric label="Fee" icon="percent" value={fee ?? '—'} note={withdraw ? `withdraw ${withdraw}` : undefined} />
-          {pending.trades ? <Metric label="Need you" icon="inbox" tone="accent" value={pending.trades.toLocaleString()} note="trades to act on" /> : null}
+          {pending.trades ? <Metric label="Trades to act on" icon="inbox" tone="accent" value={pending.trades.toLocaleString()} /> : null}
         </div>
       ) : null}
 
@@ -175,14 +175,13 @@ export function CsfloatAccountPage({ accountId, status, onChanged }: {
               checked={status.stall.away === true}
               disabled={busy !== null || !connected || status.stall.away === null}
               label="Away"
-              hint="Hides every listing. CSFloat sets this during a suspension and does not unset it."
+              hint="Hides every listing."
               onChange={(next) => void act('away', () => engine.updateMarketplaceStall(accountId, { away: next }))}
             />
             <Switch
               checked={status.stall.public === true}
               disabled={busy !== null || !connected || status.stall.public === null}
               label="Public"
-              hint="Others can see the stall."
               onChange={(next) => void act('public', () => engine.updateMarketplaceStall(accountId, { stallPublic: next }))}
             />
             {message ? <Notice tone={message.tone} role="status">{message.text}</Notice> : null}
@@ -193,7 +192,7 @@ export function CsfloatAccountPage({ accountId, status, onChanged }: {
       {hasKey ? (
         <div className="grid-2">
           <Panel>
-            <PanelHeader icon="shield-check" title="Readiness" subtitle="Shown, never enforced" />
+            <PanelHeader icon="shield-check" title="Readiness" />
             <div className="panel-body flush">
               <div className="readiness" data-testid="csfloat-readiness">
                 {readiness.map((row) => (
@@ -207,7 +206,7 @@ export function CsfloatAccountPage({ accountId, status, onChanged }: {
             </div>
           </Panel>
           <Panel>
-            <PanelHeader icon="activity" title="Activity" subtitle="As CSFloat reports it" />
+            <PanelHeader icon="activity" title="Activity" />
             <div className="panel-body">
               {statistics.length > 0 ? (
                 <div className="stat-row">
@@ -241,7 +240,6 @@ export function CsfloatAccountPage({ accountId, status, onChanged }: {
               >
                 Refresh eligibility
               </Button>
-              <span className="field-hint">Inventory offers CSFloat listing only for items this has checked.</span>
             </div>
             {message && busy === null ? <Notice tone={message.tone} role="status">{message.text}</Notice> : null}
           </>

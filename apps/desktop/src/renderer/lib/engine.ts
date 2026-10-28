@@ -26,6 +26,35 @@ export type RefreshStatusRow = {
   reason?: string;
   /** The one surface resting, when the hold is a failed walk's and not the CS2 session's. */
   heldSurface?: string;
+  /** Every scope the broker keeps for the account, in the window's words. */
+  scopes?: ScopeStatusRow[];
+};
+
+/** One scope of an account's refresh: what it is doing now, and until when or why. */
+export type ScopeStatusRow = {
+  ref: { surface: string; scope: { kind: string; id?: string } };
+  state: 'idle' | 'due' | 'walking' | 'held' | 'unreadable';
+  since: string;
+  until?: string;
+  reason?: string;
+  needs: number;
+};
+
+/** How much of one history the record holds for an account, from `history.coverage`. */
+export type HistoryCoverageRow = {
+  accountId: string;
+  surface: 'steam-market-history' | 'steam-trade-history';
+  /** Rows held in one contiguous segment from the newest. */
+  covered: number;
+  /** The venue's own count, when it named one. */
+  total: number | null;
+  /** Older rows still to read; null while the venue has named no total and the end is not reached. */
+  remaining: number | null;
+  /** Why the backfill gave up short of the end, when it did. */
+  stopped: string | null;
+  observedAt: string | null;
+  complete: number;
+  error: string | null;
 };
 
 export type SavedAccount = {
@@ -137,6 +166,18 @@ export const engine = {
   /** The currency section whole: the base code and the account-pages toggle. */
   writeCurrency: (currency: import('../../shared/api.js').CurrencySettings) =>
     invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.currency', currency }),
+  // Which engine this desktop drives (remote engine host plan), answered by main. `connectHost` and
+  // `disconnectHost` swap the engine under the window, which reloads once they answer; the token
+  // goes one way and no answer carries it.
+  engineStatus: () => invoke<import('../../shared/api.js').EngineStatus>({ type: 'engine.status' }),
+  connectHost: (request: { url: string; label: string; token: string }) =>
+    invoke<import('../../shared/api.js').EngineStatus>({ type: 'engine.connect', ...request }),
+  disconnectHost: () => invoke<import('../../shared/api.js').EngineStatus>({ type: 'engine.disconnect' }),
+  /** The pages a connected host serves; none for a local engine. */
+  hostPages: () => invoke<import('../../shared/api.js').HostPage[]>({ type: 'engine.pages' }),
+  /** Shows one host page in a view over the frame at these window pixels; the same page only moves. */
+  showHostPage: (id: string, bounds: import('../../shared/api.js').HostPageBounds) => invoke<null>({ type: 'engine.showPage', id, bounds }),
+  hideHostPage: () => invoke<null>({ type: 'engine.hidePage' }),
   // Prices, answered by main from its own cache (portfolio and pricing plan §3). The window
   // formats these figures and computes none of them.
   readValuation: (accountIds: readonly string[]) =>
@@ -148,7 +189,7 @@ export const engine = {
   itemPage: (name: string, accountIds: readonly string[]) =>
     invoke<import('../../shared/market.js').ItemPage>({ type: 'item.page', name, accountIds: [...accountIds] }),
   /** The open item page's poll: asks for the name and returns the newest book held. */
-  itemWatch: (name: string) => invoke<import('@cslytics/market-data').StoredBook | null>({ type: 'item.watch', name }),
+  itemWatch: (name: string, accountId?: string) => invoke<import('../../shared/market.js').ItemBook>({ type: 'item.watch', name, ...(accountId === undefined ? {} : { accountId }) }),
   /** Steam's price series for a name; may wait on a fetch the first time, so the page asks it on its own. */
   itemHistory: (name: string) => invoke<import('../../shared/market.js').ItemHistory>({ type: 'item.history', name }),
   /** The published float curve for a name on Steam or CSFloat, or a recorded absence. */
@@ -357,9 +398,13 @@ export const engine = {
   readRefreshStatus: (accountIds: readonly string[]) =>
     invoke<RefreshStatusRow[]>({ type: 'refresh.status', accountIds: [...accountIds] }),
 
-  /** Tells the runtime which account is on screen, so it can spend its budget there. */
+  /** How much of each history the record holds for one account. Reaches no network. */
+  readHistoryCoverage: (accountId: string) =>
+    invoke<HistoryCoverageRow[]>({ type: 'history.coverage', accountId }),
+
+  /** Tells the runtime which account is on screen, so it can spend its budget there. The desktop names at most one. */
   setRefreshScope: (accountId: string | null) =>
-    invoke<{ kind: 'scoped' }>({ type: 'refresh.scope', accountId }),
+    invoke<{ kind: 'scoped' }>({ type: 'refresh.scope', accountIds: accountId === null ? [] : [accountId] }),
 
   /**
    * Unprompted change notices.

@@ -1,5 +1,5 @@
 import type { RawEconItem } from '@cslytics/ports';
-import { ATTRIBUTE_CANNOT_TRADE, attributeValue } from './identity.js';
+import { ATTRIBUTE_CANNOT_TRADE, QUALITY_VOLATILE, attributeValue } from './identity.js';
 
 /**
  * What an item row keeps of the attributes the Game Coordinator sent (holdings plan D6).
@@ -28,13 +28,15 @@ export function encodeAttributes(item: RawEconItem): EncodedAttributes {
 /**
  * `cannot trade` read back off a stored row, for admission, which holds rows rather than the
  * walk's items. The same rule as `cannotTrade` in `identity.ts`; `cannotTradeSql` is its spelling
- * for a query. A row with no attributes, or unreadable ones, says nothing.
+ * for a query. A row with no attributes, or unreadable ones, says nothing beyond its quality.
  */
-export function storedCannotTrade(attributesJson: string | null | undefined): boolean {
-  if (!attributesJson) return false;
+export function storedCannotTrade(row: { attributes_json?: string | null; quality: number } | null | undefined): boolean {
+  if (!row) return false;
+  if (row.quality === QUALITY_VOLATILE) return true;
+  if (!row.attributes_json) return false;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(attributesJson);
+    parsed = JSON.parse(row.attributes_json);
   } catch {
     return false;
   }
@@ -45,7 +47,7 @@ export function storedCannotTrade(attributesJson: string | null | undefined): bo
 
 /** `storedCannotTrade` as a SQL predicate over an `item` alias. */
 export function cannotTradeSql(alias: string): string {
-  return `COALESCE(json_extract(${alias}.attributes_json, '$."${ATTRIBUTE_CANNOT_TRADE}"'), 0) NOT IN (0, '0')`;
+  return `(${alias}.quality = ${QUALITY_VOLATILE} OR COALESCE(json_extract(${alias}.attributes_json, '$."${ATTRIBUTE_CANNOT_TRADE}"'), 0) NOT IN (0, '0'))`;
 }
 
 /** One applied accessory on a carrier: a sticker or patch in a slot, or the charm. */

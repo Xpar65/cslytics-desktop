@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import type { StoragePageRow } from '@cslytics/engine';
-import { steamMarketListingUrl } from '@cslytics/catalogue';
 import { CopyButton } from '../../components/ui.js';
 import { Icon } from '../../components/Icon.js';
 import { qualityLabel } from '../../lib/format.js';
@@ -8,7 +7,7 @@ import { formatDateTime, locationLabel } from '../../lib/labels.js';
 import type { NamedItem } from './InventoryTiles.js';
 
 /** One line of the fold. `copy: false` is for a yes or no, which nobody pastes anywhere. */
-type Fact = { label: string; value: string; mono?: boolean; copy?: boolean; clip?: boolean };
+type Fact = { label: string; value: string; mono?: boolean; copy?: boolean };
 
 /**
  * The holding's own facts, folded until asked for, each with a copy button.
@@ -51,9 +50,6 @@ export function ItemMoreDetails({ row, accounts, units }: {
     value: row.marketable === null || row.marketable === undefined ? 'Unknown' : row.marketable ? 'Yes' : 'No',
     copy: false
   });
-  if (row.marketHashName) {
-    where.push({ label: 'Steam Market', value: steamMarketListingUrl(row.marketHashName), clip: true });
-  }
 
   const game: Fact[] = [
     { label: 'Def index', value: String(row.defIndex), mono: true },
@@ -88,10 +84,10 @@ function FactGroup({ title, facts }: { title: string; facts: readonly Fact[] }):
       <h4>{title}</h4>
       <dl>
         {facts.map((fact) => (
-          <div className="fact" key={fact.label} data-clip={fact.clip || undefined}>
+          <div className="fact" key={fact.label}>
             <dt>{fact.label}</dt>
             <dd>
-              <span className={fact.mono ? 'fact-value fact-mono' : 'fact-value'} title={fact.clip ? fact.value : undefined}>{fact.value}</span>
+              <span className={fact.mono ? 'fact-value fact-mono' : 'fact-value'}>{fact.value}</span>
               {fact.copy === false ? null : <CopyButton value={fact.value} label={`Copy ${fact.label.toLowerCase()}`} />}
             </dd>
           </div>

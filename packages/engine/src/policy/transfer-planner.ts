@@ -156,7 +156,7 @@ export class TransferPlanner {
     if (marketplace) return marketplace;
     // The Game Coordinator's `cannot trade` on the unit itself, which no Community read can lift
     // and which a crated item carries too, so it is judged before the deferred tradability below.
-    if (storedCannotTrade(db.itemByAssetId(accountId,assetId)?.attributes_json)) return 'Item is marked untradable by Steam';
+    if (storedCannotTrade(db.itemByAssetId(accountId,assetId))) return 'Item is marked untradable by Steam';
     if (!pendingRetrieval) {
       const row = evidence.community(accountId,assetId);
       // Require a positive current description even for cases and coins. An expired cooldown

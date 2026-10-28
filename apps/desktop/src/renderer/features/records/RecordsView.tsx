@@ -2,7 +2,6 @@ import React, { useCallback, useState } from 'react';
 import type { PageEnvelope } from '@cslytics/engine';
 import { PagedRows } from '../../components/PagedRows.js';
 import { Button, DetailView, Drawer, IconButton, Panel, SearchInput, Select, StatusBadge } from '../../components/ui.js';
-import { PageHeader } from '../../components/PageHeader.js';
 import { Avatar } from '../../components/Avatar.js';
 import { Icon, type IconName } from '../../components/Icon.js';
 import { formatAmount, formatObservedAmount } from '../../lib/money.js';
@@ -35,11 +34,11 @@ type Row = {
   counterparty?: string;
 };
 
-const META: Record<Domain, { title: string; icon: IconName; subtitle: string; command: 'orders.page' | 'history.page' | 'trades.page' | 'ledger.page'; detail: 'orders.detail' | 'history.detail' | 'trades.detail' | 'ledger.detail'; empty: string }> = {
-  orders: { title: 'Orders', icon: 'receipt', subtitle: 'Every order this app has placed or seen. Amounts that were never observed stay unknown.', command: 'orders.page', detail: 'orders.detail', empty: 'Orders appear once a listing or a buy order has been placed or observed.' },
-  history: { title: 'Trading history', icon: 'history', subtitle: 'Market events exactly as Steam reported them, newest first.', command: 'history.page', detail: 'history.detail', empty: 'History fills in as the market walk reads events from Steam.' },
-  trades: { title: 'Trades', icon: 'arrow-left-right', subtitle: 'Trade offers and executed trades. An accepted offer is not a delivery until both inventories show it.', command: 'trades.page', detail: 'trades.detail', empty: 'Trade offers appear once an account has been read.' },
-  ledger: { title: 'Ledger', icon: 'book', subtitle: 'Observed economic events. An amount that was never evidenced is shown as unknown, never as zero.', command: 'ledger.page', detail: 'ledger.detail', empty: 'The ledger fills in as sales, purchases and trades are observed.' }
+const META: Record<Domain, { title: string; icon: IconName; command: 'orders.page' | 'history.page' | 'trades.page' | 'ledger.page'; detail: 'orders.detail' | 'history.detail' | 'trades.detail' | 'ledger.detail'; empty: string }> = {
+  orders: { title: 'Orders', icon: 'receipt', command: 'orders.page', detail: 'orders.detail', empty: 'Orders appear once a listing or a buy order has been placed or observed.' },
+  history: { title: 'Trading history', icon: 'history', command: 'history.page', detail: 'history.detail', empty: 'History fills in as the market walk reads events from Steam.' },
+  trades: { title: 'Trades', icon: 'arrow-left-right', command: 'trades.page', detail: 'trades.detail', empty: 'Trade offers appear once an account has been read.' },
+  ledger: { title: 'Ledger', icon: 'book', command: 'ledger.page', detail: 'ledger.detail', empty: 'The ledger fills in as sales, purchases and trades are observed.' }
 };
 
 const ORDER_FILTER = ['OPEN', 'PENDING_EXTERNAL', 'SUBMITTED', 'UNEXPLAINED', 'QUARANTINED', 'ENDED_FILLED', 'ENDED_CANCELLED_BY_US', 'ENDED_CANCELLED_EXTERNALLY', 'ENDED_NOT_APPLIED'];
@@ -126,7 +125,6 @@ export function RecordsView({ domain, accountIds, accounts = [] }: { domain: Dom
   const filterLabel = domain === 'orders' ? 'Order state' : domain === 'ledger' ? 'Ledger kind' : 'Trade status';
 
   return <Panel className="enter">
-    <PageHeader subtitle={meta.subtitle} />
     <div className="toolbar page-controls">
       <SearchInput label="Find record" placeholder="Find by order, event, trade or listing number" value={search} onChange={setSearch} width={360} />
       {filterOptions.length > 0 ? (

@@ -117,12 +117,10 @@ export function MarketplacePanel({
       <PanelHeader
         mark={<VenueMark venue="csfloat" size={16} />}
         title="CSFloat"
-        subtitle="Your own developer key, stored by Windows and never shown again."
         info={{ label: 'What a CSFloat key allows', content: KEY_INFO }}
         badge={<StatusBadge label={label.text} tone={label.tone} icon={label.icon} title={label.hint} />}
       />
       <div className="panel-body stack" data-testid="marketplace-panel" data-status={state}>
-        <div className="field-hint">{label.hint}</div>
         {status?.remoteSteamId ? (
           <div className="field-hint" data-testid="marketplace-identity">
             Key belongs to CSFloat account {status.remoteSteamId}
@@ -148,7 +146,6 @@ export function MarketplacePanel({
           <Field
             label={hasKey ? 'Replace the saved key' : 'CSFloat API key'}
             icon="key"
-            hint="Saving here does not revoke the old key at CSFloat."
           >
             <input
               className="input"

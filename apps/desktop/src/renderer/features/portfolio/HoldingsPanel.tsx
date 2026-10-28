@@ -59,7 +59,7 @@ export function HoldingsPanel({
   if (holdings.length === 0) {
     return (
       <Panel>
-        <Empty icon="wallet" title="Nothing observed yet" hint="Figures appear once an account has been connected and read." />
+        <Empty icon="wallet" title="Nothing observed yet" />
       </Panel>
     );
   }

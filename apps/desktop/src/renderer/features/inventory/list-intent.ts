@@ -3,12 +3,12 @@ import { submitCommand } from './commands.js';
 import { unavailableVenues, venuesFor, type ActionVerdict } from './item-actions.js';
 import { selectionKey } from './selection.js';
 import type { NamedItem } from './InventoryTiles.js';
-import type { PricedEntry, StagedEntry, WorkspaceIntent } from '../../components/ListingWorkspace.js';
+import type { PricedEntry, StagedEntry, WorkspaceIntent } from '../../components/listing-workspace-store.js';
 
 /** What a crated row says once CSFloat is its marketplace. */
 export const CSFLOAT_FROM_STORAGE_CAPTION = 'Retrieved from storage first, then listed once CSFloat sees it in your inventory, which can take a few minutes. It needs one free inventory slot.';
 
-/** A selected item as the inspector saw it when *List for sale* was chosen, with its own verdict. */
+/** A selected item as the inspector saw it when *Stage listing* was chosen, with its own verdict. */
 export type StagedItem = { row: NamedItem; verdict: ActionVerdict };
 
 /** An item in the listing workspace: what its row prints, and the row the command is built from. */
@@ -17,8 +17,10 @@ export type StagedListItem = StagedEntry & { row: NamedItem };
 /**
  * The workspace's entries for a selection.
  *
- * The venues are the ones each row's own verdict allows, never widened: a row Steam will take and
- * CSFloat will not is not a row to offer CSFloat on and refuse later.
+ * The shell stages them (`useListingWorkspace` in `App.tsx`), not the Inventory view: the
+ * workspace has to outlive the selection and the page. The venues are the ones each row's own
+ * verdict allows, never widened: a row Steam will take and CSFloat will not is not a row to offer
+ * CSFloat on and refuse later.
  */
 export function stageItems(staged: readonly StagedItem[]): StagedListItem[] {
   return staged.map(({ row, verdict }) => {
@@ -27,15 +29,16 @@ export function stageItems(staged: readonly StagedItem[]): StagedListItem[] {
       key: selectionKey(row),
       accountId: row.accountId,
       name: row.name,
+      marketHashName: row.marketHashName,
       imageUrl: row.imageUrl,
       paintWear: row.paintWear ?? null,
       localId: row.localId,
       place: { icon: place.icon ?? 'package', label: place.label },
       ...(row.location === 'CASKET' ? {
-        caption: { icon: 'download' as const, text: 'Retrieved from storage first, then listed. It needs one free inventory slot.' },
+        caption: { icon: 'download' as const, short: 'From storage', text: 'Retrieved from storage first, then listed. It needs one free inventory slot.' },
         // CSFloat reads its own copy of the inventory, which caught up about two minutes after a
         // retrieve on 2026-09-23 (fixtures/csfloat/INDEX.md). The engine waits up to ten.
-        venueCaption: { csfloat: { icon: 'download' as const, text: CSFLOAT_FROM_STORAGE_CAPTION } }
+        venueCaption: { csfloat: { icon: 'download' as const, short: 'From storage', text: CSFLOAT_FROM_STORAGE_CAPTION } }
       } : {}),
       venues: venuesFor(verdict),
       unavailable: unavailableVenues(verdict),
@@ -55,6 +58,7 @@ export function stageItems(staged: readonly StagedItem[]): StagedListItem[] {
 export const LIST_INTENT: WorkspaceIntent<StagedListItem> = {
   verb: 'List',
   noun: 'item',
+  icon: 'tag',
   refused: 'the listing',
   batches(rows) {
     const at = (venue: 'steam' | 'csfloat'): Array<PricedEntry<StagedListItem>> => rows.filter((row) => row.venue === venue);

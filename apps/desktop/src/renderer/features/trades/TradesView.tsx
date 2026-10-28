@@ -139,7 +139,6 @@ export function TradesView({ accountIds, accounts }: { accountIds: string[]; acc
 
   return <Panel className="enter trades-page">
     <PageHeader
-      subtitle="Every trade on your accounts: what it was for, where it stands, and what moved. A record to read — nothing here sends or accepts anything."
       actions={entry ? (
         <Segmented
           label="Item view"
@@ -194,10 +193,10 @@ export function TradesView({ accountIds, accounts }: { accountIds: string[]; acc
       >
         {loaded?.error && loaded.key === selectedKey ? <Notice tone="warn" role="alert" title="This trade could not be read">{loaded.error}</Notice> : null}
         {!selected ? (
-          <Empty icon="arrow-left-right" title="No trade selected" hint="Choose a trade on the left to see what it was for and the items in it." />
+          <Empty icon="arrow-left-right" title="No trade selected" />
         ) : !entry ? (
           loaded && loaded.key === selectedKey
-            ? (loaded.error ? null : <Empty icon="inbox" title="That trade is no longer recorded" hint="Choose another trade on the left." />)
+            ? (loaded.error ? null : <Empty icon="inbox" title="That trade is no longer recorded" />)
             : <Empty icon="loader" title="Reading the trade…" />
         ) : (
           <div className="trade-main" key={selectedKey ?? ''}>

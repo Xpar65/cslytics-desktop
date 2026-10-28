@@ -1,5 +1,6 @@
 import type {
   AccountId,
+  AccountOrderBook,
   BillingAddress,
   BuyOrderId,
   BuyOrderRequest,
@@ -14,6 +15,7 @@ import type {
   TaxRate,
   Wallet
 } from '@cslytics/ports';
+import { orderBookUrl, parseOrderBook } from '@cslytics/market-data';
 
 const MARKET_BASE = 'https://steamcommunity.com/market';
 
@@ -251,6 +253,24 @@ export class SteamMarketAdapter implements SteamMarketPort {
       currency: Number(raw.wallet_currency),
       observedAt: new Date().toISOString()
     };
+  }
+
+  /**
+   * The account's own read of the 2026 order book, the one price read that carries a session
+   * (portfolio and pricing plan D5, D17): the URL and the parser are the anonymous read's
+   * (`@cslytics/market-data`), the cookies are the account's, so an answer pinned to the wallet is
+   * in the wallet's currency. `eCurrency` is read from the body and never assumed. A name with no
+   * market answers `success:false` and is `null` here, never a zero; anything else that is not a
+   * book throws, because an empty book would read as a market with nothing in it.
+   */
+  async getOrderBook(accountId: AccountId, marketHashName: string): Promise<AccountOrderBook | null> {
+    const response = await this.request(accountId, orderBookUrl(marketHashName), {
+      headers: { Accept: 'application/json', Referer: `${MARKET_BASE}/`, 'x-valve-request-type': 'queryAction' }
+    });
+    const parsed = parseOrderBook(response.status, await parseJson(response), response.headers.get('etag'));
+    if (parsed.kind === 'absent') return null;
+    if (parsed.kind !== 'ok') throw new Error(`orderbook failed: HTTP ${response.status}: ${parsed.detail}`);
+    return { ...parsed.value, observedAt: new Date().toISOString() };
   }
 
 

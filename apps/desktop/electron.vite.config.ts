@@ -43,6 +43,12 @@ export default defineConfig({
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
+        // The window's bridge, and the narrower one a connected host's page gets in its view
+        // (`HOST_PAGE_PRELOAD_ENTRY`). Both are sandboxed, so both are CommonJS below.
+        input: {
+          index: resolve('src/preload/index.ts'),
+          'host-page': resolve('src/preload/host-page.ts')
+        },
         // Sandboxed Electron renderers cannot execute ESM preload scripts. The nearest
         // package.json is ESM, so electron-vite would otherwise emit index.mjs and the
         // context bridge would never be installed. Keep this one-file bridge CommonJS.

@@ -5,6 +5,8 @@ import { useCatalogueProducer } from './producers/catalogue.js';
 import { useReleaseProducer } from './producers/release.js';
 import { useVenueProducer } from './producers/venue.js';
 import { useWorkFailureProducer } from './producers/work.js';
+import { useEngineFactsProducer } from './producers/engine.js';
+import { useEngineHostProducer } from './producers/engine-host.js';
 import { useWorkPanelOpener } from '../work/WorkIndicator.js';
 
 /**
@@ -103,7 +105,9 @@ function Producers({ api }: { api: NotificationApi }): null {
   useCatalogueProducer(api);
   useVenueProducer(api);
   useWorkFailureProducer(api);
+  useEngineFactsProducer(api);
   useReleaseProducer(api);
+  useEngineHostProducer(api);
   return null;
 }
 

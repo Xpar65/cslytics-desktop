@@ -1,10 +1,10 @@
 import { existsSync, readFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ClockPort } from '@cslytics/ports';
+import type { AccountOrderBook, ClockPort } from '@cslytics/ports';
 import {
   HttpMarketDataSource, MarketDataScheduler, MarketDataStore, MarketSchemaNewerError, OracleMarketDataSource, OracleMarketWorld,
-  type FetchLike, type FillEntry, type FxRates, type MarketDataSource, type OrderBook, type SchedulerEvent, type SchedulerStatus,
-  type StoredBook, type StoredCurve, type StoredHistory
+  type FetchLike, type FillEntry, type FxRates, type MarketDataSource, type OrderBook, type PriceHistory, type SchedulerEvent,
+  type SchedulerStatus, type StoredBook, type StoredCurve, type StoredHistory
 } from '@cslytics/market-data';
 import type { FillState } from '../../shared/market.js';
 
@@ -26,14 +26,22 @@ export type MarketSeed = {
   strict?: boolean;
   currency?: number;
   books?: Record<string, OrderBook>;
+  /** Names whose book moves on every read, through these books in turn. */
+  cycles?: Record<string, OrderBook[]>;
+  /** A sales series by name, in place of the synthetic thirty days. */
+  histories?: Record<string, PriceHistory>;
   absent?: string[];
+  /** An account's own read of a book, by account id then name, in whatever currency it says (plan D17); `null` is a session that answers none. */
+  accountBooks?: Record<string, Record<string, OrderBook | null>>;
   fx?: FxRates | null;
 };
 
-const SYSTEM_CLOCK: ClockPort = { now: () => new Date(), sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) };
+export const SYSTEM_CLOCK: ClockPort = { now: () => new Date(), sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) };
 const FX_REFRESH_MS = 12 * 60 * 60_000;
 const HISTORY_FRESH_MS = 24 * 60 * 60_000;
 const CURVE_FRESH_MS = 24 * 60 * 60_000;
+/** How long the open page's read may wait for the scheduler before it answers with the book held. */
+export const WATCH_WAIT_MS = 10_000;
 
 export class MarketDataHost {
   readonly store: MarketDataStore;
@@ -41,14 +49,23 @@ export class MarketDataHost {
   readonly scheduler: MarketDataScheduler;
   /** Set when the profile carried a seed: a journey's deterministic market. */
   readonly oracle: OracleMarketWorld | null;
+  private readonly clock: ClockPort;
   private fillComplete = false;
   private running: Promise<void> | null = null;
   private fxTimer: ReturnType<typeof setInterval> | null = null;
   private readonly inflight = new Map<string, Promise<unknown>>();
+  /** A journey's seeded books of an account's own; empty on a live profile. */
+  private readonly seededBooks: Readonly<Record<string, Readonly<Record<string, OrderBook | null>>>>;
 
   constructor(
     userData: string,
-    private readonly options: { fetch: FetchLike; userAgent: string; onEvent?: (event: SchedulerEvent) => void; clock?: ClockPort; log?: (message: string, detail?: unknown) => void }
+    private readonly options: {
+      fetch: FetchLike;
+      userAgent: string;
+      onEvent?: (event: SchedulerEvent) => void;
+      clock?: ClockPort;
+      log?: (message: string, detail?: unknown) => void;
+    }
   ) {
     this.store = MarketDataHost.openStore(join(userData, MARKET_FILE), options.log ?? (() => undefined));
     const seed = MarketDataHost.readSeed(join(userData, MARKET_SEED_FILE));
@@ -60,15 +77,19 @@ export class MarketDataHost {
       world.strict = seed.strict === true;
       if (seed.currency !== undefined) world.defaultCurrency = seed.currency;
       for (const [name, book] of Object.entries(seed.books ?? {})) world.setBook(name, book);
+      for (const [name, books] of Object.entries(seed.cycles ?? {})) world.setCycle(name, books);
+      for (const [name, history] of Object.entries(seed.histories ?? {})) world.histories.set(name, { kind: 'value', value: history });
       for (const name of seed.absent ?? []) world.setAbsent(name);
       if (seed.fx !== undefined) world.fx = seed.fx === null ? { kind: 'absent' } : { kind: 'value', value: seed.fx };
       this.oracle = world;
       this.source = new OracleMarketDataSource(world);
     }
+    this.seededBooks = seed?.accountBooks ?? {};
+    this.clock = options.clock ?? SYSTEM_CLOCK;
     this.scheduler = new MarketDataScheduler({
       source: this.source,
       store: this.store,
-      clock: options.clock ?? SYSTEM_CLOCK,
+      clock: this.clock,
       onEvent: (event) => {
         if (event.kind === 'fill-complete') this.fillComplete = true;
         // A lowered rate or a stop is why prices are slow, and the log is where that is answered.
@@ -173,10 +194,32 @@ export class MarketDataHost {
     else this.options.log?.(`fx-rates.json was not read: ${answer.parsed.kind === 'unknown' ? answer.parsed.detail : 'absent'}`);
   }
 
-  /** The newest book for a name after asking for it on the demand lane; the page polls this every 5 s. */
-  watch(name: string): StoredBook | null {
+  /** The newest book held for a name, at once, after asking for a fresh one on the demand lane: what the page opens with. */
+  ask(name: string): StoredBook | null {
     this.scheduler.demand([name]);
     return this.store.book(name) ?? null;
+  }
+
+  /**
+   * The open Items page's live read. It asks for the name on the demand lane and answers once that
+   * read has landed, so the page shows the book Steam has just served, not the one before it. A
+   * name observed within the scheduler's five seconds is not read again, and the call answers at
+   * once with that book. The wait is bounded because a paused or stopped scheduler holds the read:
+   * the page then gets the held book, shows its age, and asks again.
+   */
+  async watch(name: string): Promise<StoredBook | null> {
+    this.scheduler.demand([name]);
+    await Promise.race([this.scheduler.settled(name), this.clock.sleep(WATCH_WAIT_MS)]);
+    return this.store.book(name) ?? null;
+  }
+
+  /**
+   * A journey's seeded book of an account's own, in place of the runtime's session read: only a
+   * profile holding `market-seed.json` has any, and a name not seeded is a session answering none.
+   */
+  seededAccountBook(accountId: string, name: string): AccountOrderBook | null {
+    const book = this.seededBooks[accountId]?.[name] ?? null;
+    return book === null ? null : { ...book, observedAt: this.clock.now().toISOString() };
   }
 
   /** The series for a name, fetched on first open and again once it is a day old. One fetch at a time per name. */

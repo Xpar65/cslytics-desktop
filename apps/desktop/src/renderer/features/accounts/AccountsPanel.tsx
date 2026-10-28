@@ -39,7 +39,8 @@ export function AccountsPanel({
   busy,
   onOpen,
   onManage,
-  onAddAccount
+  onAddAccount,
+  canAdd = true
 }: {
   accounts: readonly AccountCard[];
   holdings?: readonly AccountHoldings[] | undefined;
@@ -51,25 +52,27 @@ export function AccountsPanel({
   /** Settings › Account for this account: where connect, sign in and sign out live. */
   onManage: (accountId: string) => void;
   onAddAccount: () => void;
+  /** False when accounts are added elsewhere: a connected engine host's are its own. */
+  canAdd?: boolean | undefined;
 }): React.JSX.Element {
   return (
     <Panel>
       <PanelHeader
         icon="users"
         title={accounts.length === 1 ? 'Steam' : 'Steam accounts'}
-        subtitle={accounts.length === 0
-          ? 'No Steam account has been added yet.'
-          : 'Reconnected from saved sessions on launch. Manage an account to sign in where Steam asks for a code.'}
-        actions={accounts.length > 0 ? <Button size="sm" icon="plus" onClick={onAddAccount}>Add another</Button> : null}
+        actions={accounts.length > 0 && canAdd ? <Button size="sm" icon="plus" onClick={onAddAccount}>Add another</Button> : null}
       />
       <div className="panel-body">
         {accounts.length === 0 ? (
-          <Empty
-            icon="user-plus"
-            title="Nothing to connect yet"
-            hint="Add a Steam account and this window reconnects it on every later launch."
-            action={<Button variant="primary" icon="plus" onClick={onAddAccount}>Add your first account</Button>}
-          />
+          canAdd ? (
+            <Empty
+              icon="user-plus"
+              title="Nothing to connect yet"
+              action={<Button variant="primary" icon="plus" onClick={onAddAccount}>Add your first account</Button>}
+            />
+          ) : (
+            <Empty icon="globe" title="No accounts on the host" hint="Accounts are added on the engine host, not here." />
+          )
         ) : (
           <div className="account-cards">
             {accounts.map((account, index) => (

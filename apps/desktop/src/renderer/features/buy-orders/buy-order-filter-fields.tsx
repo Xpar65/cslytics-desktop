@@ -215,9 +215,6 @@ export function BuyOrderFilterFields({ venue, item, held, draft, onChange, disab
     <fieldset className="order-fields" data-testid="buy-order-filter-fields">
       <legend className="order-field-legend">Filters</legend>
       {kinds.map((kind) => fields[kind])}
-      {venue === 'CSFLOAT' && !item ? (
-        <span className="order-field-quiet">Every filter CSFloat takes is shown, because what this order is for could not be told from its name.</span>
-      ) : null}
     </fieldset>
   );
 }

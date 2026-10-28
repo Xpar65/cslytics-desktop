@@ -41,12 +41,27 @@ export const currencySettingsSchema = z.object({
 }).strict();
 /** The duplicate-protection switch (consolidation plan D13): a preference of this desktop, passed to the engine, which persists nothing. */
 export const csfloatSettingsSchema = z.object({ protection: z.boolean() }).strict();
+/**
+ * Which engine this desktop drives (remote engine host plan D1, D2): the Engine Runtime it forks
+ * beside itself, or a host on another machine that answers the same commands over `POST /command`
+ * and the `/events` stream. The token that host wants lives in the OS vault under
+ * `engine-host:<url>`, never in this file; `label` is what the window calls the host.
+ */
+/** An engine host's address: http or https, a host and a port, nothing after them. */
+const hostUrlSchema = z.string().url().max(512).regex(/^https?:\/\//i, 'An engine host URL starts with http:// or https://');
+export const engineConnectionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('local') }).strict(),
+  z.object({ kind: z.literal('remote'), url: hostUrlSchema, label: z.string().max(64) }).strict()
+]);
+export type EngineConnection = z.infer<typeof engineConnectionSchema>;
+export const DEFAULT_ENGINE: EngineConnection = { kind: 'local' };
 export const settingsSchema = z.object({
   version: z.literal(1),
   appearance: appearanceSettingsSchema,
   accounts: z.record(z.string().min(1), accountLaunchSchema),
   currency: currencySettingsSchema,
-  csfloat: csfloatSettingsSchema
+  csfloat: csfloatSettingsSchema,
+  engine: engineConnectionSchema
 }).strict();
 export type AppearanceSettings = z.infer<typeof appearanceSettingsSchema>;
 export type AccountLaunch = z.infer<typeof accountLaunchSchema>;
@@ -56,7 +71,59 @@ export type DesktopSettings = z.infer<typeof settingsSchema>;
 export const DEFAULT_LAUNCH: AccountLaunch = { signIn: true, cs2: true };
 export const DEFAULT_CURRENCY: CurrencySettings = { base: null, baseSource: 'first-account', showAccountPagesInBase: false };
 export const DEFAULT_CSFLOAT: CsfloatSettings = { protection: true };
-export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT };
+export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT, engine: DEFAULT_ENGINE };
+
+/** How the connection to an engine host is going, as the window shows it (remote engine host plan D7, D8). */
+export type EngineHostState = 'connecting' | 'connected' | 'unreachable' | 'refused';
+/**
+ * Which engine this desktop is driving right now, answered by main to `engine.status`. A remote
+ * answer carries the host's state, its build when `/health` named one, and the accounts it holds;
+ * never the token.
+ */
+export type EngineStatus =
+  | { kind: 'local'; desktopVersion: string }
+  | {
+    kind: 'remote';
+    desktopVersion: string;
+    url: string;
+    label: string;
+    state: EngineHostState;
+    /** When the state last changed. */
+    since: string;
+    build: string | null;
+    accounts: readonly string[];
+    /** Why, when the state is not `connected`. */
+    detail: string | null;
+  };
+/** A page a connected host serves, as its `GET /ui/pages` lists it (plan D12). `path` is on the host's origin. */
+export const hostPageSchema = z.object({
+  id: z.string().min(1).max(64),
+  title: z.string().min(1).max(80),
+  path: z.string().min(1).max(200).startsWith('/')
+}).strict();
+export const hostPagesSchema = z.object({ pages: z.array(hostPageSchema).max(32) });
+export type HostPage = z.infer<typeof hostPageSchema>;
+/** Where the window wants a host page drawn: the frame's rectangle in the window's own pixels. */
+export const hostPageBoundsSchema = z.object({ x: z.number(), y: z.number(), width: z.number().min(0), height: z.number().min(0) }).strict();
+export type HostPageBounds = z.infer<typeof hostPageBoundsSchema>;
+/** The surface a change in the engine connection's state is announced on; the account id of that notice is the same word. */
+export const ENGINE_HOST_SURFACE = 'engine-host';
+
+/**
+ * `notifications-state.json`: what this desktop has told the person of the facts the engine
+ * observed (notifications plan §7.2). Per account, the watermark below which every fact the bell
+ * carries has been raised: the last fact's instant and id. An account with an entry and no
+ * watermark has been looked at and had nothing; one with no entry has never been looked at, and
+ * what the record already holds is history rather than news. Main's file, never the engine's.
+ */
+export const factCursorSchema = z.object({ at: z.string(), id: z.string() }).strict();
+export const notificationsStateSchema = z.object({
+  version: z.literal(1),
+  accounts: z.record(z.string().min(1), z.object({ watermark: factCursorSchema.nullable() }).strict())
+}).strict();
+export type FactCursor = z.infer<typeof factCursorSchema>;
+export type NotificationsState = z.infer<typeof notificationsStateSchema>;
+export const EMPTY_NOTIFICATIONS_STATE: NotificationsState = { version: 1, accounts: {} };
 
 /** The code figures are shown in: the pinned or chosen base, or USD until any wallet has been seen. */
 export function baseCurrencyOf(settings: DesktopSettings): string {
@@ -110,20 +177,38 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('cslytics.verify') }).strict(),
   z.object({ type: z.literal('cslytics.signOut') }).strict(),
   z.object({ type: z.literal('settings.currency'), currency: currencySettingsSchema }).strict(),
+  // What the bell has told the person, answered by main from `notifications-state.json` (notifications
+  // plan §7.2): the watermark per account, and the window moving it once it has raised a page of facts.
+  z.object({ type: z.literal('notifications.state') }).strict(),
+  z.object({ type: z.literal('notifications.seen'), accountId: z.string().min(1), watermark: factCursorSchema.nullable() }).strict(),
   // Prices, answered by main from its own cache and the engine's reads (portfolio and pricing plan
-  // §3): the runtime never sees a price. `item.watch` is the open Items page's 5 s poll.
+  // §3): the runtime relays one price, an account's own book, and keeps none. `item.watch` is the
+  // open Items page's live read, answered once it lands; asked for an account, as the listing
+  // workspace asks, a wallet the anonymous book is not priced for gets the account's own read (D17).
   z.object({ type: z.literal('portfolio.valuation'), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
   z.object({ type: z.literal('market.status') }).strict(),
   // The newest FX snapshot main holds, for the read-only conversion hint beside a typed price.
   z.object({ type: z.literal('market.fx') }).strict(),
   z.object({ type: z.literal('portfolio.history'), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
   z.object({ type: z.literal('item.page'), name: z.string().min(1).max(200), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
-  z.object({ type: z.literal('item.watch'), name: z.string().min(1).max(200) }).strict(),
+  z.object({ type: z.literal('item.watch'), name: z.string().min(1).max(200), accountId: z.string().min(1).optional() }).strict(),
   // The Items page: the series and the curve on their own, because either may wait on the network
   // and the book must not wait with them; and the market names one item is sold under.
   z.object({ type: z.literal('item.history'), name: z.string().min(1).max(200) }).strict(),
   z.object({ type: z.literal('item.curve'), name: z.string().min(1).max(200), venue: z.enum(['steam', 'csfloat']).optional() }).strict(),
-  z.object({ type: z.literal('item.variants'), name: z.string().min(1).max(200), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict()
+  z.object({ type: z.literal('item.variants'), name: z.string().min(1).max(200), accountIds: z.array(z.string().min(1)).min(1).max(32) }).strict(),
+  // Which engine this desktop drives (remote engine host plan). Answered by main: the connection is a
+  // setting, the token goes to the vault and is never answered back, and `connect` or `disconnect`
+  // swaps the engine side under the window, which then reloads. An empty token on `connect` reuses
+  // the one the vault holds for that URL.
+  z.object({ type: z.literal('engine.status') }).strict(),
+  z.object({ type: z.literal('engine.connect'), url: hostUrlSchema, label: z.string().max(64), token: z.string().max(512) }).strict(),
+  z.object({ type: z.literal('engine.disconnect') }).strict(),
+  // The pages a connected host serves, and the one the window wants shown in a view over its
+  // content area at these bounds (plan D12). A local engine has no pages.
+  z.object({ type: z.literal('engine.pages') }).strict(),
+  z.object({ type: z.literal('engine.showPage'), id: z.string().min(1).max(64), bounds: hostPageBoundsSchema }).strict(),
+  z.object({ type: z.literal('engine.hidePage') }).strict()
 ]);
 
 export type EngineCommand = z.infer<typeof engineCommandSchema>;

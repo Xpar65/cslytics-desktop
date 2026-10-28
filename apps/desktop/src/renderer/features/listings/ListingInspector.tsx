@@ -36,7 +36,7 @@ export function ListingInspector({ row, account, multiAccount, busy, staged, del
 }): React.JSX.Element {
   if (!row) {
     return <aside className="inspector" aria-label="Listing inspector">
-      <Empty icon="tag" title="No listing selected" hint="Click a listing to see its details, change its price or take it down." />
+      <Empty icon="tag" title="No listing selected" />
     </aside>;
   }
 
@@ -115,7 +115,7 @@ export function ListingInspector({ row, account, multiAccount, busy, staged, del
         {
           label: 'You receive',
           value: row.receiveCents === null
-            ? <span className="quiet">CSFloat reports fees and proceeds; this app was not told them</span>
+            ? <span className="quiet" title="CSFloat reports fees and proceeds; this app was not told them">—</span>
             : <Money cents={row.receiveCents} currency={row.currency} />
         }
       ]}

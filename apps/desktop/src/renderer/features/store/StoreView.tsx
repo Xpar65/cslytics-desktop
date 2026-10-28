@@ -3,7 +3,6 @@ import type { StorePurchasePage, StorePurchaseView } from '@cslytics/engine';
 import { engine, type EnrichedStoreSheet } from '../../lib/engine.js';
 import { formatAmount } from '../../lib/money.js';
 import { Panel, PanelHeader } from '../../components/ui.js';
-import { PageHeader } from '../../components/PageHeader.js';
 import type { AccountHoldings } from '../../lib/types.js';
 
 /**
@@ -71,7 +70,6 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
   const sheetUsable = sheet !== null && sheet.parseState === 'PARSED' && sheet.observationComplete;
 
   return <div className="stack" data-testid="store-screen">
-    <PageHeader subtitle="What the CS2 Game Coordinator sells this account, at its own quoted prices. Approval happens on Steam's checkout page; delivery is proven by the inventory." />
     <Panel>
       <div className="toolbar page-controls">
         <button className="btn" disabled={busy} onClick={() => void run(() => engine.storeRefresh(accountId), 'Price sheet read from the Game Coordinator')}>Refresh price sheet</button>
@@ -109,7 +107,7 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
       </div>
     </Panel>
     <Panel>
-      <PanelHeader title="Purchases" subtitle="Every purchase this app has asked Steam for, with the evidence it has reached." />
+      <PanelHeader title="Purchases" />
       {purchases?.rows.length ? purchases.rows.map((row) => <div className="inventory-data-row" key={row.id} data-testid="store-purchase" data-state={row.state}>
         <span>{STATE_LABEL[row.state]}<br />
           <small>{row.lines.map((line) => `${line.quantity} × ${line.entryKey}${line.observedQuantity ? ` (${line.observedQuantity} seen)` : ''}`).join(', ')} · {formatAmount(row.requestedTotalCents, row.currency)} · {new Date(row.createdAt).toLocaleString()}</small>

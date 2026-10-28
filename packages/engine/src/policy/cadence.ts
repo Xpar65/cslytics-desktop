@@ -97,7 +97,12 @@ export const SURFACE_ORDER: readonly Surface[] = [
   'steam-trade-offers', 'steam-trade-history'
 ];
 
-export type BackoffState = { consecutiveFailures: number; notBeforeMs: number };
+export type BackoffState = {
+  consecutiveFailures: number;
+  notBeforeMs: number;
+  /** The venue refused the read for its pace. Nothing but time lifts this hold (`policy/backoff.ts`). */
+  rateLimited?: boolean;
+};
 
 export type DueInput = {
   ref: SurfaceRef;
@@ -111,15 +116,17 @@ export type DueInput = {
   transferIntervalMs?: number;
   /** When a waiting action's need makes this scope due (`policy/proof.ts`). */
   proofDueAtMs?: number | undefined;
-  /** The market history still has older pages to read (`OrderService.coverage`): the backfill interval caps the tier's. */
+  /** A history still has older pages to read (`OrderService.coverage`, `TradeService.coverage`): the backfill interval caps the tier's. */
   backfillPending?: boolean;
 };
 
 /**
- * How soon the market history is read again while older pages remain. A walk reads the top of the
- * log and at most `HISTORY_PAGES_PER_WALK` pages, so an account whose log is deep is covered over
- * several walks rather than one; two minutes apart keeps the per-endpoint budget untouched and
- * finishes a log of fifty pages inside half an hour.
+ * How soon a history is read again while older pages remain. A walk reads the top of the log and
+ * at most a few pages (`HISTORY_PAGES_PER_WALK` for the market history, `TRADE_HISTORY_PAGES_PER_WALK`
+ * for executed trades), so an account whose log is deep is covered over several walks rather than
+ * one; two minutes apart keeps the per-endpoint budget untouched and finishes a log of fifty pages
+ * inside half an hour. The interval is the same in both tiers: a log is finished whether or not
+ * anyone is looking at the account.
  */
 export const HISTORY_BACKFILL_EVERY_MS = 2 * 60_000;
 

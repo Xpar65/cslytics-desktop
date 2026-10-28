@@ -57,6 +57,20 @@ export const NOTIFICATION_KINDS = {
     },
     action: null
   },
+  // The desktop is set to drive an engine on another machine and cannot reach it, or it refused
+  // the token (remote engine host plan D7). Main's `engine.status` holds while the stream is down;
+  // the producer reads it, it never decides it. Pages keep showing what was last read.
+  'engine-host.unreachable': {
+    shape: 'condition',
+    severity: 'warn',
+    icon: 'wifi-off',
+    title: 'Cannot reach the engine host',
+    body: {
+      unreachable: 'Pages show what was last read from the host. They refresh on their own once it answers again.',
+      refused: 'The engine host refused the token. Enter the token it was started with under Settings › Engine host.'
+    },
+    action: { label: 'Open Settings', route: { section: 'settings', settings: 'engine' } }
+  },
   // Both are facts `/me` already carries (`marketplace.status` → `restriction`, `stall`); the
   // producer reads them, it never decides them. The second is the trap CSFloat leaves behind:
   // it sets the stall away when it suspends and does not clear it when the suspension ends.
@@ -86,6 +100,24 @@ export const NOTIFICATION_KINDS = {
     title: 'A CSFloat listing from storage was not created',
     body: 'CSFloat did not see the item within 10 minutes of it leaving the unit. It is in your inventory and not listed; list it again once CSFloat shows it.',
     action: { label: 'Open work panel', route: { section: 'inventory', panel: 'work' } }
+  },
+  // Facts the engine observed and wrote as `event` rows, read past this desktop's watermark
+  // (plan §7.2, `producers/engine.ts`): each is raised once per profile, and never again after a relaunch.
+  'trade.reversed': {
+    shape: 'event',
+    severity: 'warn',
+    icon: 'undo',
+    title: 'A sale was reversed',
+    body: 'Steam reversed the trade in its reversal period and CSFloat refunded the buyer. The item is back in your inventory and can be listed again.',
+    action: { label: 'Open Trades', route: { section: 'trades' } }
+  },
+  'market.buy-order-filled': {
+    shape: 'event',
+    severity: 'info',
+    icon: 'coins',
+    title: 'A buy order was filled',
+    body: 'Steam filled one of your buy orders. The item is in your inventory once the next inventory read shows it.',
+    action: { label: 'Open Inventory', route: { section: 'inventory' } }
   },
   // This build, from `release.status` (desktop release plan §4, §5). The reasons a rule gives are
   // the release host's words, so they are shown under Settings › General › About and not here:

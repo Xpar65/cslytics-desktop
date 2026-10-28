@@ -93,6 +93,31 @@ export type BuyOrderStatus = {
 export type TaxRate = { addTax: boolean; rate: number };
 export type Wallet = { balanceCents: number; delayedBalanceCents: number; currency: number; observedAt: string };
 
+/** One resting level of an order book: a price and the units at it, point not cumulative. */
+export type OrderBookLevel = { priceCents: number; quantity: number };
+
+/**
+ * The account's own read of a name's order book: `/market/orderbook` asked with the account's
+ * session, integer cents in `currency`, which is the `eCurrency` Steam named for the answer and is
+ * never assumed. Where the session pins the book to the wallet, every figure here is one the venue
+ * named in the wallet's currency, and so one a price may be pressed from without conversion
+ * (AGENTS.md rule 9).
+ */
+export type AccountOrderBook = {
+  currency: number;
+  highestBidCents: number | null;
+  lowestAskCents: number | null;
+  /** Units resting on each side, as Steam counts them. */
+  bidUnits: number;
+  askUnits: number;
+  /** Best bid first. */
+  bids: readonly OrderBookLevel[];
+  /** Best ask first. */
+  asks: readonly OrderBookLevel[];
+  etag: string | null;
+  observedAt: string;
+};
+
 export interface SteamMarketPort {
   getMyHistoryPage(accountId: AccountId, start: number, count: number): Promise<MyHistoryPage>;
   getMyListingsPage(accountId: AccountId, start: number, count: number): Promise<MyListingsPage>;
@@ -103,4 +128,10 @@ export interface SteamMarketPort {
   getBuyOrderStatus(accountId: AccountId, buyOrderId: BuyOrderId): Promise<BuyOrderStatus>;
   getTradeFeeTaxRate(accountId: AccountId, billing: BillingAddress): Promise<TaxRate>;
   getWallet(accountId: AccountId): Promise<Wallet>;
+  /**
+   * The account's own read of a name's order book, or `null` when Steam has no market for the
+   * name. A price read, not an observation: nothing of it enters the trading record (portfolio
+   * and pricing plan D3, D17).
+   */
+  getOrderBook(accountId: AccountId, marketHashName: string): Promise<AccountOrderBook | null>;
 }

@@ -5,11 +5,12 @@ import { MarketplaceStore } from '../db/marketplace.js';
 import { TransferStore } from '../db/transfers.js';
 import { WorkStore } from '../db/work.js';
 import { OrderStore } from '../db/orders.js';
-import { ACCOUNT_INVENTORY, ACCOUNT_MARKET, surfaceEvidence, type Surface } from '../kernel/evidence.js';
+import { ACCOUNT_INVENTORY, ACCOUNT_MARKET, FRESHNESS, surfaceEvidence, type Surface } from '../kernel/evidence.js';
 import { marketplaceBlock } from '../kernel/marketplace-commitments.js';
 import { storedCannotTrade } from '../kernel/attributes.js';
 import { COMMITTING_STATUSES } from './trade-status.js';
 import { TradeStore } from '../db/trades.js';
+import type { CommandAuthority } from '../db/alphabets.js';
 
 export type CsfloatSellMember = { accountId: string; localId: string; priceCents: number };
 /**
@@ -18,7 +19,8 @@ export type CsfloatSellMember = { accountId: string; localId: string; priceCents
  * holds a unit's id.
  */
 export type CsfloatSellGroupMember = { accountId: string; stackKey: string; quantity: number; priceCents: number };
-export type CsfloatSellRequest = { commandId: string; members: readonly (CsfloatSellMember | CsfloatSellGroupMember)[] };
+/** `authority` is whose the listing is: a person's unless it says otherwise (strategy authority plan D1). */
+export type CsfloatSellRequest = { commandId: string; members: readonly (CsfloatSellMember | CsfloatSellGroupMember)[]; authority?: CommandAuthority | undefined };
 /** At most this many listings per command, however they were asked for: CSFloat's own batch limit. */
 export const CSFLOAT_LIST_LIMIT = 100;
 
@@ -26,7 +28,7 @@ export const CSFLOAT_LIST_LIMIT = 100;
  * Every account surface `validate` judges a CSFloat listing by, in the order it judges them.
  *
  * Admission reads these again before it judges (`CsfloatSellingService.submit`). Each is trusted
- * for five minutes, and two of them — CSFloat's inventory and Steam's trade inventory — are read on
+ * for five minutes (CSFloat's inventory for fifteen, CSF-51), and two of them — CSFloat's inventory and Steam's trade inventory — are read on
  * events only, never on a timer. Judged as last recorded, an eligibility refresh followed by a List
  * six minutes later was refused against a read nothing would ever renew, while the window, which
  * reads eligibility from the last complete walk, went on offering CSFloat (D-CSF-15, 2026-09-17).
@@ -38,6 +40,18 @@ export const CSFLOAT_LIST_EVIDENCE: readonly Surface[] = [
 ];
 
 /**
+ * What a delivery's own checks judge (`CsfloatDeliveryService.validateOwnership`): CSFloat's stall
+ * and sales, the item in main inventory and tradable, and Steam's offers. An accept or a nudge reads
+ * these only once they have aged past their trust window, so one walk of each serves every sale of
+ * a backlog. Reading every book per sale, as a person's Refresh does, spent CSFloat's sales budget
+ * (~100 a few minutes) on a run of sales and then refused the very sends it was reading for (2026-10-25).
+ * CSFloat's inventory is not here: a delivery never judges it, and it allows 120 reads a day.
+ */
+export const CSFLOAT_DELIVERY_EVIDENCE: readonly Surface[] = [
+  'csfloat-account-status', 'csfloat-stall', 'csfloat-trades', 'gc-inventory', 'steam-trade-inventory', 'steam-trade-offers'
+];
+
+/**
  * When CSFloat's copy of the inventory is read while a retrieved item waits to be listed: offsets
  * from the observation that proved it loose. Per account, shared by every waiting operation, never
  * per item — each read spends one of about 120 a day (fixtures/csfloat/INDEX.md). On 2026-09-23 a
@@ -46,6 +60,12 @@ export const CSFLOAT_LIST_EVIDENCE: readonly Surface[] = [
 export const VISIBILITY_READ_OFFSETS_MS: readonly number[] = [30_000, 60_000, 120_000, 240_000, 480_000];
 /** How long a retrieved item may wait for CSFloat to see it before the listing fails. */
 export const VISIBILITY_DEADLINE_MS = 600_000;
+/**
+ * How far before a create's attempt began a listing CSFloat stamps may still be that create's, when
+ * the answer named no id: the venue's clock against the engine's (delivery retries plan D6). A
+ * listing stamped earlier than this existed before the attempt and is never its product.
+ */
+export const CREATE_CLOCK_TOLERANCE_MS = 60_000;
 /** The operation's error on that timeout. The window recognises it by this exact text. */
 export const CSFLOAT_VISIBILITY_TIMEOUT_REASON = 'CSFloat did not show the item within 10 minutes; it stays in main inventory';
 
@@ -76,14 +96,14 @@ export class CsfloatSellingPolicy {
     if (!asset || item.location !== 'MAIN') throw new Error('Retrieve the item into main inventory before listing');
     // The Game Coordinator's own `cannot trade` on the unit, before anything a venue says: no read
     // of either inventory can make a granted music kit tradable.
-    if (storedCannotTrade(item.attributes_json)) throw new Error('Item is marked untradable by Steam');
+    if (storedCannotTrade(item)) throw new Error('Item is marked untradable by Steam');
     if (item.unit_kind === 'fungible' && (item.quantity !== 1 || (item.reserved_command && item.reserved_command !== ownOperation))) throw new Error('Select an available individual commodity asset');
     for (const until of [item?.tradable_after,item?.trade_protected_until]) if (until && (!Number.isFinite(Date.parse(until)) || until > now)) throw new Error(`Item is trade locked or protected until ${until}`);
     const conflict = marketplaceBlock(db,member.accountId,member.localId,'csfloat-list',now,ownOperation);
     if (conflict) throw new Error(conflict);
     const action = db.inFlightAction(member.accountId,`item:${member.localId}`);
     if (action && action.id !== new WorkStore(db).step(ownOperation)?.action_id) throw new Error('Item has an unresolved operation');
-    if (!store.fresh(member.accountId,'csfloat-inventory',now)) throw new Error('Refresh CSFloat inventory eligibility first');
+    if (!store.fresh(member.accountId,'csfloat-inventory',now,FRESHNESS['csfloat-inventory'].maxAgeMs)) throw new Error('Refresh CSFloat inventory eligibility first');
     const evidence = new AssetEvidenceStore(db), venue = evidence.csfloat(member.accountId,asset);
     if (!venue || venue.eligible !== 1 || store.associate(member.accountId,venue.item) !== member.localId) throw new Error('CSFloat has not confirmed this exact item as tradable');
     const transfers = new TransferStore(db), steamObs = transfers.fresh(member.accountId,'steam-trade-inventory',now), steam = evidence.community(member.accountId,asset);
@@ -115,7 +135,7 @@ export class CsfloatSellingPolicy {
     const item = db.itemByLocalId(member.accountId,member.localId);
     if (item?.unit_kind === 'fungible') throw new Error('Only individual items can be listed from storage');
     if (!item?.asset_id || item.location !== 'CASKET' || !item.casket_id) throw new Error('Item is not in a storage unit');
-    if (storedCannotTrade(item.attributes_json)) throw new Error('Item is marked untradable by Steam');
+    if (storedCannotTrade(item)) throw new Error('Item is marked untradable by Steam');
     const asset = item.asset_id;
     for (const until of [item.tradable_after,item.trade_protected_until]) if (until && (!Number.isFinite(Date.parse(until)) || until > now)) throw new Error(`Item is trade locked or protected until ${until}`);
     const conflict = marketplaceBlock(db,member.accountId,member.localId,'csfloat-list',now);

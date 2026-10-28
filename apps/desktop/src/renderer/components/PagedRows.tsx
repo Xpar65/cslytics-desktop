@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { PageEnvelope } from '@cslytics/engine';
 import { Button, Empty, Notice, Skeleton } from './ui.js';
-import { Icon } from './Icon.js';
 import { nearEnd } from './PagedGrid.js';
 
 const ROW = 64;
@@ -180,7 +179,6 @@ export function PagedRows<T>({ load, render, rowKey, onPage, emptyTitle = 'Nothi
     <div className="paged-head">
       <span className="paged-total" data-testid="page-total">
         {total === undefined ? <Skeleton width={90} /> : <><strong className="num">{total.toLocaleString()}</strong> {nested ? 'in this group' : noun}</>}
-        {nested ? null : <span className="badge" data-tone="quiet" title="Read from the local cache of the last complete observation. Nothing here reaches Steam."><Icon name="database" size={11} /> Cached observation</span>}
       </span>
       {header}
     </div>
@@ -220,19 +218,19 @@ export function PagedRows<T>({ load, render, rowKey, onPage, emptyTitle = 'Nothi
         {infinite ? (
           <>
             <span className="paged-page quiet">
-              {loading && rows.length > 0 ? 'Loading more…' : nextCursor ? `${rows.length.toLocaleString()} loaded` : rows.length > 0 ? 'end of list' : ''}
+              {loading && rows.length > 0 ? 'Loading more…' : ''}
             </span>
             <span className="toolbar">
-              {nested ? null : <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void fetchPage()}>Refresh cached view</Button>}
+              {nested ? null : <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void fetchPage()}>Refresh</Button>}
             </span>
           </>
         ) : (
           <>
-            <span className="paged-page quiet">Page {pageNumber}{current?.page.hasNext ? '' : ' · end of list'}</span>
+            <span className="paged-page quiet">Page {pageNumber}</span>
             <span className="toolbar">
               <Button size="sm" icon="chevron-left" disabled={loading || index === 0} onClick={() => { setIndex(index - 1); setTop(0); if (viewport.current) viewport.current.scrollTop = 0; onPage?.(cache[index - 1]!.page); }}>Previous page</Button>
               <Button size="sm" iconRight="chevron-right" disabled={loading || !current?.page.nextCursor} onClick={() => void fetchPage(current?.page.nextCursor ?? undefined, true)}>Next page</Button>
-              {nested ? null : <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void fetchPage()}>Refresh cached view</Button>}
+              {nested ? null : <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void fetchPage()}>Refresh</Button>}
             </span>
           </>
         )}

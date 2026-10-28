@@ -15,10 +15,9 @@ import { useScopedChips } from '../../components/scoped-chips.js';
 import { InventoryTiles, type NamedItem } from './InventoryTiles.js';
 import { InspectorSplit } from '../../components/InspectorSplit.js';
 import { ItemInspector } from './ItemInspector.js';
-import { ListingWorkspace } from '../../components/ListingWorkspace.js';
-import { LIST_INTENT, stageItems, type StagedItem, type StagedListItem } from './list-intent.js';
+import type { StagedItem } from './list-intent.js';
 import { emptyInventorySelection, selectionKey, selectionQuantity, withPage, type InventorySelection } from './selection.js';
-import { isStorageUnit, itemName, unitGroupName } from './storage-unit.js';
+import { isStorageUnit, itemName, unitGroupName, unitName } from './storage-unit.js';
 import { DISPLAY_ONLY_CAPTION, DISPLAY_ONLY_LABEL, isDisplayOnly } from './display-only.js';
 import { SortControl, type SortDirection, type SortOption } from '../../components/SortControl.js';
 import { compareNames } from '../../../shared/name-order.js';
@@ -85,13 +84,15 @@ const HIGHLIGHT_CAP = 1_000;
  * as much as a skin: forty cases are forty rows to tick, as they are forty tiles. The inspector on the right is the same panel the tile view uses: click a copy
  * to see the skin and the actions that copy actually allows.
  */
-export function InventoryView({ accountIds, accounts = [], selection, onSelection, selectionOnly = false, onOpenItem }: {
+export function InventoryView({ accountIds, accounts = [], selection, onSelection, selectionOnly = false, onStage, onOpenItem }: {
   accountIds: string[];
   /** Names (and optional avatar refs and Steam ids) for the ids, so a row can say which account owns it. */
   accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; steamId64?: string | null | undefined; currency?: number | null | undefined }> | undefined;
   selection: InventorySelection;
   onSelection: (next: InventorySelection) => void;
   selectionOnly?: boolean;
+  /** The inspector's *Stage listing*: the shell stages these and holds the workspace. */
+  onStage?: ((selected: readonly StagedItem[]) => void) | undefined;
   /** Opens the item page for a market name: the book, the history and the curve (plan §7). */
   onOpenItem?: ((name: string) => void) | undefined;
 }): React.JSX.Element {
@@ -121,33 +122,12 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
   const [groupDirection, setGroupDirection] = useState<SortDirection>('asc');
   const [tileSort, setTileSort] = useState<TileSort>('name');
   const [tileDirection, setTileDirection] = useState<SortDirection>('asc');
-  /**
-   * What is staged for listing, and which staging it is.
-   *
-   * It lives here rather than in the inspector because the workspace has to outlive the selection:
-   * a submitted row leaves the selection, and the last one leaving used to unmount the panel that
-   * was reporting what had just happened to it. The id is the workspace's React key, so staging a
-   * new selection seeds a fresh one while an existing one keeps every price already typed into it.
-   * It renders into the account strip (a portal into the shell's slot), not into this panel.
-   */
-  const [staging, setStaging] = useState<{ id: string; reveal: number; rows: readonly StagedListItem[] } | null>(null);
-
-  /**
-   * Staging the same selection again is "show me the workspace", not "start over".
-   *
-   * Its pill in the account strip reopens a folded workspace, and so does the inspector's List
-   * verb — and re-seeding it there would throw away every price already typed into it. A
-   * different selection is a different staging and does seed a fresh workspace.
-   */
-  function stage(selected: readonly StagedItem[]): void {
-    const rows = stageItems(selected);
-    const keys = rows.map((row) => row.key).join('\n');
-    setStaging((current) => (
-      current !== null && current.rows.map((row) => row.key).join('\n') === keys
-        ? { ...current, reveal: current.reveal + 1 }
-        : { id: crypto.randomUUID(), reveal: 0, rows }
-    ));
-  }
+  // The inspected item is always one of the selection. The listing workspace, which the shell
+  // holds (`useListingWorkspace` in `App.tsx`), takes rows out of the selection as it sends them,
+  // so a subject it sent is let go of here rather than inspected on as if it were still chosen.
+  useEffect(() => {
+    if (subject && !(selectionKey(subject) in selection.rows)) setSubject(null);
+  }, [selection.rows]);
   const work = useOpenWork(accountIds);
   const busyKeys = useMemo(() => busyKeysFromWork(work), [work]);
   const nameOf = useCallback((id: string): string => accounts.find((account) => account.id === id)?.name ?? id, [accounts]);
@@ -375,7 +355,14 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
       onPrice={setPrice}
       onSubmitted={() => { onSelection(emptyInventorySelection()); setSubject(null); }}
       onUnitRenamed={() => setUnitsRevision((n) => n + 1)}
-      onStage={stage}
+      // Everything in the unit, so the unit's chip replaces whatever the bar held: a search that
+      // already narrowed the view would hide some of what the unit holds. It is the chip the bar
+      // offers for the unit's name (`ownedSuggestions`), and it filters by the casket id, so an
+      // unnamed unit narrows as well.
+      onShowUnit={(unit) => setChips([
+        { kind: 'unit', text: unitName(unit), accountId: unit.accountId, casketId: unit.casketId }
+      ])}
+      onStage={(selected) => onStage?.(selected)}
       onDeselect={(key) => {
         const rows = { ...selection.rows };
         delete rows[key];
@@ -435,10 +422,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
 
   return <Panel className="enter">
     <PageHeader
-      // The header already counts the selection beside the title.
-      subtitle={count > 0
-        ? 'Selected quantities belong to the named account and location.'
-        : 'Grouped by item. Open a group to pick individual copies, or select everything that matches a filter.'}
       badge={selection.manifest ? <Badge tone="accent" icon="lock">Frozen selection</Badge> : null}
       actions={<>
         <Segmented
@@ -546,28 +529,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
         />
       )}
     </InspectorSplit>
-
-    {staging && !selectionOnly ? (
-      <ListingWorkspace
-        key={staging.id}
-        staged={staging.rows}
-        intent={LIST_INTENT}
-        reveal={staging.reveal}
-        accounts={accounts}
-        price={price}
-        onPrice={setPrice}
-        onMessage={setMessage}
-        onDismiss={() => setStaging(null)}
-        onSent={(keys) => {
-          // The listing workspace sends row by row, so only the rows that went are released. A
-          // blanket clear here would throw away the ones still waiting for a price.
-          const rows = { ...selection.rows };
-          for (const key of keys) delete rows[key];
-          onSelection({ rows });
-          if (subject && keys.includes(selectionKey(subject))) setSubject(null);
-        }}
-      />
-    ) : null}
 
     <Drawer
       open={detail !== null}

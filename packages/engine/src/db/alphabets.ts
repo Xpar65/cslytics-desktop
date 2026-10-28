@@ -8,7 +8,11 @@
  * word is added here only with the migration that lets a record in the field accept it.
  */
 
-/** The hops a command is made of: one row of `work_step` each. */
+/**
+ * The hops a command is made of: one row of `work_step` each. `CONFIRM` is the engine's own phone
+ * tap for a listing or an offer one of its hops made, only where a host composed a confirmation port
+ * (strategy authority and confirmations plan D9).
+ */
 export const WORK_STEP_KINDS = [
   'DELIST', 'LIST', 'RETRIEVE', 'STORE',
   'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL',
@@ -16,7 +20,8 @@ export const WORK_STEP_KINDS = [
   'CSFLOAT_CREATE', 'CSFLOAT_AWAIT_VENUE', 'CSFLOAT_REPRICE', 'CSFLOAT_CANCEL',
   'CSFLOAT_ACCEPT', 'CSFLOAT_SEND', 'CSFLOAT_NOTIFY', 'CSFLOAT_CANNOT_DELIVER',
   'CSFLOAT_BUY_ORDER_EDIT', 'CSFLOAT_BUY_ORDER_CANCEL',
-  'STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL'
+  'STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL',
+  'CONFIRM'
 ] as const;
 export type WorkStepKind = (typeof WORK_STEP_KINDS)[number];
 
@@ -37,6 +42,14 @@ export const OPEN_STEP_STATES: readonly WorkStepState[] = ['QUEUED', 'SENT', 'AW
 
 export const ACTION_STATES = ['READY', 'RUNNING', 'AWAITING_OBSERVATION', 'DONE', 'FAILED'] as const;
 export type ActionState = (typeof ACTION_STATES)[number];
+
+/**
+ * Whose a command is (strategy authority plan D1). `HUMAN` is a person's press, the default and the
+ * only word the desktop sends; `STRATEGY` is a rule a person set up, acting for them. A person's
+ * word on a holding stands against a strategy's until the person hands the holding over (D3, D4).
+ */
+export const COMMAND_AUTHORITIES = ['HUMAN', 'STRATEGY'] as const;
+export type CommandAuthority = (typeof COMMAND_AUTHORITIES)[number];
 
 /** `DRAFT` is a captured selection no kind has been chosen for yet (consolidation plan §4.4). */
 export const COMMAND_STATES = ['DRAFT', 'REJECTED', 'ADMITTED', 'RUNNING', 'PARTIAL', 'COMPLETE', 'STOPPED'] as const;

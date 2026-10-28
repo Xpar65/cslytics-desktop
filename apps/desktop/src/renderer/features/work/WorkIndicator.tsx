@@ -23,6 +23,8 @@ export type WorkRow = {
   commandId: string;
   commandKind: string;
   commandState: string;
+  /** Whose the command is: a person's, or a strategy's acting for one. The outbox's rows are the person's. */
+  authority?: 'HUMAN' | 'STRATEGY' | undefined;
   submittedAt: string;
   memberId: string;
   memberState: string;

@@ -29,6 +29,24 @@ export const BACKOFF_CEILING_MS = 15 * 60_000;
  */
 export const BLOCKED_ELSEWHERE_RETRY_MS = 60_000;
 
+/**
+ * The venue refused a read for its pace.
+ *
+ * A flat hold, long, and one a person cannot lift: a 429 is Steam's judgement that this account is
+ * asking too often, and *Refresh now* or the reconnect sweep asking again at once is the burst
+ * that earns the next one. The corpus records a 429 on this family lasting minutes to tens of
+ * minutes and names no `Retry-After` worth reading (`concepts.steam-rate-limits`), so the span is a
+ * choice: ten minutes, plus up to five at random so two accounts held together do not return
+ * together (history backfill plan D5). The read is held, not the account: every other scope keeps
+ * its own cadence.
+ */
+export const RATE_LIMIT_HOLD_MS = 10 * 60_000;
+
+/** Whether a walk's own words say the venue refused it for its pace: HTTP 429, or a port's rate-limit fault. */
+export function isRateLimitReason(reason: string): boolean {
+  return /\b429\b|rate.?limit/i.test(reason);
+}
+
 export type Jitter = (spanMs: number) => number;
 
 /** Deterministic in tests, spread in production: full jitter over the computed delay. */
@@ -67,6 +85,24 @@ export class BackoffLedger {
     this.states.delete(this.key(accountId, surface));
   }
 
+  /** Records a read the venue refused for its pace: a flat hold nothing but time lifts, counted as a failure. */
+  rateLimit(accountId: string, surface: string, nowMs: number): BackoffState {
+    const previous = this.states.get(this.key(accountId, surface));
+    const state = {
+      consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+      notBeforeMs: nowMs + RATE_LIMIT_HOLD_MS + this.jitter(RATE_LIMIT_HOLD_MS / 2),
+      rateLimited: true
+    };
+    this.states.set(this.key(accountId, surface), state);
+    return state;
+  }
+
+  /** Whether the scope is under a rate limit's hold now. */
+  rateLimited(accountId: string, surface: string, nowMs: number): boolean {
+    const state = this.states.get(this.key(accountId, surface));
+    return state?.rateLimited === true && state.notBeforeMs > nowMs;
+  }
+
   /** Holds a surface off for a fixed span without counting it as an escalating failure. */
   hold(accountId: string, surface: string, spanMs: number, nowMs: number): void {
     const previous = this.states.get(this.key(accountId, surface));
@@ -76,14 +112,37 @@ export class BackoffLedger {
     });
   }
 
-  /** Lifts one scope's hold, failures and all: what a person asking for that scope does. */
-  clear(accountId: string, surface: string): void {
+  /**
+   * Lifts one scope's hold, failures and all: what a person asking for that scope does. A rate
+   * limit's hold stands, and the answer says so.
+   */
+  clear(accountId: string, surface: string): boolean {
+    const state = this.states.get(this.key(accountId, surface));
+    if (state?.rateLimited && !this.expired(state)) return false;
     this.states.delete(this.key(accountId, surface));
+    return true;
   }
 
-  forget(accountId: string): void {
-    for (const key of [...this.states.keys()]) {
-      if (key.startsWith(`${accountId}:`)) this.states.delete(key);
+  /** Lifts every hold of the account a person may lift; `all` lifts the rate limits' too, for an account being stopped. */
+  forget(accountId: string, all = false): void {
+    for (const [key, state] of [...this.states.entries()]) {
+      if (!key.startsWith(`${accountId}:`)) continue;
+      if (!all && state.rateLimited && !this.expired(state)) continue;
+      this.states.delete(key);
     }
+  }
+
+  /** A hold is over once its moment has passed; the ledger keeps no clock, so the caller's last reading decides. */
+  private expired(state: BackoffState): boolean {
+    return state.notBeforeMs <= this.lastSeenMs;
+  }
+
+  /** The latest moment a caller named, so an expired rate limit lifts like any other hold. */
+  private lastSeenMs = 0;
+
+  /** Tells the ledger the time, which `clear` and `forget` judge an expired hold by. */
+  at(nowMs: number): this {
+    this.lastSeenMs = Math.max(this.lastSeenMs, nowMs);
+    return this;
   }
 }

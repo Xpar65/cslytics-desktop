@@ -15,6 +15,8 @@ export type SettleServices = {
   inGameStore: InGameStoreService;
   /** CSFloat selling and buying, late-bound: both orchestrators are built after the settler's inputs. */
   csfloat: { reconcileSelling(accountId: AccountId): void; reconcileBuying(accountId: AccountId): void };
+  /** The engine's own confirmations, late-bound likewise; a profile without the port settles nothing there. */
+  confirmations: { reconcile(accountId: AccountId): void };
 };
 
 /**
@@ -144,6 +146,8 @@ export class SettleService implements Settling {
     this.step(accountId, 'in-game-store', () => this.services.inGameStore.reconcile(accountId));
     this.step(accountId, 'csfloat-selling', () => this.services.csfloat.reconcileSelling(accountId));
     this.step(accountId, 'csfloat-buying', () => this.services.csfloat.reconcileBuying(accountId));
+    // Last: a confirmation is judged on the listing or offer the walks above have just written.
+    this.step(accountId, 'confirmations', () => this.services.confirmations.reconcile(accountId));
   }
 
   /**

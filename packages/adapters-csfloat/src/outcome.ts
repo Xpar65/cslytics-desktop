@@ -1,12 +1,24 @@
 import type { CsfloatReadResult, MutationOutcome } from '@cslytics/ports';
 import type { CsfloatRate, CsfloatTransportResult } from './transport.js';
 
+/**
+ * How long the venue asks for before the next request: `retry-after` when it sends one, else the
+ * time to the reset its `x-ratelimit-reset` names, else nothing (`concept.rate-limits`: every
+ * response carries the three headers; a 429 says "follow `reset`").
+ */
+export function venueWaitMs(rate: CsfloatRate): number | null {
+  if (rate.retryAfterMs !== null) return rate.retryAfterMs;
+  return rate.resetAtMs === null ? null : Math.max(0, rate.resetAtMs - Date.now());
+}
+
+/** The wait a throttle earns when the venue named none: the transport's own cooldown default. */
+export const THROTTLE_DEFAULT_WAIT_MS = 60_000;
+
 export function readResult<T>(result: CsfloatTransportResult, parse: (body: unknown) => T | null): CsfloatReadResult<T> {
   if (result.kind === 'failure') return { kind: 'unavailable', cause: result.cause, raw: null };
   if ([401, 403, 404].includes(result.status)) return { kind: 'rejected', status: result.status,
     reason: result.status === 401 ? 'invalid-key' : result.status === 403 ? 'forbidden' : 'not-found', raw: null };
-  if (result.status === 429) return { kind: 'throttled', retryAfterMs: result.rate.retryAfterMs ??
-    (result.rate.resetAtMs === null ? null : Math.max(0, result.rate.resetAtMs - Date.now())), raw: null };
+  if (result.status === 429) return { kind: 'throttled', retryAfterMs: venueWaitMs(result.rate), raw: null };
   if (!result.ok) return { kind: 'unavailable', cause: 'transport', raw: { status: result.status } };
   const value = parse(result.body);
   return value === null ? { kind: 'unavailable', cause: 'malformed', raw: null } : { kind: 'ok', value };
@@ -48,7 +60,7 @@ const said = (refusal: CsfloatRefusal, code: number, phrase: RegExp): boolean =>
 const EXPLANATIONS: readonly Explanation[] = [
   // 429 `{"code":20,"message":"too many requests, try again later"}`. Nothing was processed; the
   // incumbent stops sending for the account until the reset the headers name.
-  { matches: (r) => r.status === 429 || r.code === 20,
+  { matches: throttled,
     explain: (rate) => `CSFloat is rate limiting this account and nothing was sent.${retryHint(rate)}` },
   // 401 `{"code":1,"message":"invalid api key"}`: the key, not the request.
   { matches: (r) => r.status === 401 || r.code === 1,
@@ -90,8 +102,13 @@ const EXPLANATIONS: readonly Explanation[] = [
 ];
 
 function retryHint(rate: CsfloatRate): string {
-  const wait = rate.retryAfterMs ?? (rate.resetAtMs === null ? null : rate.resetAtMs - Date.now());
+  const wait = venueWaitMs(rate);
   return wait === null || wait <= 0 ? ' Try again later.' : ` Try again in ${Math.ceil(wait / 1000)} seconds.`;
+}
+
+/** A 429, or the venue's own code for one: nothing was processed, and the headers say when to ask again. */
+function throttled(refusal: CsfloatRefusal): boolean {
+  return refusal.status === 429 || refusal.code === 20;
 }
 
 /**
@@ -108,13 +125,21 @@ export function explainRefusal(refusal: CsfloatRefusal, rate: CsfloatRate): stri
   return known ? `${head.replace(/\.$/, '')}. ${known.explain(rate)}` : head;
 }
 
-/** Keep response facts small: full trade bodies can contain a buyer's private trade token. */
+/**
+ * Keep response facts small: full trade bodies can contain a buyer's private trade token.
+ *
+ * A throttle is a refusal of the moment, never of the request: nothing was processed, and the
+ * venue's headers say when the same request may be made again. It carries that wait, so the
+ * engine can hold the work until then rather than file it as failed. The transport's own
+ * cooldown answers a 429 without calling the venue at all, with the remainder of its wait.
+ */
 export function mutationResult(result: CsfloatTransportResult, accepted: (body: unknown) => boolean): MutationOutcome {
   if (result.kind === 'failure') return { kind: 'AMBIGUOUS', cause: result.cause === 'timeout' ? 'timeout' : 'transport', raw: null };
   if ([400, 401, 403, 404, 409, 422, 429].includes(result.status)) {
-    const refusal = venueRefusal(result.body);
-    const reason = explainRefusal({ status: result.status, ...refusal }, result.rate);
-    return { kind: 'DEFINITIVELY_REJECTED', reason, raw: { status: result.status, ...(refusal.code === null ? {} : { code: refusal.code }) } };
+    const refusal = { status: result.status, ...venueRefusal(result.body) };
+    const reason = explainRefusal(refusal, result.rate);
+    const wait = throttled(refusal) ? { retryAfterMs: venueWaitMs(result.rate) ?? THROTTLE_DEFAULT_WAIT_MS } : {};
+    return { kind: 'DEFINITIVELY_REJECTED', reason, raw: { status: result.status, ...(refusal.code === null ? {} : { code: refusal.code }) }, ...wait };
   }
   if (!result.ok || !accepted(result.body)) return { kind: 'AMBIGUOUS', cause: 'unclassified', raw: { status: result.status } };
   const body = record(result.body);

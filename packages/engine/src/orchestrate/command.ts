@@ -13,10 +13,12 @@ import { csfloatClaimedAssets, marketplaceBlock, MARKETPLACE_CONSENTS, type Mark
 import { isUntradableGroup, restrictionOf } from '../kernel/identity.js';
 import { storedCannotTrade } from '../kernel/attributes.js';
 import { HoldingsStore } from '../db/holdings.js';
-import { OrderStore } from '../db/orders.js';
+import { OrderStore, type SteamListingRow } from '../db/orders.js';
 import { AssetEvidenceStore } from '../db/asset-evidence.js';
+import { priceChangeRefusal } from '../kernel/price-cadence.js';
 import { OPEN_STEP_STATES_SQL, WorkStore, isSettled, type WorkStepRow } from '../db/work.js';
-import { sqlList, type WorkStepKind } from '../db/alphabets.js';
+import { sqlList, type CommandAuthority, type WorkStepKind } from '../db/alphabets.js';
+import { claimForPerson, strategyRefusal } from '../policy/authority.js';
 import { attemptsMade } from '../kernel/not-applied.js';
 import { RETRY_POLICY, retryPlan } from '../kernel/retry-policy.js';
 import { ACCOUNT_INVENTORY, ObservationRequired, surfaceEvidence, surfaceName, type SurfaceRef } from '../kernel/evidence.js';
@@ -110,6 +112,16 @@ export type CommandRequest = {
    * carries it; it lets through only the claims it names, and only for a store.
    */
   consent?: readonly MarketplaceConsent[];
+  /**
+   * A person's decision to change a price inside the venue's price-change interval
+   * (`kernel/price-cadence.ts`). Read by a `REPRICE` only, and recorded on each member it admitted.
+   */
+  force?: boolean;
+  /**
+   * Whose the command is: a person's unless it says otherwise (strategy authority and
+   * confirmations plan D1). A strategy's is refused on a holding a person holds (`policy/authority.ts`).
+   */
+  authority?: CommandAuthority;
 };
 
 export type SelectionMemberInput = {
@@ -248,7 +260,8 @@ export class CommandService {
     const draft = request.manifestToken ? db.draft(request.manifestToken) : undefined;
     if (request.manifestToken && (!draft || draft.preparing || draft.state !== 'DRAFT' || (request.manifestRevision !== undefined && draft.revision !== request.manifestRevision))) throw new Error('Selection token is unexecutable or stale');
     if (!draft && !request.members?.length) throw new Error('Command has no members');
-    db.insertCommand({ id: request.commandId, correlation_id: randomUUID(), kind: request.kind, state: 'ADMITTED', reject_reason: null, created_at: this.context.now(), preparing: 1, manifest_token: request.manifestToken ?? null, observed_completed: 0 });
+    db.insertCommand({ id: request.commandId, correlation_id: randomUUID(), kind: request.kind, state: 'ADMITTED', reject_reason: null, created_at: this.context.now(), preparing: 1, manifest_token: request.manifestToken ?? null, observed_completed: 0,
+      authority: request.authority ?? 'HUMAN' });
 
     const cursor: PrepareCursor = { afterAccount: '', afterKey: '', offset: 0, admitted: new Map() };
     let more: boolean;
@@ -412,9 +425,11 @@ export class CommandService {
       }
     }
     db.transaction(() => {
+      // A forced price change is recorded on the member it admitted, so the record says it was a decision.
       for (const { key, member } of input) db.insertCommandMember({ command_id: request.commandId, account_id: member.accountId, local_id: key,
         stack_key: member.stackKey ?? null, quantity: member.quantity ?? 1, destination: member.destinationCasketId ?? null, price_receive_cents: member.priceReceiveCents ?? null,
-        state: 'PREPARED', input_json: JSON.stringify(member) });
+        state: 'PREPARED', input_json: JSON.stringify(request.kind === 'REPRICE' && request.force ? { ...member, force: true } : member) });
+      claimForPerson(db, request.authority, request.commandId, input.map((row) => row.member), this.context.now());
     });
     cursor.afterAccount = input.at(-1)!.member.accountId; cursor.afterKey = input.at(-1)!.key; cursor.offset += input.length;
     // A short page is the last page for an inline member list; a manifest has to ask again.
@@ -500,7 +515,8 @@ export class CommandService {
         created_at: now,
         preparing: 0,
         manifest_token: request.manifestToken ?? null,
-        observed_completed: 0
+        observed_completed: 0,
+        authority: request.authority ?? 'HUMAN'
       });
       if (reason) {
         for (const [index, member] of members.entries()) {
@@ -521,8 +537,11 @@ export class CommandService {
 
       for (const [index, member] of members.entries()) {
         const admitted = this.admitMember(request.commandId, request.kind, member, index);
-        for (const row of admitted) database.insertCommandMember(row);
+        // A forced price change is recorded on the member it admitted, so the record says it was a decision.
+        for (const row of admitted) database.insertCommandMember(request.kind === 'REPRICE' && request.force && row.input_json
+          ? { ...row, input_json: JSON.stringify({ ...(JSON.parse(row.input_json) as object), force: true }) } : row);
       }
+      claimForPerson(database, request.authority, request.commandId, members, now);
       return database.command(request.commandId)!;
     });
   }
@@ -850,6 +869,12 @@ export class CommandService {
    */
   protected preflight(request: CommandRequest, phase: 'submit' | 'dispatch' = 'submit'): string | null {
     const { database } = this.context;
+    // Who may send it, judged at admission only: a strategy's work already admitted gives way to
+    // a person's newer request through the hop's own action (plan D6), never by refusing its dispatch.
+    if (phase === 'submit') {
+      const authority = this.authorityProblem(request);
+      if (authority) return authority;
+    }
     const retrievesByAccount = new Map<string, number>();
     // Read once per account rather than per member: a two-thousand-member batch must not run
     // two thousand joins to answer the same question.
@@ -942,7 +967,7 @@ export class CommandService {
         return 'LIST requires a positive seller-receives price';
       }
       if (DELIST_FIRST.includes(request.kind)) {
-        const chain = this.delistChainProblem(request.kind, member);
+        const chain = this.delistChainProblem(request.kind, member, request.force ?? false);
         if (chain) return chain;
       }
     }
@@ -952,6 +977,15 @@ export class CommandService {
       }
     }
     return null;
+  }
+
+  /**
+   * Why a strategy may not send this command (strategy authority and confirmations plan D3), or
+   * `null`; a person's command is never refused here. Isolated so a saboteur can let a strategy
+   * act on whatever it names.
+   */
+  protected authorityProblem(request: CommandRequest): string | null {
+    return strategyRefusal(this.context.database, { authority: request.authority, force: request.force, members: request.members ?? [] });
   }
 
   protected itemProblem(kind: CommandKind, member: CommandMemberInput, item: ItemRow): string | null {
@@ -989,14 +1023,15 @@ export class CommandService {
   }
 
   /**
-   * A unit the Game Coordinator marks `cannot trade` (attribute 2) is held, not handled: it is
+   * A unit the Game Coordinator marks `cannot trade` (attribute 2), or an unsealed terminal
+   * (quality 14, which carries no such mark), is held, not handled: it is
    * neither listed nor stored. Retrieving one that somehow sits in a unit stays allowed, so nothing
    * is ever trapped. An item is read off its row's own attributes, re-derived on every walk; a
    * group by its key, whose restriction field is `untradable` for exactly those units.
    */
   protected untradableProblem(kind: CommandKind, subject: { item?: ItemRow; stackKey?: string }): string | null {
     if (kind !== 'LIST' && kind !== 'STORE') return null;
-    if (subject.item && storedCannotTrade(subject.item.attributes_json)) return `Item ${subject.item.local_id} is marked untradable by Steam`;
+    if (subject.item && storedCannotTrade(subject.item)) return `Item ${subject.item.local_id} is marked untradable by Steam`;
     if (subject.stackKey && isUntradableGroup(subject.stackKey)) return `${subject.stackKey} is marked untradable by Steam`;
     return null;
   }
@@ -1744,14 +1779,34 @@ export class CommandService {
   }
 
   /** Both chains need an open listing to cancel and their own second-hop input. */
-  protected delistChainProblem(kind: CommandKind, member: CommandMemberInput): string | null {
+  protected delistChainProblem(kind: CommandKind, member: CommandMemberInput, force: boolean): string | null {
     if (!member.localId) return `${kind} needs an individual item`;
-    if (!this.openListingFor(member.accountId, member.localId)) return `Item ${member.localId} has no open listing`;
+    const listing = new OrderStore(this.context.database).openSteamListingFor(member.accountId, member.localId);
+    if (!listing) return `Item ${member.localId} has no open listing`;
     if (kind === 'REPRICE' && !(member.priceReceiveCents && member.priceReceiveCents > 0)) {
       return 'REPRICE requires a positive seller-receives price';
     }
+    if (kind === 'REPRICE') {
+      const cadence = this.priceChangeProblem(listing, member.priceReceiveCents!, force);
+      if (cadence) return cadence;
+    }
     if (kind === 'DELIST_TO_STORE' && !member.destinationCasketId) return 'DELIST_TO_STORE requires destinationCasketId';
     return null;
+  }
+
+  /**
+   * The price-change cadence on a Steam listing (`kernel/price-cadence.ts`). A reprice is a new
+   * listing, so the open listing was last *changed* when its create attempt belonged to a `REPRICE`
+   * command; a first listing set its price and changed nothing, and a listing this app did not
+   * create has no attempt at all. The engine refuses only what it can date as a change.
+   */
+  protected priceChangeProblem(listing: SteamListingRow, priceReceiveCents: number, force: boolean): string | null {
+    const { database } = this.context;
+    const attempt = listing.action_id ? database.action(listing.action_id) : undefined;
+    const step = attempt?.step_id ? this.work.step(attempt.step_id) : undefined;
+    const relisted = step && database.command(step.command_id)?.kind === 'REPRICE';
+    return priceChangeRefusal({ venue: 'steam', lastChangedAt: relisted ? attempt!.created_at : null, currentCents: listing.price_cents ?? 0,
+      requestedCents: priceReceiveCents, now: this.context.now(), force });
   }
 
   /** Destination exists, differs from source, and has a complete occupancy observation. */

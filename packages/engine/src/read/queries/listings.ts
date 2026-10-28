@@ -2,6 +2,9 @@ import type { EngineDatabase } from '../../db/database.js';
 import type { WearBand } from '../../db/inventory-query.js';
 import { MarketplaceStore } from '../../db/marketplace.js';
 import { CSFLOAT_CURRENCY } from '../../db/csfloat.js';
+import { PRICE_CHANGE, nextPriceChangeAt } from '../../kernel/price-cadence.js';
+import { AuthorityStore } from '../../db/authority.js';
+import type { CommandAuthority } from '../../db/alphabets.js';
 import { assertAccountScope, queryPage, type PageEnvelope } from './paging.js';
 
 /**
@@ -102,6 +105,19 @@ export type ListingPageRow = {
   /** When the walk that last saw this row finished, and whether that walk completed (rule 5). */
   observedAt: string | null;
   observationComplete: number;
+  /**
+   * When this app last changed the listing's price: a Steam listing's create attempt when it was a
+   * reprice's, the last proved CSFloat reprice. `null` is a listing never repriced from here.
+   */
+  lastPriceChangeAt: string | null;
+  /** The earliest the venue's price-change cadence admits another change (`kernel/price-cadence.ts`); `null` is now. */
+  nextPriceChangeAt: string | null;
+  /**
+   * Who may act on the listing's holding (strategy authority plan D5): `HUMAN` a person holds it and
+   * a strategy's change is refused, `STRATEGY` a strategy may act, `null` nobody has said, or the
+   * listing names no holding this app knows.
+   */
+  authority: CommandAuthority | null;
 };
 
 /** Money for one venue in one currency. Two currencies are two rows, never one sum (BUY-09). */
@@ -166,8 +182,23 @@ export function pageListings(database: EngineDatabase, request: ListingPageReque
     params,
     ['sortValue', 'accountId', 'venue', 'listingId']
   );
-  // The sort column is the cursor's business, not the row's.
-  if (page.kind === 'page') for (const row of page.rows) delete row.sortValue;
+  if (page.kind === 'page') {
+    for (const row of page.rows) {
+      // The sort column is the cursor's business, not the row's.
+      delete row.sortValue;
+      // The plain interval: a read does not know the price to come, so it cannot say whether the
+      // drift exception would apply (`priceChangeRefusal` does, at admission).
+      row.nextPriceChangeAt = row.lastPriceChangeAt ? nextPriceChangeAt(row.lastPriceChangeAt, PRICE_CHANGE[row.venue === 'STEAM' ? 'steam' : 'csfloat']) : null;
+      row.authority = null;
+    }
+    // Whose each holding is, asked once per account for the whole page.
+    const store = new AuthorityStore(database);
+    for (const accountId of new Set(page.rows.map((row) => row.accountId))) {
+      const rows = page.rows.filter((row) => row.accountId === accountId && row.localId);
+      const say = new Map(store.say(accountId, rows.map((row) => row.localId!)).map((entry) => [entry.localId, entry.authority]));
+      for (const row of rows) row.authority = say.get(row.localId!) ?? null;
+    }
+  }
   return page;
 }
 
@@ -326,7 +357,9 @@ function steamBranch(accounts: readonly string[], filter: ListingFilter): Branch
         i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
         m.transactable_after AS holdUntil, CASE WHEN s.raw_bucket='PENDING_CONFIRMATION' THEN 1 ELSE 0 END AS awaitingConfirmation,
         NULL AS createdAt, f.finished_at AS firstSeenAt,
-        o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete
+        o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete,
+        (SELECT a.created_at FROM action a JOIN work_step w ON w.id=a.step_id JOIN command c ON c.id=w.command_id
+          WHERE a.id=m.action_id AND c.kind='REPRICE') AS lastPriceChangeAt, NULL AS nextPriceChangeAt
       FROM venue_order m
       JOIN steam_order s ON s.account_id=m.account_id AND s.order_id=m.order_id
       LEFT JOIN item i ON i.local_id=m.local_id AND i.account_id=m.account_id
@@ -365,7 +398,9 @@ function csfloatBranch(accounts: readonly string[], filter: ListingFilter): Bran
         IFNULL(i.paint_wear, ${venue('floatValue')}) AS paintWear, IFNULL(i.paint_seed, ${venue('paintSeed')}) AS paintSeed,
         NULL AS holdUntil, 0 AS awaitingConfirmation,
         k.created_at AS createdAt, f.finished_at AS firstSeenAt,
-        o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete
+        o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete,
+        (SELECT MAX(w.updated_at) FROM work_step w INDEXED BY work_step_target WHERE w.account_id=c.account_id AND w.kind='CSFLOAT_REPRICE' AND w.target_id=c.venue_order_id AND w.state='DONE') AS lastPriceChangeAt,
+        NULL AS nextPriceChangeAt
       FROM venue_order c
       JOIN csfloat_order k ON k.account_id=c.account_id AND k.order_id=c.order_id
       LEFT JOIN item i ON i.local_id=c.local_id AND i.account_id=c.account_id

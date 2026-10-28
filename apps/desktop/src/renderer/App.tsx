@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MarketplaceStatus } from '@cslytics/engine';
-import { DEFAULT_SETTINGS, launchFor, type AccountLaunch, type DesktopSettings } from '../shared/api.js';
+import { DEFAULT_SETTINGS, ENGINE_HOST_SURFACE, launchFor, type AccountLaunch, type DesktopSettings, type EngineStatus, type HostPage } from '../shared/api.js';
 import { engine, listAccountsWhenReady, type RefreshStatusRow } from './lib/engine.js';
 import { launchConnect } from './lib/launch.js';
 import type {
@@ -19,6 +19,9 @@ import { SignIn } from './features/accounts/SignIn.jsx';
 import { AccountBar } from './features/accounts/AccountBar.jsx';
 import { AccountsPanel, type AccountCard } from './features/accounts/AccountsPanel.jsx';
 import { InventoryView, emptyInventorySelection, selectionQuantity, type InventorySelection } from './features/inventory/InventoryView.js';
+import { LIST_INTENT, stageItems } from './features/inventory/list-intent.js';
+import { REPRICE_INTENT } from './features/listings/listing-actions.js';
+import { ListingWorkspace, useListingWorkspace } from './components/ListingWorkspace.js';
 import { RecordsView } from './features/records/RecordsView.js';
 import { ListingsView } from './features/listings/ListingsView.js';
 import { BuyOrdersView } from './features/buy-orders/BuyOrdersView.js';
@@ -36,6 +39,7 @@ import type { Route } from './features/notifications/model.js';
 import { RECORD_TABS, type RecordTab, type Section } from './lib/sections.js';
 import { setUpByAccount, type VenueId } from './lib/marketplaces.js';
 import { TradesView } from './features/trades/TradesView.js';
+import { HostPageView } from './features/host/HostPageView.js';
 
 type Status = { tone: 'idle' | 'busy' | 'error'; message: string };
 const ENGINE_WAIT: Status = { tone: 'busy', message: 'Waiting for the Engine Runtime to answer.' };
@@ -152,7 +156,34 @@ export function App(): React.JSX.Element {
    * even once, is the thing those preferences exist to prevent.
    */
   const [settings, setSettings] = useState<DesktopSettings | null>(null);
+  /**
+   * Which engine this window drives (remote engine host plan D5, D6, D12): `null` until main has
+   * answered. A host owns its sessions, so with a remote engine the launch sweep does not run and
+   * connect, sign-in, sign-out, add, remove and reset are not offered; the pages the host serves
+   * are listed in the sidebar instead, and the open one is shown in main's view over the content.
+   */
+  const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
+  const [hostPages, setHostPages] = useState<HostPage[]>([]);
+  const [hostPage, setHostPage] = useState<HostPage | null>(null);
+  const remote = engineStatus?.kind === 'remote';
   const [inventorySelection, setInventorySelection] = useState<InventorySelection>(emptyInventorySelection);
+  /**
+   * The two listing workspaces: items staged for sale, and standing listings staged for a new
+   * price. The shell holds them with the selection, for the same reason: all three outlive the
+   * page. A person who stages items and opens one's Items page keeps the pill in the strip and the
+   * rows behind it, and comes back to the same selection; a listing staged for a new price survives
+   * leaving the Listings page the same way.
+   */
+  const listing = useListingWorkspace(LIST_INTENT, (keys) => {
+    // The workspace sends row by row, so only the rows that went leave the selection. A blanket
+    // clear would throw away the ones still waiting for a price.
+    setInventorySelection((current) => {
+      const rows = { ...current.rows };
+      for (const key of keys) delete rows[key];
+      return { rows };
+    });
+  });
+  const reprice = useListingWorkspace(REPRICE_INTENT);
   const [sidebarPinned, setSidebarPinned] = useState(
     () => typeof localStorage !== 'undefined' && localStorage.getItem(SIDEBAR_PIN_KEY) === '1'
   );
@@ -187,13 +218,12 @@ export function App(): React.JSX.Element {
   const activeAccount = accounts.find((entry) => entry.accountId === scope) ?? null;
   const key = activeAccount?.accountId ?? '';
 
-  /** Where the open page puts its description, badge and controls in the header (`PageHeader`). */
-  const [subtitleSlot, setSubtitleSlot] = useState<HTMLElement | null>(null);
+  /** Where the open page puts its badge and controls in the header (`PageHeader`). */
   const [badgeSlot, setBadgeSlot] = useState<HTMLElement | null>(null);
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null);
   const headerSlots = useMemo(
-    () => ({ subtitle: subtitleSlot, badge: badgeSlot, actions: actionsSlot }),
-    [subtitleSlot, badgeSlot, actionsSlot]
+    () => ({ badge: badgeSlot, actions: actionsSlot }),
+    [badgeSlot, actionsSlot]
   );
 
   /** Holdings and connection state for every known account. Both reach no network. */
@@ -329,6 +359,29 @@ export function App(): React.JSX.Element {
     void engine.settings().then(setSettings).catch(() => setSettings(DEFAULT_SETTINGS));
   }, []);
 
+  /** Which engine, and a host's pages, read again whenever main says the connection's state moved. */
+  useEffect(() => {
+    let cancelled = false;
+    const read = (): void => {
+      void engine.engineStatus().then((status) => {
+        if (cancelled) return;
+        setEngineStatus(status);
+        if (status.kind !== 'remote') {
+          setHostPages([]);
+          return;
+        }
+        if (status.state === 'connected') {
+          void engine.hostPages().then((pages) => { if (!cancelled) setHostPages(pages); }).catch(() => undefined);
+        }
+      }).catch(() => undefined);
+    };
+    read();
+    const unsubscribe = engine.subscribeToChanges((notice) => {
+      if (notice.surfaces.includes(ENGINE_HOST_SURFACE)) read();
+    });
+    return () => { cancelled = true; unsubscribe(); };
+  }, []);
+
   useEffect(() => {
     void reloadAccounts()
       .then(() => {
@@ -355,7 +408,9 @@ export function App(): React.JSX.Element {
    * account left out is still marked swept, so a later re-list does not sign it in either.
    */
   useEffect(() => {
-    if (settings === null) return undefined;
+    // The sweep is the local engine's: a host connected its accounts when it started, and a second
+    // handshake per account per window open would cost it with no information in it (plan D6).
+    if (settings === null || engineStatus === null || engineStatus.kind === 'remote') return undefined;
     const pending = accounts.filter((account) => account.hasSession && !swept.current.has(account.accountId));
     if (pending.length === 0) return undefined;
     for (const account of pending) swept.current.add(account.accountId);
@@ -367,7 +422,7 @@ export function App(): React.JSX.Element {
       }
     })();
     return undefined;
-  }, [accounts, connect, settings]);
+  }, [accounts, connect, settings, engineStatus]);
 
   /**
    * The GC session can end while nobody is clicking — another computer starts CS2 and Steam
@@ -408,8 +463,10 @@ export function App(): React.JSX.Element {
    * forbids the scheduler having an ambient current account to guess with.
    */
   useEffect(() => {
+    // A host sets its own cadence (plan D5); the hint would re-tier its accounts.
+    if (engineStatus?.kind !== 'local') return;
     void engine.setRefreshScope(scope).catch(() => undefined);
-  }, [scope]);
+  }, [scope, engineStatus]);
 
   useEffect(() => {
     if (accountIds.length > 0) void refresh().catch(() => undefined);
@@ -507,6 +564,7 @@ export function App(): React.JSX.Element {
     // No count: the page is a search over the catalogue, not a list of anything held.
     items: 0,
     settings: 0,
+    'host-page': 0,
     portfolio: accounts.length,
     inventory: totals.items
   };
@@ -516,7 +574,11 @@ export function App(): React.JSX.Element {
   const wallet = activeHoldings?.wallet
     ? { balance_cents: activeHoldings.wallet.balanceCents, currency: activeHoldings.currency }
     : null;
-  const current = [...SECTIONS, SETTINGS].find((entry) => entry.id === section) ?? SECTIONS[0]!;
+  /** The open host page as a section entry, so the header names it like any other page. */
+  const hostEntry: SectionEntry | null = hostPage
+    ? { id: 'host-page', label: hostPage.title, icon: 'globe', perAccount: false, group: 'Host', blurb: `A page served by ${engineStatus?.kind === 'remote' ? engineStatus.label : 'the engine host'}` }
+    : null;
+  const current = (section === 'host-page' && hostEntry) ? hostEntry : [...SECTIONS, SETTINGS].find((entry) => entry.id === section) ?? SECTIONS[0]!;
   const connection = describeConnection(connections.find((row) => row.accountId === key));
   // A frozen screen with no explanation is the failure this whole scheduler exists to remove,
   // so when an account is not refreshing the window says which problem it is.
@@ -611,6 +673,9 @@ export function App(): React.JSX.Element {
   /** A venue's plus on Listings or Buy orders: that venue's page in Settings, for that account. */
   const addVenue = (accountId: string, venue: VenueId): void => navigate({ section: 'settings', settings: venue, accountId });
 
+  /** The one way in from an empty page. A host's accounts are added on the host, so it offers none. */
+  const addAccount = remote ? undefined : <Button variant="primary" icon="plus" onClick={() => setSigningIn({ kind: 'new' })}>Add a Steam account</Button>;
+
   return (
     <WorkProvider accountIds={workScope}>
     <NotificationProvider onNavigate={navigate}>
@@ -636,9 +701,6 @@ export function App(): React.JSX.Element {
             <BrandMark />
             <div className="brand-text">
               <div className="brand-mark">CS<span>lytics</span></div>
-              <div className="brand-sub">
-                {activeAccount ? activeAccount.accountName : plural(accounts.length, 'account')}
-              </div>
             </div>
           </div>
           <button
@@ -662,9 +724,32 @@ export function App(): React.JSX.Element {
             </React.Fragment>
           );
         })}
+        {/* The pages a connected host serves, under its label (plan D12): the window lists them and
+            shows one; what each is about is the host's business. */}
+        {engineStatus?.kind === 'remote' && hostPages.length > 0 ? (
+          <>
+            <div className="nav-label">{engineStatus.label}</div>
+            {hostPages.map((page) => (
+              <button
+                key={page.id}
+                type="button"
+                className="nav-item"
+                data-selected={section === 'host-page' && hostPage?.id === page.id}
+                aria-current={section === 'host-page' && hostPage?.id === page.id ? 'page' : undefined}
+                aria-label={page.title}
+                title={`${page.title}. A page served by ${engineStatus.label}`}
+                onClick={() => { setHostPage(page); setSection('host-page'); }}
+              >
+                <Icon name="globe" size={16} />
+                <span className="nav-text">{page.title}</span>
+              </button>
+            ))}
+          </>
+        ) : null}
 
         <div className="sidebar-foot">
-          <button
+          {/* Connect and sign out are the local engine's: a host's sessions are its own (plan D5). */}
+          {remote ? null : <button
             type="button"
             className="nav-item"
             aria-label={activeAccount ? 'Connect this account' : 'Connect all'}
@@ -690,7 +775,7 @@ export function App(): React.JSX.Element {
           >
             <Icon name="link" size={16} />
             <span className="nav-text">{activeAccount ? 'Connect this account' : 'Connect all'}</span>
-          </button>
+          </button>}
           <button
             type="button"
             className="nav-item"
@@ -713,7 +798,7 @@ export function App(): React.JSX.Element {
             <span className="nav-text">{activeAccount ? 'Refresh now' : 'Refresh all now'}</span>
           </button>
           {navItem(SETTINGS)}
-          {activeAccount ? (
+          {activeAccount && !remote ? (
             <button
               type="button"
               className="nav-item"
@@ -763,16 +848,19 @@ export function App(): React.JSX.Element {
             if (next === null && current.perAccount) setSection('portfolio');
           }}
           onAddAccount={() => setSigningIn({ kind: 'new' })}
+          canAdd={!remote}
           busy={busy}
           venues={venues}
           // What is happening, in its own area at the right-hand end of the account strip. It
           // belongs to the window rather than to the open section, so it sits on the row the
           // accounts are on rather than on the section header below. Scope follows the tab, like
-          // every other read (rule 8). The empty slot ahead of it is where the listing workspace
-          // puts its pill while it holds a row: staging is owned by the Inventory view, so the
-          // view portals into this rather than the shell holding its state.
+          // every other read (rule 8). The empty slot ahead of it is where each listing workspace
+          // puts its pill while it holds a row, on every page: the shell holds the staging, so
+          // the pill outlives the view that filled it.
           aside={<>
             <span className="listing-slot" data-slot="listing-workspace" />
+            <ListingWorkspace workspace={listing} accounts={accountNames} />
+            <ListingWorkspace workspace={reprice} accounts={accountNames} />
             <WorkIndicator
               accountIds={workScope}
               accounts={accountNames}
@@ -796,10 +884,6 @@ export function App(): React.JSX.Element {
                 <span className="topbar-badge" ref={setBadgeSlot} />
                 {hold ? <Caption icon="pause" tone="warn">Not refreshing: {describeHold(hold)}</Caption> : null}
                 {selectedCount > 0 ? <Caption icon="list-checks" tone="accent">{selectedCount.toLocaleString()} selected</Caption> : null}
-              </div>
-              <div className="topbar-subtitle">
-                <span className="topbar-subtitle-slot" ref={setSubtitleSlot} />
-                <span className="topbar-blurb">{current.blurb}</span>
               </div>
             </div>
           </div>
@@ -826,14 +910,22 @@ export function App(): React.JSX.Element {
 
             {section === 'portfolio' && loaded && accounts.length === 0 ? (
               <Panel>
-                <Empty
-                  icon="user-plus"
-                  title="Welcome to CSlytics"
-                  hint="Add a Steam account to see what it holds. Later launches reconnect it on their own, and nothing here is sent anywhere but Steam."
-                  action={<Button variant="primary" icon="plus" size="lg" onClick={() => setSigningIn({ kind: 'new' })}>Add your first account</Button>}
-                />
+                {remote ? (
+                  <Empty
+                    icon="globe"
+                    title="The engine host holds no accounts"
+                    hint="Accounts are added on the host, not here."
+                  />
+                ) : (
+                  <Empty
+                    icon="user-plus"
+                    title="Welcome to CSlytics"
+                    action={<Button variant="primary" icon="plus" size="lg" onClick={() => setSigningIn({ kind: 'new' })}>Add your first account</Button>}
+                  />
+                )}
               </Panel>
             ) : null}
+            {section === 'host-page' && hostPage ? <HostPageView page={hostPage} /> : null}
 
             {/* Gated on `loaded` for the same reason the account list is: before the runtime has
                 answered, "no accounts yet" is a guess, and it is the one guess that reads as a
@@ -847,7 +939,7 @@ export function App(): React.JSX.Element {
               />
             ) : null}
             {section === 'items' && loaded && accountIds.length === 0 ? (
-              <Panel><Empty icon="trending-up" title="No accounts yet" hint="Add a Steam account to look items up." /></Panel>
+              <Panel><Empty icon="trending-up" title="No accounts yet" action={addAccount} /></Panel>
             ) : null}
             {section === 'portfolio' && loaded && accounts.length > 0 ? (
               <PortfolioPage
@@ -869,6 +961,7 @@ export function App(): React.JSX.Element {
                 onOpen={(accountId) => { setScope(accountId); setSection('inventory'); }}
                 onManage={(accountId) => { setScope(accountId); setSection('settings'); }}
                 onAddAccount={() => setSigningIn({ kind: 'new' })}
+                canAdd={!remote}
               />
             ) : null}
 
@@ -882,7 +975,6 @@ export function App(): React.JSX.Element {
                   icon="wallet"
                   tone="accent"
                   value={formatAmount(wallet?.balance_cents ?? null, wallet?.currency ?? null)}
-                  note={wallet ? undefined : 'not observed yet'}
                 />
               </div>
             ) : null}
@@ -894,13 +986,20 @@ export function App(): React.JSX.Element {
             ) : null}
 
             {section === 'inventory' && accountIds.length > 0 ? (
-              <InventoryView accountIds={scope ? [scope] : accountIds} accounts={accountNames} selection={inventorySelection} onSelection={setInventorySelection} onOpenItem={(name) => openItem(name, 'inventory')} />
+              <InventoryView
+                accountIds={scope ? [scope] : accountIds}
+                accounts={accountNames}
+                selection={inventorySelection}
+                onSelection={setInventorySelection}
+                onStage={(selected) => listing.stage(stageItems(selected))}
+                onOpenItem={(name) => openItem(name, 'inventory')}
+              />
             ) : null}
             {section === 'trades' && accountIds.length > 0 ? (
               <TradesView accountIds={scope ? [scope] : accountIds} accounts={accountNames} />
             ) : null}
             {section === 'trades' && loaded && accountIds.length === 0 ? (
-              <Panel><Empty icon="arrow-left-right" title="No accounts yet" hint="Add a Steam account to see its trades." /></Panel>
+              <Panel><Empty icon="arrow-left-right" title="No accounts yet" action={addAccount} /></Panel>
             ) : null}
             {section === 'records' && accountIds.length > 0 ? (
               <PageHeader actions={(
@@ -916,22 +1015,23 @@ export function App(): React.JSX.Element {
               <RecordsView key={`${recordTab}:${scope ?? 'all'}`} domain={recordTab} accountIds={scope ? [scope] : accountIds} accounts={accountNames} />
             ) : null}
             {section === 'listings' && accountIds.length > 0 ? (
-              <ListingsView accountIds={scope ? [scope] : accountIds} accounts={accountNames} setUp={marketplaces} onAddVenue={addVenue} />
+              <ListingsView accountIds={scope ? [scope] : accountIds} accounts={accountNames} setUp={marketplaces} onAddVenue={addVenue} reprice={reprice} />
             ) : null}
             {section === 'listings' && loaded && accountIds.length === 0 ? (
-              <Panel><Empty icon="layers" title="No accounts yet" hint="Add a Steam account to see what it has listed." /></Panel>
+              <Panel><Empty icon="layers" title="No accounts yet" action={addAccount} /></Panel>
             ) : null}
             {section === 'buy-orders' && accountIds.length > 0 ? (
               <BuyOrdersView key={scope ?? 'all'} accountIds={scope ? [scope] : accountIds} accounts={accountNames} setUp={marketplaces} onAddVenue={addVenue} />
             ) : null}
             {section === 'buy-orders' && loaded && accountIds.length === 0 ? (
-              <Panel><Empty icon="shopping-cart" title="No accounts yet" hint="Add a Steam account to see its buy orders." /></Panel>
+              <Panel><Empty icon="shopping-cart" title="No accounts yet" action={addAccount} /></Panel>
             ) : null}
 
             {section === 'settings' ? (
               <SettingsView
                 accounts={accounts}
                 loaded={loaded}
+                remote={remote}
                 account={activeAccount}
                 connection={connections.find((row) => row.accountId === key)}
                 connecting={connecting.has(key)}
@@ -954,7 +1054,7 @@ export function App(): React.JSX.Element {
 
 
             {!loaded && section === 'portfolio' ? (
-              <Panel><Empty icon="loader" title="Opening your accounts…" hint="Waiting for the Engine Runtime to answer." /></Panel>
+              <Panel><Empty icon="loader" title="Opening your accounts…" /></Panel>
             ) : null}
           </div>
         </div>

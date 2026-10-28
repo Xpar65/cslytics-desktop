@@ -18,6 +18,11 @@ export interface CsfloatTradePort {
   getTrades(accountId: AccountId, credential: CsfloatCredentialRef, state: string): Promise<CsfloatReadResult<{ trades: CsfloatTrade[]; count: number }>>;
   getTrade(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string): Promise<CsfloatReadResult<CsfloatTrade>>;
   accept(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string): Promise<MutationOutcome>;
+  /**
+   * Several queued sales in one call (`POST /trades/bulk/accept`), answered per id: a refusal or a lost answer of the
+   * whole call is every id's, and an id a successful answer does not name is AMBIGUOUS, for a trade read to settle.
+   */
+  acceptMany(accountId: AccountId, credential: CsfloatCredentialRef, tradeIds: readonly string[]): Promise<Readonly<Record<string, MutationOutcome>>>;
   notifyOffer(accountId: AccountId, credential: CsfloatCredentialRef, offerId: string, assetIds: readonly string[]): Promise<MutationOutcome>;
   cannotDeliver(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string): Promise<MutationOutcome>;
 }

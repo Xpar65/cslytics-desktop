@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useId, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { BuyOrderBook, BuyOrderBookRow, BuyOrderVenue } from '@cslytics/engine';
 import { Button, Empty, Field, IconButton, Metric, Notice, Panel, Spinner, Thumbnail } from '../../components/ui.js';
 import { PageHeader } from '../../components/PageHeader.js';
@@ -20,7 +20,7 @@ import {
   useCancelBuyOrder, useEditBuyOrder, useRefreshBuyOrders,
   type BuyOrderCancelling, type BuyOrderEditing, type BuyOrderMessage, type BuyOrderTerms, type CsfloatAccountFacts, type NamedBuyOrder
 } from './buy-order-actions.js';
-import { BuyOrderFilters, filterPieces, filterSummary } from './buy-order-filters.js';
+import { BuyOrderFilters, filterPieces } from './buy-order-filters.js';
 import { BuyOrderFilterFields } from './buy-order-filter-fields.js';
 import { constraintsFromDraft, draftFromFilters, sameConstraints } from './buy-order-filter-draft.js';
 
@@ -42,29 +42,6 @@ const WATCHED = ['steam-market', 'steam-wallet', 'steam-buy-order-status', 'csfl
 
 /** The picture is a tile's, on the tile's halo, with where the order stands marked on its corner. */
 const PICTURE = 72;
-
-const BUY_ORDER_NOTE = 'Steam orders in each account\'s wallet currency and CSFloat in US dollars, and nothing is converted. Orders are placed on each venue\'s own site and appear here after its next read.';
-
-/** The filled information mark (SVG Repo), inlined so it takes the text colour. */
-function InfoMark(): React.JSX.Element {
-  return (
-    <svg className="icon" width={14} height={14} viewBox="0 0 496.304 496.303" fill="currentColor" aria-hidden="true" focusable="false">
-      <path d="M248.146,0C111.314,0,0,111.321,0,248.152c0,136.829,111.314,248.151,248.146,248.151c136.835,0,248.158-111.322,248.158-248.151C496.304,111.321,384.98,0,248.146,0z M248.146,472.093c-123.473,0-223.935-100.459-223.935-223.941c0-123.479,100.462-223.941,223.935-223.941c123.488,0,223.947,100.462,223.947,223.941C472.093,371.634,371.634,472.093,248.146,472.093z M319.536,383.42v32.852c0,1.383-1.123,2.494-2.482,2.494H196.45c-1.374,0-2.482-1.117-2.482-2.494V383.42c0-1.372,1.114-2.482,2.482-2.482h34.744V205.831h-35.101c-1.375,0-2.468-1.111-2.468-2.474v-33.6c0-1.38,1.1-2.479,2.468-2.479h82.293c1.371,0,2.482,1.105,2.482,2.479v211.181h36.186C318.413,380.938,319.536,382.048,319.536,383.42z M209.93,105.927c0-20.895,16.929-37.829,37.829-37.829c20.886,0,37.826,16.935,37.826,37.829s-16.94,37.829-37.826,37.829C226.853,143.756,209.93,126.822,209.93,105.927z" />
-    </svg>
-  );
-}
-
-function BuyOrderNote(): React.JSX.Element {
-  const id = useId();
-  return (
-    <span className="buy-order-note">
-      <button type="button" className="buy-order-note-button" aria-label="About these orders" aria-describedby={id}>
-        <InfoMark />
-      </button>
-      <span className="buy-order-note-bubble" id={id} role="tooltip">{BUY_ORDER_NOTE}</span>
-    </span>
-  );
-}
 
 function compare(sort: BuyOrderSort, left: BuyOrderBookRow, right: BuyOrderBookRow): number {
   if (sort === 'price') return left.priceCents - right.priceCents;
@@ -232,7 +209,6 @@ export function BuyOrdersView({ accountIds, accounts = [], setUp, onAddVenue }: 
   return (
     <div className="stack-lg" data-testid="buy-orders-screen">
       <PageHeader
-        subtitle={<>Every buy order standing open across your accounts and venues. <BuyOrderNote /></>}
         actions={(
           <>
             <Button
@@ -321,15 +297,15 @@ export function BuyOrdersView({ accountIds, accounts = [], setUp, onAddVenue }: 
           <Empty icon="loader" title="Reading buy orders" />
         ) : rows.length === 0 ? (
           hasFilter
-            ? <Empty icon="search" title="No buy order matches" hint="Try a broader search, another venue, or reset the filters." />
-            : <Empty icon="shopping-cart" title="No open buy orders" hint="Buy orders placed on the Steam Community Market or on CSFloat appear here after the next read of that venue." />
+            ? <Empty icon="search" title="No buy order matches" action={<Button size="sm" variant="ghost" icon="filter" onClick={() => { setVenue(''); setChips([]); }}>Reset filters</Button>} />
+            : <Empty icon="shopping-cart" title="No open buy orders" />
         ) : (
           <div className="table-scroll">
             <table className="table buy-order-table" aria-label="Open buy orders">
               <thead>
                 <tr>
                   <th scope="col">Item</th>
-                  <th scope="col" className="num-cell">Price each</th>
+                  <th scope="col" className="num-cell" title="Steam orders in each account's wallet currency and CSFloat in US dollars. Nothing is converted.">Price each</th>
                   <th scope="col" className="num-cell">Bought</th>
                   <th scope="col" className="num-cell">Committed</th>
                   <th scope="col" aria-label="Actions" />
@@ -395,7 +371,6 @@ export function BuyOrderRow({ row, open, onToggle, account, cancelling, editing,
   const editPhase = editing.phase(row);
   const cannotEdit = row.venue === 'CSFLOAT' && !row.editable;
   const pieces = row.filters === null ? null : filterPieces(row.venue, row.filters);
-  const summary = pieces === null ? 'filters not reported' : filterSummary(pieces);
   // Open and part filled are the ordinary states, and the corner says them. Anything on its way or
   // failed is also said in words, beside the button, because it is what the person came to see.
   const needsLooking = status.tone === 'warn' || status.tone === 'negative';
@@ -449,7 +424,7 @@ export function BuyOrderRow({ row, open, onToggle, account, cancelling, editing,
                   <BuyOrderFilters
                     venue={row.venue}
                     filters={row.filters}
-                    note={cannotEdit ? 'This app cannot carry every one of these filters through a change, so change the order on CSFloat.' : null}
+                    note={cannotEdit ? 'Change this order on CSFloat.' : null}
                   />
                   <span className="cell-sub buy-order-number">
                     <span className="mono">Order {row.buyOrderId}</span>
@@ -492,7 +467,7 @@ export function BuyOrderRow({ row, open, onToggle, account, cancelling, editing,
       {editPhase !== 'idle' ? (
         <tr className="buy-order-editor" data-testid="buy-order-editor">
           <td colSpan={5}>
-            <BuyOrderEditor row={row} summary={summary} facts={facts} sending={editPhase === 'sending'} onSubmit={(terms) => editing.submit(row, terms)} onClose={editing.close} />
+            <BuyOrderEditor row={row} facts={facts} sending={editPhase === 'sending'} onSubmit={(terms) => editing.submit(row, terms)} onClose={editing.close} />
           </td>
         </tr>
       ) : null}
@@ -514,10 +489,9 @@ export function BuyOrderRow({ row, open, onToggle, account, cancelling, editing,
  * Save, and a total past the account's balance, or an account past the order cap, warns and
  * leaves the choice to the person, because a balance read minutes ago may since have moved.
  */
-function BuyOrderEditor({ row, summary, facts, sending, onSubmit, onClose }: {
+function BuyOrderEditor({ row, facts, sending, onSubmit, onClose }: {
   row: NamedBuyOrder;
   /** The order's filters in words, which a change carries through unchanged. */
-  summary: string;
   facts: CsfloatAccountFacts | null;
   sending: boolean;
   onSubmit: (terms: BuyOrderTerms) => void;
@@ -558,7 +532,7 @@ function BuyOrderEditor({ row, summary, facts, sending, onSubmit, onClose }: {
         <input className="input" inputMode="numeric" value={quantity} onChange={(event) => setQuantity(event.target.value)} disabled={sending} aria-label="How many are wanted" />
       </Field>
       <span className="cell-sub buy-order-editor-note">
-        {problem ?? `CSFloat will pay at most ${formatAmount(cents!, row.currency)} for each of ${wanted!.toLocaleString()}, ${formatAmount(cents! * wanted!, row.currency)} in all${filtersChanged ? ', with the filters below' : summary ? `, and still only ${summary}` : ''}.`}
+        {problem ?? `CSFloat will pay at most ${formatAmount(cents!, row.currency)} for each of ${wanted!.toLocaleString()}, ${formatAmount(cents! * wanted!, row.currency)} in all.`}
       </span>
       <BuyOrderFilterFields venue={row.venue} item={row.csfloatItem} held={held} draft={draft} onChange={setDraft} disabled={sending} />
       <Button type="submit" size="sm" variant="primary" loading={sending} disabled={Boolean(problem)}>Save</Button>

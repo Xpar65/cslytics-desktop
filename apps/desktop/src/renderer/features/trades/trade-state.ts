@@ -96,8 +96,10 @@ export const KIND_ORDER = Object.keys(TRADE_ORIGIN_CLASS) as TradeOriginClass[];
  * The short state a trade's row and badge carry: the stage, except where the stage is a family and
  * Steam's own word is more useful — which confirmation an open offer waits on, why one ended.
  */
-export function stageBadge(row: Pick<TradeListRow, 'stage' | 'offerStatus' | 'tradeStatus' | 'listed'>): StageLabel {
+export function stageBadge(row: Pick<TradeListRow, 'stage' | 'offerStatus' | 'tradeStatus' | 'listed'> & { reversesTradeId?: string | null | undefined }): StageLabel {
   const stage = TRADE_STAGE[row.stage];
+  // The return of a reversed trade is complete and final, and says so by what it is.
+  if (row.reversesTradeId && row.tradeStatus === 'COMPLETE') return { ...stage, label: 'Returned', icon: 'undo', hint: 'Steam returned the items of a trade it reversed' };
   if (row.stage === 'to-be-confirmed' || row.stage === 'ended') {
     if (row.stage === 'ended' && row.listed === 0 && !row.tradeStatus) return { ...stage, label: 'No longer listed' };
     const code = row.tradeStatus && row.tradeStatus !== 'COMPLETE' ? row.tradeStatus : row.offerStatus;
@@ -115,6 +117,10 @@ export type TradeStateInput = Pick<TradeListRow, 'stage' | 'direction' | 'offerS
   escrowUntil?: string | null | undefined;
   rawOfferState?: number | null | undefined;
   rawTradeStatus?: number | null | undefined;
+  /** The trade this one reverses: the return of a trade-protection rollback. */
+  reversesTradeId?: string | null | undefined;
+  /** The trade that returned this one's items, once an entry knows it. */
+  reversedByTradeId?: string | null | undefined;
 };
 
 function capitalise(text: string): string {
@@ -149,12 +155,16 @@ export function describeTradeState(entry: TradeStateInput, other: string): Trade
         icon: 'trade-protected'
       };
     case 'finalized':
+      if (entry.reversesTradeId) {
+        return { headline: 'Return of a reversed trade', detail: `Steam returned the items of trade ${entry.reversesTradeId} after reversing it.`, tone: 'quiet', icon: 'undo' };
+      }
       return hadReversalPeriod(entry)
         ? { headline: `Finalized ${formatDateTime(entry.settlesAt)}`, detail: `The reversal period is over: Steam can no longer reverse this trade.${accepted(entry)}`, tone: 'positive', icon: 'check-circle' }
         : { headline: `Completed ${formatDateTime(entry.acceptedAt ?? entry.sortAt)}`, detail: 'Steam\'s trade history shows the items moved.', tone: 'positive', icon: 'check-circle' };
     case 'reversed':
       return entry.tradeStatus === 'REVERSED'
-        ? { headline: 'Steam reversed this trade in its reversal period', detail: 'The items went back in a separate trade.', tone: 'negative', icon: 'undo' }
+        ? { headline: 'Steam reversed this trade in its reversal period',
+            detail: entry.reversedByTradeId ? `The items went back in trade ${entry.reversedByTradeId}.` : 'The items went back in a separate trade.', tone: 'negative', icon: 'undo' }
         : { headline: 'Steam reversed this trade', detail: 'Items that moved were moved back.', tone: 'negative', icon: 'undo' };
     default:
       return describeOpenOrEnded(entry, other, sent);

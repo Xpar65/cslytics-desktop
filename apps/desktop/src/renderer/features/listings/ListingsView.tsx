@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ListingsSummary, ListingSort, ListingSortDirection, ListingVenue, PageEnvelope } from '@cslytics/engine';
 import { Button, IconButton, Notice, Panel, Select } from '../../components/ui.js';
-import { PageHeader } from '../../components/PageHeader.js';
 import { VenueFilter, useOfferedVenue } from '../../components/VenueFilter.js';
 import { useOpenWork, useWorkRefresh } from '../work/WorkIndicator.js';
 import { formatRelative, plural } from '../../lib/labels.js';
@@ -10,11 +9,11 @@ import { SortControl, type SortOption } from '../../components/SortControl.js';
 import { FilterBar } from '../../components/FilterBar.js';
 import { LISTING_CHIP_KINDS, chipsToListingFilter } from '../../components/filter-grammar.js';
 import { InspectorSplit } from '../../components/InspectorSplit.js';
-import { ListingWorkspace } from '../../components/ListingWorkspace.js';
+import type { Workspace } from '../../components/ListingWorkspace.js';
 import { useScopedChips } from '../../components/scoped-chips.js';
 import { ListingInspector } from './ListingInspector.js';
 import { ListingTiles } from './ListingTiles.js';
-import { REPRICE_INTENT, stageListing, useDelisting, type StagedListing } from './listing-actions.js';
+import { stageListing, useDelisting, type StagedListing } from './listing-actions.js';
 import { listingKey, listingState, type NamedListing } from './listing-parts.js';
 import { VENUE_LABEL, byVenue, venueOffer, type VenueId } from '../../lib/marketplaces.js';
 import type { Message } from '../../components/ui.js';
@@ -53,18 +52,21 @@ const SORTS: ReadonlyArray<SortOption<ListingSort>> = [
  * things that can be done about it. Changing a price stages the listing in the listing workspace,
  * the same dock Inventory lists from, because that is where a figure is read through a venue's
  * fees before anything is sent; what is sent then shows in the work panel like any other work.
- * Delisting asks first.
+ * The shell holds that workspace (`reprice`), so a staged listing outlives this page the way a
+ * staged item outlives Inventory. Delisting asks first.
  *
  * The venue control offers the venues the accounts in view have set up, and a plus for each they
  * have not, which opens that venue's page in Settings (`VenueFilter`, `venueOffer`).
  */
-export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
+export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue, reprice }: {
   accountIds: string[];
   accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; currency?: number | null | undefined }> | undefined;
   /** Which venues each account has set up (`setUpByAccount`); an account is absent until known. */
   setUp: Readonly<Record<string, ReadonlySet<VenueId>>>;
   /** Opens one venue's page in Settings for one account. */
   onAddVenue: (accountId: string, venue: VenueId) => void;
+  /** The shell's workspace for new prices: the pencil stages a listing in it. */
+  reprice: Workspace<StagedListing>;
 }): React.JSX.Element {
   const [venue, setVenue] = useState<'' | ListingVenue>('');
   const [state, setState] = useState('');
@@ -75,26 +77,12 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
   const [subject, setSubject] = useState<NamedListing | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [revision, setRevision] = useState(0);
-  /** What is staged for a new price. The workspace is keyed by `id`, and joins rows added to it. */
-  const [staging, setStaging] = useState<{ id: string; reveal: number; rows: readonly StagedListing[] } | null>(null);
   const work = useOpenWork(accountIds);
   const busyKeys = useMemo(() => busyKeysFromWork(work), [work]);
   const delisting = useDelisting(setMessage, useWorkRefresh());
   const nameOf = useCallback((id: string): string => accounts.find((account) => account.id === id)?.name ?? id, [accounts]);
-
-  /**
-   * Staging a listing that is already staged is "show me the workspace"; any other joins the rows
-   * already there, each of which keeps whatever has been typed into it.
-   */
-  function stageReprice(row: NamedListing): void {
-    const entry = stageListing(row);
-    setStaging((current) => {
-      if (current === null) return { id: crypto.randomUUID(), reveal: 0, rows: [entry] };
-      return current.rows.some((staged) => staged.key === entry.key)
-        ? { ...current, reveal: current.reveal + 1 }
-        : { ...current, rows: [...current.rows, entry] };
-    });
-  }
+  /** The pencil, on a tile or in the inspector: the listing joins the shell's reprice workspace. */
+  const stageReprice = (row: NamedListing): void => reprice.stage([stageListing(row)]);
 
   /**
    * The inspector holds a copy of a row, and a walk replaces the rows. Point it at the fresh copy
@@ -193,7 +181,7 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
       account={subject ? nameOf(subject.accountId) : ''}
       multiAccount={accountIds.length > 1}
       busy={subject !== null && itemIsBusy(busyKeys, subject)}
-      staged={subject !== null && Boolean(staging?.rows.some((entry) => entry.key === listingKey(subject)))}
+      staged={subject !== null && reprice.state.rows.some((entry) => entry.key === listingKey(subject))}
       delisting={delisting}
       onReprice={stageReprice}
     />
@@ -201,8 +189,6 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
 
   return (
     <div className="stack-lg" data-testid="listings-screen">
-      <PageHeader subtitle="Every advertisement standing across your accounts and venues. Steam prices in each account's wallet currency and CSFloat in US dollars, and nothing is converted." />
-
       {/*
         Above the coverage caveat on purpose. An unfinished walk is a reason to distrust the
         list; an unconfirmed listing is something to go and do, and the thing to do outranks the
@@ -294,19 +280,6 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue }: {
           />
         </InspectorSplit>
       </Panel>
-
-      {staging ? (
-        <ListingWorkspace
-          key={staging.id}
-          staged={staging.rows}
-          intent={REPRICE_INTENT}
-          reveal={staging.reveal}
-          accounts={accounts}
-          onMessage={setMessage}
-          onUnstaged={(key) => setStaging((current) => (current === null ? null : { ...current, rows: current.rows.filter((entry) => entry.key !== key) }))}
-          onDismiss={() => setStaging(null)}
-        />
-      ) : null}
     </div>
   );
 }

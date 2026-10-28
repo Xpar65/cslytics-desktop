@@ -63,6 +63,70 @@ export async function executeMutation(
 }
 
 /**
+ * One venue call that carries several actions of one kind on one account (CSFloat's bulk accept).
+ *
+ * Each action is checked and gets its own attempt row exactly as `sendMutation` does it; the call is made once,
+ * under one token of the kind's budget and one verdict of its breaker, and each action is settled by its own entry
+ * of the answer, AMBIGUOUS where the answer names none. An action whose checks refuse it is left out of the call and
+ * answered with the error, and nothing is sent when every action is left out.
+ */
+export async function executeBatchMutation(
+  context: EngineContext,
+  items: ReadonlyArray<{ action: ActionRow; validate?: () => void }>,
+  call: (actions: readonly ActionRow[]) => Promise<ReadonlyMap<string, MutationOutcome>>
+): Promise<Map<string, MutationOutcome | Error>> {
+  const answers = new Map<string, MutationOutcome | Error>();
+  const first = items[0]?.action;
+  if (!first) return answers;
+  if (items.some(({ action }) => action.account_id !== first.account_id || action.kind !== first.kind)) throw new Error('A batch is one account and one action kind');
+  const governor = context.governors.forMutation(first.account_id, first.kind);
+  if (!governor.breaker.canAttempt()) throw new Error(`Circuit open for ${first.kind} on ${first.account_id}`);
+  await governor.bucket.take();
+
+  const sent: ActionRow[] = [];
+  for (const { action, validate } of items) {
+    try {
+      const current = context.database.action(action.id);
+      if (!current || current.state !== 'READY' || !context.database.currentDesired(current)) throw new Error('Action is no longer current and READY');
+      validate?.();
+      sent.push(current);
+    } catch (error) {
+      answers.set(action.id, error instanceof Error ? error : new Error(errorMessage(error)));
+    }
+  }
+  if (!sent.length) return answers;
+  const attempts = new Map(sent.map((action) => [action.id, context.database.startAttempt(action.id, context.now())]));
+  let outcomes: ReadonlyMap<string, MutationOutcome>;
+  try {
+    outcomes = await call(sent);
+  } catch (error) {
+    const lost: MutationOutcome = { kind: 'AMBIGUOUS', cause: classifyAmbiguity(error), raw: errorMessage(error) };
+    outcomes = new Map(sent.map((action) => [action.id, lost]));
+  }
+  const unnamed: MutationOutcome = { kind: 'AMBIGUOUS', cause: 'unclassified', raw: 'the batch answer named no outcome for this action' };
+  if (sent.some((action) => (outcomes.get(action.id) ?? unnamed).kind === 'AMBIGUOUS')) governor.breaker.failure();
+  else governor.breaker.success();
+  for (const action of sent) {
+    const outcome = outcomes.get(action.id) ?? unnamed, now = context.now();
+    context.database.finishAttempt(action.id, attempts.get(action.id)!, outcome.kind, outcome.raw, now,
+      outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : undefined, venueRetryAt(outcome, now));
+    context.signals.emit({ kind: 'mutation-settled', accountId: action.account_id, actionKind: action.kind, outcome: outcome.kind, targetId: action.target_id });
+    answers.set(action.id, outcome);
+  }
+  return answers;
+}
+
+/**
+ * When a venue that refused the request says it may be made again, as an instant on the engine's
+ * clock (rule 9: `now` is a parameter); `null` for every other answer. Kept on the attempt, so the
+ * hold survives a restart and the work panel counts down to the same instant the resend waits for.
+ */
+export function venueRetryAt(outcome: MutationOutcome, now: string): string | null {
+  return outcome.kind === 'DEFINITIVELY_REJECTED' && outcome.retryAfterMs !== undefined
+    ? new Date(Date.parse(now) + outcome.retryAfterMs).toISOString() : null;
+}
+
+/**
  * `executeMutation`, returning once the call has gone out rather than once it is answered.
  *
  * Everything before the call is the same: the budget, the breaker, the checks, the attempt row.
@@ -122,13 +186,15 @@ export async function sendMutation(
     if (outcome.kind === 'AMBIGUOUS') governor.breaker.failure();
     else governor.breaker.success();
 
+    const now = context.now();
     context.database.finishAttempt(
       action.id,
       attemptId,
       outcome.kind,
       outcome.raw,
-      context.now(),
-      outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : undefined
+      now,
+      outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : undefined,
+      venueRetryAt(outcome, now)
     );
     // A settled attempt is the strongest available hint that the surfaces which could *prove* its
     // effect are now worth re-reading. It is emphatically not a hint to try again: this signal

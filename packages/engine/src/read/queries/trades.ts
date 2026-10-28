@@ -1,5 +1,6 @@
 import { KIT_ATTRIBUTES_BY_ITEM, KIT_ATTRIBUTES_BY_QUALITY } from '@cslytics/ports';
 import { TransferStore } from '../../db/transfers.js';
+import { CsfloatStore } from '../../db/csfloat.js';
 import type { EngineDatabase } from '../../db/database.js';
 import { surfaceCoverage, type SurfaceCoverage } from './coverage.js';
 import { assertAccountScope, bounded, queryPage, type PageEnvelope, type Param } from './paging.js';
@@ -114,6 +115,8 @@ export type TradeListRow = {
   acceptedAt: string | null;
   /** When Steam settles the trade: for a trade-protected trade, the end of its reversal period. */
   settlesAt: string | null;
+  /** The trade this one reverses, when Steam's history named one: this is the return of a trade-protection rollback. */
+  reversesTradeId: string | null;
   transferState: string | null;
   giveQuantity: number;
   receiveQuantity: number;
@@ -207,6 +210,8 @@ export type TradeCsfloatLink = {
   listingId: string;
   role: 'purchase' | 'sale';
   state: string;
+  /** How the sale ended beyond the venue's word: `reversed` when Steam returned the item and CSFloat refunded the buyer (`CsfloatStore.saleEnding`). */
+  ending: 'reversed' | null;
   priceCents: number | null;
   hashName: string | null;
   floatValue: number | null;
@@ -235,6 +240,8 @@ export type TradeEntry = TradeListRow & {
   initiatedAt: string | null;
   tradeUpdatedAt: string | null;
   settledAt: string | null;
+  /** The trade that returned this one's items after Steam reversed it, once the history has shown it. */
+  reversedByTradeId: string | null;
   firstSeenAt: string | null;
   lastSeenAt: string | null;
   /** Which lines the items come from: Steam's history once it has any, the offer's otherwise. */
@@ -281,7 +288,7 @@ type EntryBase = {
   direction: 'SENT' | 'RECEIVED' | null; offerStatus: string | null; tradeStatus: string | null;
   counterpartySteamId64: string | null; peerAccountId: string | null; phase: TradePhase; stage: TradeStage;
   originClass: TradeOriginClass; flow: TradeFlow; listed: number; sortAt: string; createdAt: string; acceptedAt: string | null;
-  settlesAt: string | null; transferState: string | null;
+  settlesAt: string | null; reversesTradeId: string | null; transferState: string | null;
 };
 
 type LineScope = { accountId: string; source: 'trade' | 'offer'; id: string; peerAccountId: string | null };
@@ -344,12 +351,13 @@ function entriesSql(accounts: readonly string[], asOf: string, where: EntryFilte
         o.created_at AS createdAt,
         COALESCE(t.initiated_at, CASE WHEN o.status='ACCEPTED' THEN o.updated_at END) AS acceptedAt,
         COALESCE(o.settlement_date, t.settled_at) AS settlesAt,
+        t.reverses_trade_id AS reversesTradeId,
         o.message AS message
       FROM trade_offer o JOIN walk w ON w.account_id=o.account_id
       LEFT JOIN executed_trade t ON t.account_id=o.account_id AND t.trade_id=o.trade_id
       UNION ALL
       SELECT t.account_id, 'trade:' || t.trade_id, NULL, t.trade_id, NULL, NULL, t.status, t.counterparty_steam_id64, 1,
-        MAX(t.initiated_at, IFNULL(t.updated_at, '')), t.initiated_at, t.initiated_at, t.settled_at, NULL
+        MAX(t.initiated_at, IFNULL(t.updated_at, '')), t.initiated_at, t.initiated_at, t.settled_at, t.reverses_trade_id, NULL
       FROM executed_trade t
       WHERE t.account_id IN (${marks})
         AND NOT EXISTS (SELECT 1 FROM trade_offer o WHERE o.account_id=t.account_id AND o.trade_id=t.trade_id)
@@ -405,7 +413,7 @@ function entriesSql(accounts: readonly string[], asOf: string, where: EntryFilte
       SELECT y.*, CASE WHEN stage IN ('to-be-confirmed','reversal-period') THEN 'current' ELSE 'past' END AS phase FROM y
     )
     SELECT accountId, entryKey, offerId, tradeId, direction, offerStatus, tradeStatus, counterpartySteamId64, peerAccountId,
-      phase, stage, originClass, flow, listed, sortAt, createdAt, acceptedAt, settlesAt, transferState
+      phase, stage, originClass, flow, listed, sortAt, createdAt, acceptedAt, settlesAt, reversesTradeId, transferState
     FROM z${conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''}`;
   return { sql, params };
 }
@@ -478,7 +486,9 @@ function resolvedLinesSql(scope: LineScope): { sql: string; params: Param[] } {
               (SELECT i.local_id FROM item i WHERE i.account_id=l.account_id
                  AND i.asset_id = CASE l.side WHEN 'GIVE' THEN l.asset_id ELSE l.new_asset_id END)) AS ownId,
             ${peer} AS peerId,
-            (SELECT t.trade_id FROM csfloat_trade t WHERE t.account_id=l.account_id AND t.asset_id=l.asset_id ORDER BY t.trade_id LIMIT 1) AS cfId
+            COALESCE(
+              (SELECT t.trade_id FROM csfloat_trade t WHERE t.account_id=l.account_id AND t.asset_id=l.asset_id AND t.offer_id=l.offer_id LIMIT 1),
+              (SELECT t.trade_id FROM csfloat_trade t WHERE t.account_id=l.account_id AND t.asset_id=l.asset_id ORDER BY t.trade_id DESC LIMIT 1)) AS cfId
           FROM trade_line l WHERE ${lines.sql}
         ) q
         LEFT JOIN item h ON h.local_id=COALESCE(q.ownId, q.peerId)
@@ -495,7 +505,7 @@ type OriginResult = {
   csfloat: TradeCsfloatLink[];
 };
 
-type CsfloatTradeRecord = { trade_id: string; listing_id: string; asset_id: string; state: string; seller_steam_id: string; data_json: string };
+type CsfloatTradeRecord = { trade_id: string; listing_id: string; asset_id: string; state: string; seller_steam_id: string; data_json: string; offer_id: string | null };
 
 /**
  * What the trade was for, strongest evidence first: a transfer this app made, then a CSFloat trade,
@@ -548,21 +558,24 @@ function linkOf(database: EngineDatabase, row: { command_id: string; account_id:
 function csfloatLinksOf(database: EngineDatabase, base: EntryBase, scope: LineScope | null): TradeCsfloatLink[] {
   const raw = database.raw();
   const ownSteamId = database.account(base.accountId)?.steam_id64 ?? null;
+  const store = new CsfloatStore(database);
   const found = new Map<string, TradeCsfloatLink>();
   const add = (row: CsfloatTradeRecord, evidence: TradeCsfloatLink['evidence']): void => {
-    if (!found.has(row.trade_id)) found.set(row.trade_id, csfloatLink(row, ownSteamId, evidence));
+    if (found.has(row.trade_id)) return;
+    const ending = store.saleEnding(base.accountId, { state_word: row.state, data_json: row.data_json, offer_id: row.offer_id });
+    found.set(row.trade_id, csfloatLink(row, ownSteamId, evidence, ending));
   };
   if (base.offerId) {
     // `csfloat_trade_offer` serves the lookup by the offer the venue named.
-    for (const row of raw.prepare(`SELECT trade_id, listing_id, asset_id, state_word AS state, seller_steam_id, data_json FROM csfloat_trade
+    for (const row of raw.prepare(`SELECT trade_id, listing_id, asset_id, state_word AS state, seller_steam_id, data_json, offer_id FROM csfloat_trade
       WHERE account_id=? AND offer_id=? ORDER BY trade_id`).all(base.accountId, base.offerId) as CsfloatTradeRecord[]) add(row, 'offer-id');
-    for (const row of raw.prepare(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json
+    for (const row of raw.prepare(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, c.offer_id
       FROM work_step s JOIN csfloat_trade c ON c.account_id=s.account_id AND c.trade_id=s.target_id
       WHERE s.account_id=? AND s.kind='CSFLOAT_SEND' AND s.offer_id=? ORDER BY c.trade_id`).all(base.accountId, base.offerId) as CsfloatTradeRecord[]) add(row, 'own-delivery');
   }
   if (scope && base.counterpartySteamId64) {
     const lines = lineWhere(scope);
-    const rows = raw.prepare(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, l.side AS side
+    const rows = raw.prepare(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, c.offer_id, l.side AS side
       FROM trade_line l JOIN csfloat_trade c ON c.account_id=l.account_id AND c.asset_id=l.asset_id
       WHERE ${lines.sql} ORDER BY c.trade_id`).all(...lines.params) as Array<CsfloatTradeRecord & { side: TradeSide }>;
     for (const row of rows) {
@@ -584,7 +597,7 @@ function parseTrade(json: string): StoredTrade {
   try { return JSON.parse(json) as StoredTrade; } catch { return {}; }
 }
 
-function csfloatLink(row: CsfloatTradeRecord, ownSteamId: string | null, evidence: TradeCsfloatLink['evidence']): TradeCsfloatLink {
+function csfloatLink(row: CsfloatTradeRecord, ownSteamId: string | null, evidence: TradeCsfloatLink['evidence'], ending: TradeCsfloatLink['ending']): TradeCsfloatLink {
   const data = parseTrade(row.data_json);
   const item = data.listing?.item;
   return {
@@ -592,6 +605,7 @@ function csfloatLink(row: CsfloatTradeRecord, ownSteamId: string | null, evidenc
     listingId: row.listing_id,
     role: row.seller_steam_id === ownSteamId ? 'sale' : 'purchase',
     state: row.state,
+    ending,
     priceCents: typeof data.listing?.priceCents === 'number' ? data.listing.priceCents : null,
     hashName: typeof item?.marketHashName === 'string' ? item.marketHashName : null,
     floatValue: typeof item?.floatValue === 'number' ? item.floatValue : null,
@@ -739,6 +753,10 @@ export function readTradeEntry(database: EngineDatabase, request: TradeEntryRequ
   const trade = base.tradeId
     ? raw.prepare('SELECT * FROM executed_trade WHERE account_id=? AND trade_id=?').get(accountId, base.tradeId) as TradeRow | undefined
     : undefined;
+  // One lookup per opened entry: the return of a reversed trade names it in `reverses_trade_id`.
+  const reversedBy = base.tradeId && base.tradeStatus === 'REVERSED'
+    ? (raw.prepare('SELECT trade_id FROM executed_trade WHERE account_id=? AND reverses_trade_id=? ORDER BY initiated_at LIMIT 1').get(accountId, base.tradeId) as { trade_id: string } | undefined)?.trade_id ?? null
+    : null;
   const seen = (id: number | undefined): string | null => (id === undefined ? null : database.observation(accountId, id)?.finished_at ?? null);
 
   let groups: TradeItemGroup[] = [];
@@ -775,6 +793,7 @@ export function readTradeEntry(database: EngineDatabase, request: TradeEntryRequ
     initiatedAt: trade?.initiated_at ?? null,
     tradeUpdatedAt: trade?.updated_at ?? null,
     settledAt: trade?.settled_at ?? null,
+    reversedByTradeId: reversedBy,
     firstSeenAt: seen(offer?.first_seen_obs ?? trade?.first_seen_obs),
     lastSeenAt: seen(Math.max(offer?.last_seen_obs ?? 0, trade?.last_seen_obs ?? 0) || undefined),
     lineSource: scope?.source ?? null,

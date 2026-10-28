@@ -5,10 +5,10 @@ import type { ActionRow } from '../db/database.js';
 import { TransferStore } from '../db/transfers.js';
 import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { HoldingsStore } from '../db/holdings.js';
-import type { TradeInventoryItem, SendOfferRequest } from '@cslytics/ports';
+import type { TradeInventoryItem, SendOfferRequest, TradeHistoryPage } from '@cslytics/ports';
 import { errorMessage } from '../kernel/support.js';
 import { COMMITTING_STATUSES, offerStatus, reversesDelivery, settlesDelivery, tradeStatus } from '../policy/trade-status.js';
-import { TradeStore } from '../db/trades.js';
+import { TradeStore, type TradeHistoryCoverage } from '../db/trades.js';
 import { LedgerStore } from '../db/ledger.js';
 
 export const TRADE_OFFERS_SURFACE = 'steam-trade-offers';
@@ -26,10 +26,25 @@ export const HISTORY_OVERLAP_MS = 10 * 60_000;
 /** How far back a history walk still re-reads a trade Steam has not settled: escrow is at most 15 days, protection 7. */
 export const UNSETTLED_REREAD_MS = 31 * 86_400_000;
 
-/** Bounds one sync. A pathological account cannot make a single walk unbounded. */
-export const MAX_HISTORY_PAGES = 200;
+/** Bounds one offers walk. A pathological account cannot make a single walk unbounded. */
 export const MAX_OFFER_PAGES = 100;
 export const HISTORY_PAGE_SIZE = 50;
+
+/**
+ * The pages one history walk may read: the top of the log, then as many older pages as are left.
+ *
+ * `GetTradeHistory` refuses a burst. At the desktop's own pace a walk of consecutive pages drew
+ * HTTP 429 after twenty to thirty pages every time (corpus `steam-webapi.ieconservice.get-trade-history`),
+ * and a walk that began again at the newest page after each refusal never reached the end: by
+ * 2026-10-28 one record held 477 such walks for one account and 91 for another, and neither account held a trade
+ * older than the pages a walk read before Steam refused it (history backfill plan §1). A walk now
+ * reads what is new and extends its coverage by a few older pages, each page past the first on the
+ * endpoint's own token (`admitPage`), and the cadence asks again every `HISTORY_BACKFILL_EVERY_MS`
+ * while older pages remain (`policy/cadence.ts`). The pages a refusal interrupted stay read: an
+ * older page is contiguous with the boundary it was read after, so the boundary moves to the last
+ * page that answered, and the next walk reads on from there rather than from the top.
+ */
+export const TRADE_HISTORY_PAGES_PER_WALK = 5;
 
 export type TradeSyncResult = {
   observationId: number;
@@ -40,10 +55,17 @@ export type TradeSyncResult = {
   /** Rows this walk was the first to record. */
   recorded: number;
   checkpointAdvanced: boolean;
+  /** The coverage this walk committed, when it committed one. */
+  coverage?: TradeHistoryCoverage;
+  /** The walk handed the lane back before its pages were spent, because somebody was waiting for it. */
+  yielded?: boolean;
   error?: string;
 };
 
-type HistoryCheckpoint = { afterTimeSeconds: number; afterTradeId: string };
+/** How a history walk asks its host whether to stop short: a page it does not read is read next time. */
+export type HistoryWalkOptions = { yield?: () => boolean };
+
+type HistoryCursor = { afterTimeSeconds: number; afterTradeId: string };
 
 /**
  * Trade observation: the offer book and the executed-trade log.
@@ -55,8 +77,9 @@ type HistoryCheckpoint = { afterTimeSeconds: number; afterTradeId: string };
  *   only an executed trade whose status is `COMPLETE` posts an item movement (TRD-04, N-TRD-01).
  * - **A checkpoint is a promise about coverage.** It advances only inside the transaction that
  *   committed the rows it covers, and only when the walk actually reached its boundary. A failed
- *   page leaves it where it was, so the next sync re-reads rather than skipping (TRD-05,
- *   N-TRD-03).
+ *   page of the top leaves it where it was, so the next sync re-reads rather than skipping
+ *   (TRD-05, N-TRD-03); a failed page of the backfill keeps the boundary the pages before it
+ *   reached, because each was read after the one above (OBS-HIST-03).
  *
  * Money is never invented here. Steam does not price a trade, so every trade posting carries an
  * `UNKNOWN` amount basis rather than a zero (DATA-04).
@@ -151,8 +174,33 @@ export class TradeService {
     return this.walkOffers(accountId);
   }
 
-  syncHistory(accountId: AccountId, pageSize = HISTORY_PAGE_SIZE): Promise<TradeSyncResult> {
-    return this.walkHistory(accountId, pageSize);
+  syncHistory(accountId: AccountId, pageSize = HISTORY_PAGE_SIZE, options: HistoryWalkOptions = {}): Promise<TradeSyncResult> {
+    return this.walkHistory(accountId, pageSize, options);
+  }
+
+  /** The committed coverage of the account's executed trades, or undefined before a walk committed one. */
+  coverage(accountId: string): TradeHistoryCoverage | undefined {
+    return new TradeStore(this.context.database).historyCoverage(accountId);
+  }
+
+  /** Whether older pages of the history remain to be read, which hurries the surface's cadence (`policy/cadence.ts`). */
+  backfillPending(accountId: string): boolean {
+    const coverage = this.coverage(accountId);
+    return coverage !== undefined && !coverage.reachedEnd && !coverage.stopped;
+  }
+
+  /** The pages one walk may read. Isolated so a saboteur can read without end. */
+  protected pagesPerWalk(): number {
+    return TRADE_HISTORY_PAGES_PER_WALK;
+  }
+
+  /**
+   * Takes the endpoint's token for one more page of a walk already admitted. The broker charges a
+   * walk one token; a walk of several pages is several requests to the venue, and is paced as such.
+   * Isolated so a saboteur can page for free.
+   */
+  protected async admitPage(accountId: string): Promise<void> {
+    await this.context.governors.admitRead(accountId, 'steam-web', TRADE_HISTORY_SURFACE);
   }
 
   // --- offers --------------------------------------------------------------
@@ -213,6 +261,19 @@ export class TradeService {
 
     this.context.signals.emit({ kind: 'observed', accountId, surface: TRADE_OFFERS_SURFACE, complete, observationId });
     return { observationId, complete, pagesWalked, observed: offers.length, recorded, checkpointAdvanced: complete, ...(error ? { error } : {}) };
+  }
+
+  /**
+   * Whether a page followed the cursor it was read after: every row new to this walk, none newer
+   * than the cursor, and rows at all when Steam says there are more. A page that fails this is a
+   * cursor that did not advance, which is what `navigating_back` produced for six weeks, and what
+   * a walk must never read as progress (OBS-HIST-04). Isolated so a saboteur can believe the page.
+   */
+  protected follows(page: TradeHistoryPage, after: HistoryCursor, seen: ReadonlySet<string>): boolean {
+    if (page.trades.some((trade) => seen.has(trade.tradeId))) return false;
+    if (!page.trades.length && page.more) return false;
+    const first = page.trades[0];
+    return !(first && after.afterTradeId !== '' && Date.parse(first.initiatedAt) > after.afterTimeSeconds * 1000 + 999);
   }
 
   /**
@@ -288,39 +349,128 @@ export class TradeService {
 
   // --- executed history ----------------------------------------------------
 
-  protected async walkHistory(accountId: AccountId, pageSize: number): Promise<TradeSyncResult> {
+  /**
+   * One walk of the account's executed trades: the newest pages down to what the record already
+   * holds, then, while the walk's pages last, older pages below its boundary.
+   *
+   * The log is keyset-paged, newest first: an older page is read after the last row of the one
+   * above it, so a boundary is a stable place to resume from, which an offset into the market
+   * history is not. The top is read until a page's oldest trade is older than the committed
+   * coverage (`historyBoundaryMs`: its newest trade less the overlap, and further back to the
+   * oldest trade Steam may still change), which joins what was read to the coverage. A first walk
+   * has nothing to join and reads at most its pages from the top; what it read is the coverage,
+   * and the rest of the log is the backfill's, a few pages a walk until the end. A later top that
+   * outran the walk's pages restarts the coverage at what was read, contiguous from the newest
+   * trade, and what lay below is backfilled again (`history-coverage-rebased`), as the market
+   * history does. A page whose rows the walk already holds, or that claims more rows while
+   * carrying none, is a cursor that did not advance: it fails the top, and it stops the backfill
+   * with a reason, since a cursor that lies is not a thing to reason past.
+   *
+   * A failed page of the top commits no coverage (rule 5), though every trade read is a fact worth
+   * keeping (N-TRD-03). A failed page of the backfill keeps the boundary the pages before it
+   * reached: they were read after the boundary in turn, so the segment is still contiguous, and a
+   * refusal costs one page rather than the walk. The walk is incomplete either way, so the broker
+   * holds the scope and answers no need from it.
+   */
+  protected async walkHistory(accountId: AccountId, pageSize: number, options: HistoryWalkOptions): Promise<TradeSyncResult> {
     const { database } = this.context;
     const startedAt = this.context.now();
+    const previous = this.coverage(accountId);
     const boundaryMs = this.historyBoundaryMs(accountId);
-
+    const heldRow = database.raw().prepare(`SELECT 1 FROM executed_trade WHERE account_id=? AND trade_id=?`);
+    const seen = new Set<string>();
     const trades: ExecutedTrade[] = [];
     let pagesWalked = 0;
-    let cursor: HistoryCheckpoint = { afterTimeSeconds: 0, afterTradeId: '' };
+    let total: number | null = null;
+    let error: string | undefined;
+    let coverage: TradeHistoryCoverage | undefined;
+    let coveredThrough: string | null = previous ? database.checkpoint(accountId, TRADE_HISTORY_SURFACE)?.covered_through ?? null : null;
+    let rebased = false;
+    let yielded = false;
+
+    const read = async (after: HistoryCursor): Promise<TradeHistoryPage> => {
+      if (pagesWalked > 0) await this.admitPage(accountId);
+      const page = await this.context.ports.trade.getTradeHistoryPage(accountId, { ...after, maxTrades: pageSize });
+      pagesWalked += 1;
+      if (page.totalTrades !== null) total = page.totalTrades;
+      if (!this.follows(page, after, seen)) throw new Error('history-cursor-did-not-advance');
+      for (const trade of page.trades) seen.add(trade.tradeId);
+      return page;
+    };
+    const oldestOf = (page: TradeHistoryPage): ExecutedTrade | undefined => page.trades[page.trades.length - 1];
+
+    // 1. The top of the log, down to the covered segment.
+    let newest: ExecutedTrade | undefined;
+    let oldest: ExecutedTrade | undefined;
     let reachedEnd = false;
     let crossedBoundary = false;
-    let error: string | undefined;
-
+    let outran = false;
     try {
+      let cursor: HistoryCursor = { afterTimeSeconds: 0, afterTradeId: '' };
       for (;;) {
-        const page = await this.context.ports.trade.getTradeHistoryPage(accountId, { ...cursor, maxTrades: pageSize });
-        pagesWalked += 1;
+        const page = await read(cursor);
         trades.push(...page.trades);
-        if (!page.more || page.trades.length === 0) { reachedEnd = true; break; }
-        const oldest = page.trades[page.trades.length - 1]!;
-        if (Date.parse(oldest.initiatedAt) < boundaryMs) { crossedBoundary = true; break; }
-        if (pagesWalked >= MAX_HISTORY_PAGES) throw new Error('history-walk-page-limit');
-        cursor = { afterTimeSeconds: Math.floor(Date.parse(oldest.initiatedAt) / 1000), afterTradeId: oldest.tradeId };
+        newest ??= page.trades[0];
+        oldest = oldestOf(page) ?? oldest;
+        if (!page.more) { reachedEnd = true; break; }
+        if (oldest && Date.parse(oldest.initiatedAt) < boundaryMs) { crossedBoundary = true; break; }
+        if (pagesWalked >= this.pagesPerWalk()) { outran = true; break; }
+        // A first walk has nothing to join, so it may stop for a person as the backfill does.
+        if (!previous && options.yield?.()) { outran = true; yielded = true; break; }
+        cursor = cursorOf(oldest!);
       }
-      if (new Set(trades.map((trade) => trade.tradeId)).size !== trades.length) throw new Error('history-walk-duplicate-trade-ids');
+    } catch (caught) {
+      error = errorMessage(caught);
+    }
+    const joined = this.historyCoverageIsContiguous({ failed: error !== undefined, reachedEnd, crossedBoundary });
+    if (previous && joined) {
+      const fresh = trades.filter((trade) => heldRow.get(accountId, trade.tradeId) === undefined).length;
+      const deeper = oldest !== undefined && Date.parse(oldest.initiatedAt) < previous.boundaryTimeSeconds * 1000;
+      coverage = {
+        ...previous,
+        ...(newest ? cursorOf(newest) : {}),
+        ...(deeper ? { boundaryTimeSeconds: seconds(oldest!.initiatedAt), boundaryTradeId: oldest!.tradeId } : {}),
+        coveredCount: previous.coveredCount + fresh,
+        total: total ?? previous.total,
+        reachedEnd: previous.reachedEnd || reachedEnd
+      };
+      if (newest) coveredThrough = newest.initiatedAt;
+    } else if (joined || (error === undefined && outran)) {
+      // The first segment, or a top that outran the walk's pages: the coverage is what was read.
+      rebased = previous !== undefined;
+      coverage = newest && oldest
+        ? { ...cursorOf(newest), boundaryTimeSeconds: seconds(oldest.initiatedAt), boundaryTradeId: oldest.tradeId, coveredCount: trades.length, total, reachedEnd }
+        : { afterTimeSeconds: 0, afterTradeId: '', boundaryTimeSeconds: 0, boundaryTradeId: '', coveredCount: 0, total, reachedEnd };
+      coveredThrough = newest?.initiatedAt ?? null;
+    }
+
+    // 2. Older pages below the boundary, while the walk's pages last and nobody waits for the lane.
+    try {
+      while (error === undefined && coverage && !coverage.reachedEnd && !coverage.stopped && coverage.boundaryTradeId !== '' && pagesWalked < this.pagesPerWalk()) {
+        if (options.yield?.()) { yielded = true; break; }
+        let page: TradeHistoryPage;
+        try {
+          page = await read({ afterTimeSeconds: coverage.boundaryTimeSeconds, afterTradeId: coverage.boundaryTradeId });
+        } catch (caught) {
+          if (errorMessage(caught) === 'history-cursor-did-not-advance') { coverage = { ...coverage, stopped: 'history-cursor-did-not-advance' }; break; }
+          throw caught;
+        }
+        trades.push(...page.trades);
+        const last = oldestOf(page);
+        coverage = {
+          ...coverage,
+          coveredCount: coverage.coveredCount + page.trades.length,
+          total: total ?? coverage.total,
+          reachedEnd: !page.more,
+          ...(last ? { boundaryTimeSeconds: seconds(last.initiatedAt), boundaryTradeId: last.tradeId } : {})
+        };
+      }
     } catch (caught) {
       error = errorMessage(caught);
     }
 
-    const complete = this.historyCoverageIsContiguous({ failed: error !== undefined, reachedEnd, crossedBoundary });
-    const newest = newestOf(trades);
+    const complete = error === undefined;
     let recorded = 0;
-    let checkpointAdvanced = false;
-
     const observationId = database.transaction(() => {
       const obs = database.insertObservation({
         accountId,
@@ -329,26 +479,25 @@ export class TradeService {
         finishedAt: this.context.now(),
         complete,
         pagesWalked,
-        totalExpected: trades.length,
+        totalExpected: total ?? trades.length,
         ...(error === undefined ? {} : { error })
       });
+      // Trade rows are point facts: one that was read is true whether or not a later page failed.
       for (const trade of trades) if (this.persistTrade(accountId, trade, obs)) recorded += 1;
-      if (complete && newest) {
-        database.advanceCheckpoint({
-          accountId,
-          surface: TRADE_HISTORY_SURFACE,
-          cursor: { afterTimeSeconds: Math.floor(Date.parse(newest.initiatedAt) / 1000), afterTradeId: newest.tradeId },
-          coveredThrough: newest.initiatedAt,
-          observationId: obs,
-          now: this.context.now()
-        });
-        checkpointAdvanced = true;
+      // The coverage moves only with the rows that join it, in the transaction that writes them,
+      // so a restart cannot keep the one without the other and a failed top cannot make the next
+      // walk skip the trades it never saw.
+      if (coverage) {
+        database.advanceCheckpoint({ accountId, surface: TRADE_HISTORY_SURFACE, cursor: coverage, coveredThrough, observationId: obs, now: this.context.now() });
+        if (rebased) database.addEvent(accountId, 'history-coverage-rebased', { surface: TRADE_HISTORY_SURFACE, coveredCount: coverage.coveredCount, total: coverage.total }, this.context.now());
+        if (coverage.stopped && coverage.stopped !== previous?.stopped) database.addEvent(accountId, 'history-backfill-stopped', { surface: TRADE_HISTORY_SURFACE, reason: coverage.stopped, coveredCount: coverage.coveredCount }, this.context.now());
       }
       return obs;
     });
 
     this.context.signals.emit({ kind: 'observed', accountId, surface: TRADE_HISTORY_SURFACE, complete, observationId });
-    return { observationId, complete, pagesWalked, observed: trades.length, recorded, checkpointAdvanced, ...(error ? { error } : {}) };
+    return { observationId, complete, pagesWalked, observed: trades.length, recorded, checkpointAdvanced: coverage !== undefined,
+      ...(coverage ? { coverage } : {}), ...(yielded ? { yielded } : {}), ...(error ? { error } : {}) };
   }
 
   /**
@@ -371,9 +520,15 @@ export class TradeService {
       initiated_at: trade.initiatedAt,
       updated_at: trade.updatedAt ?? null,
       settled_at: trade.settledAt ?? null,
-      reverses_trade_id: null,
+      reverses_trade_id: trade.rollbackOf ?? null,
       observation_id: observationId
     });
+    // The first read of a reversal is the fact a person is told of (delivery retries plan D11): once per
+    // trade, however many walks read the 12 again. The return trade posts the items' way back itself.
+    if (changed && status === 'REVERSED') {
+      database.addEventOnce(accountId, 'trade-reversed', { tradeId: trade.tradeId, offerId, counterpartySteamId64: trade.counterpartySteamId64,
+        assetIds: trade.given.map((line) => line.assetId) }, this.context.now());
+    }
 
     const sides = [['GIVE', trade.given], ['RECEIVE', trade.received]] as const;
     for (const [side, lines] of sides) {
@@ -532,10 +687,11 @@ function lineKey(tradeId: string | null, offerId: string | null, side: 'GIVE' | 
   return `${tradeId ? `trade:${tradeId}` : `offer:${offerId ?? ''}`}:${side}:${line.assetId}`;
 }
 
-function newestOf(trades: readonly ExecutedTrade[]): ExecutedTrade | undefined {
-  let newest: ExecutedTrade | undefined;
-  for (const trade of trades) {
-    if (!newest || Date.parse(trade.initiatedAt) > Date.parse(newest.initiatedAt)) newest = trade;
-  }
-  return newest;
+/** The keyset a page after this trade is read with: Steam's own `time_init` and `tradeid`. */
+function cursorOf(trade: ExecutedTrade): HistoryCursor {
+  return { afterTimeSeconds: seconds(trade.initiatedAt), afterTradeId: trade.tradeId };
+}
+
+function seconds(iso: string): number {
+  return Math.floor(Date.parse(iso) / 1000);
 }

@@ -10,6 +10,10 @@ import { currencyById, currencyByCode, formatUnits, type Converted, type Figure,
  * them, because a symbol alone is six Steam currencies, and there is no default currency: a
  * caller that does not know what currency a figure is in says so, and the figure says so too.
  *
+ * A figure that is sent is never converted (AGENTS.md rule 9, plan D17). Everything here is for
+ * what the window shows: a price is typed or pressed in the account's own currency, from a figure
+ * named in it, and nothing on its way to a venue goes through `formatConverted` or a rate.
+ *
  * `formatCents` used to default to AUD, which is wrong for anyone whose wallet is in another
  * currency. It is gone; `formatAmount` takes the currency or prints that it is unknown.
  */

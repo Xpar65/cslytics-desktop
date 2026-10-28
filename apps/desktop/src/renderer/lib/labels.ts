@@ -307,6 +307,9 @@ export const DESTINATION: Readonly<Record<string, Destination>> = {
   CSFLOAT_REPRICE: { icon: 'pencil', verb: 'Repricing', done: 'Repriced', venue: 'csfloat' },
   CSFLOAT_CANCEL: { icon: 'trash', verb: 'Delisting', done: 'Delisted', venue: 'csfloat', joiner: 'from' },
   CSFLOAT_DELIVER: { icon: 'send', verb: 'Delivering', done: 'Delivered', venue: 'csfloat', joiner: 'sold on' },
+  // The engine's own confirmation of a listing or an offer its work made. Only a host that composed a
+  // confirmation port does this; the desktop never does, and this row is for a window over such a host.
+  CONFIRM: { icon: 'smartphone', verb: 'Confirming', done: 'Confirmed', venue: 'steam', noun: 'confirmation' },
   // An in-game store purchase: its hops name the entries bought, not an item this app holds.
   STORE_PURCHASE: { icon: 'shopping-cart', verb: 'Buying', done: 'Bought', venue: 'steam', joiner: 'from the store on', noun: 'store purchase' },
   // Work about a buy order, which names no item. The engine calls a Steam one by its action's
@@ -443,6 +446,8 @@ export const CSFLOAT_STATE: Readonly<Record<string, StateLabel>> = {
   pending: { label: 'Awaiting delivery', tone: 'accent', icon: 'send' },
   verified: { label: 'Delivered', tone: 'positive', icon: 'check-circle' },
   failed: { label: 'Failed', tone: 'negative', icon: 'x-circle' },
+  // A `failed` sale whose buyer had taken the item: Steam reversed the trade and CSFloat refunded the buyer (`TradeCsfloatLink.ending`).
+  reversed: { label: 'Reversed', tone: 'negative', icon: 'undo' },
   QUEUED: { label: 'Queued', tone: 'accent', icon: 'hourglass' },
   RUNNING: { label: 'In progress', tone: 'accent', icon: 'loader' },
   AWAITING_OBSERVATION: { label: 'Awaiting observation', tone: 'accent', icon: 'eye' },

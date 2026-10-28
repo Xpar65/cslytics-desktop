@@ -496,8 +496,51 @@ export const MIGRATIONS: readonly Migration[] = [
       // that reached this build without any had five weeks of guessed plans behind it.
       sqlite.exec('ANALYZE');
     }
+  },
+  {
+    version: 30,
+    name: 'a command says whose it is; a confirmation is a hop',
+    foreignKeysOff: true,
+    up(sqlite) {
+      // Strategy authority and confirmations plan D1: every command written before this was a person's.
+      addColumn(sqlite, 'command', 'authority', "TEXT NOT NULL DEFAULT 'HUMAN' CHECK(authority IN ('HUMAN', 'STRATEGY'))");
+      // D9: the engine's own confirmation is a hop of its own kind, which the step alphabet must admit.
+      rebuildTable(sqlite, 'work_step', WORK_STEP_30, "'CONFIRM'",
+        ['id', 'command_id', 'account_id', 'local_id', 'target_id', 'offer_id', 'ordinal', 'kind', 'state', 'action_id', 'desired_id', 'reason', 'params_json', 'observation_id', 'deadline_at', 'created_at', 'updated_at']);
+    }
+  },
+  {
+    version: 31,
+    name: "an attempt keeps the venue's own wait",
+    up(sqlite) {
+      // Delivery retries plan D1, D2: a refusal of the moment (a rate limit, Steam's offer cap) names
+      // when the same request may go again, and the engine holds the work until then. Every attempt
+      // written before this was answered without one.
+      addColumn(sqlite, 'attempt', 'retry_after', 'TEXT');
+    }
   }
 ];
+
+/** `work_step` as migration 30 rebuilds it: migration 29's shape with `CONFIRM` in its alphabet. */
+const WORK_STEP_30 = `CREATE TABLE IF NOT EXISTS work_step (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL REFERENCES command(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  local_id TEXT,
+  target_id TEXT,
+  offer_id TEXT,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('DELIST', 'LIST', 'RETRIEVE', 'STORE', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL', 'SEND', 'ACCEPT', 'CANCEL', 'CSFLOAT_CREATE', 'CSFLOAT_AWAIT_VENUE', 'CSFLOAT_REPRICE', 'CSFLOAT_CANCEL', 'CSFLOAT_ACCEPT', 'CSFLOAT_SEND', 'CSFLOAT_NOTIFY', 'CSFLOAT_CANNOT_DELIVER', 'CSFLOAT_BUY_ORDER_EDIT', 'CSFLOAT_BUY_ORDER_CANCEL', 'STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL', 'CONFIRM')),
+  state TEXT NOT NULL CHECK(state IN ('QUEUED', 'SENT', 'AWAITING_OBSERVATION', 'RETRYING', 'DONE', 'FAILED', 'STOPPED')),
+  action_id TEXT REFERENCES action(id),
+  desired_id TEXT REFERENCES desired_state(id),
+  reason TEXT,
+  params_json TEXT,
+  observation_id INTEGER REFERENCES observation(id),
+  deadline_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT`;
 
 /**
  * The frozen shapes migration 29 rebuilds to. Copies of the declaration as it stood when the

@@ -9,6 +9,7 @@
     "./trade": "./src/trade.ts"
   },
   "dependencies": {
+    "@cslytics/market-data": "workspace:*",
     "@cslytics/ports": "workspace:*",
     "globaloffensive": "^3.2.0",
     "long": "^5.3.2",

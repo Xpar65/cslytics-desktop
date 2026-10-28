@@ -5,7 +5,7 @@ import { VenueMark } from '../../components/VenueMark.js';
 import { Avatar } from '../../components/Avatar.js';
 import { engine } from '../../lib/engine.js';
 import { formatAmount } from '../../lib/money.js';
-import { currencyCode, formatDateTime, formatRelative, plural, shortId, surfaceLabel } from '../../lib/labels.js';
+import { currencyCode, formatDateTime, formatRelative, plural, surfaceLabel } from '../../lib/labels.js';
 import { isOverdue, type WaitingRow, type WaitingState } from './use-waiting.js';
 
 /**
@@ -104,9 +104,7 @@ export function WaitingList({ waiting, accountIds, accounts = [], onOpenListings
         <Empty
           icon="check-circle"
           title="Nothing is waiting on you"
-          hint={unwalked.length > 0
-            ? 'Nothing has been walked yet on at least one surface, so this is what has been observed rather than what is true.'
-            : 'Listings and trade offers Steam is holding for a phone confirmation appear here.'}
+          hint={unwalked.length > 0 ? <Caption icon="alert-triangle" tone="warn">Not every surface has been walked yet</Caption> : undefined}
         />
       ) : null}
 
@@ -186,8 +184,6 @@ function WaitingLine({ row }: { row: WaitingRow }): React.JSX.Element {
           {row.expiresAt ? (
             <><span className="sep">·</span><span><Icon name="clock" size={11} /> expires {formatDateTime(row.expiresAt)}</span></>
           ) : null}
-          <span className="sep">·</span>
-          <span className="quiet">#{shortId(row.id, 5)}</span>
         </span>
       </span>
       <Badge tone={overdue ? 'warn' : 'accent'} icon="smartphone">

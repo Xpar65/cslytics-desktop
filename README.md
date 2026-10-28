@@ -85,10 +85,9 @@ pnpm package:desktop   # an unsigned installer in apps\desktop\dist
 | Path | Is |
 |---|---|
 | `apps/desktop` | the Electron app: main process, the window, updates and the release policy |
-| `apps/host` | the same engine headless: a command line and an HTTP surface over one trading record, with the venues composed by a ports module you name |
 | `packages/engine` | desired state, observation and convergence; the only writer of the trading record |
 | `packages/ports` | the contract vocabulary between the engine and the outside world |
-| `packages/runtime` | the command schema and the one dispatch table the desktop and the host both answer from |
+| `packages/runtime` | the command schema and the one dispatch table the desktop answers from, with the record opener and the single-writer lock |
 | `packages/adapters-steam` | Steam: sign-in, the Game Coordinator, inventory, market, trades |
 | `packages/adapters-csfloat` | CSFloat |
 | `packages/catalogue` | item names and images, outside the engine |

@@ -6,10 +6,10 @@
  * theme recolour every screen without an edit to this file.
  *
  * Motion is deliberate and short: surfaces fade and rise as they arrive, a drawer slides from
- * the edge it belongs to, a spinner turns while a request is out, and nothing else moves. Every
- * animation is a transform or an opacity. Entrance motion is switched off under
- * `prefers-reduced-motion`; a spinner or indeterminate bar is not, because that is the only
- * signal that a wait is still in progress.
+ * the edge it belongs to, a spinner turns while a request is out, a live figure flashes once when
+ * a read changes it, and nothing else moves. Every animation is a transform or an opacity.
+ * Entrance motion and the flashes are switched off under `prefers-reduced-motion`; a spinner or
+ * indeterminate bar is not, because that is the only signal that a wait is still in progress.
  */
 
 * { box-sizing: border-box; }
@@ -73,6 +73,8 @@ a { color: var(--cs-accent-text); }
 @keyframes cs-ping { 0% { transform: scale(1); opacity: 0.7; } 100% { transform: scale(2.4); opacity: 0; } }
 @keyframes cs-shimmer { from { background-position: -200% 0; } to { background-position: 200% 0; } }
 @keyframes cs-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes cs-flash { from { opacity: 0.32; } to { opacity: 0; } }
+@keyframes cs-fade-out { 0%, 40% { opacity: 1; } 100% { opacity: 0; } }
 @keyframes cs-indeterminate {
   0% { transform: translateX(-120%); }
   100% { transform: translateX(320%); }
@@ -86,6 +88,7 @@ a { color: var(--cs-accent-text); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+  .items-flash, .items-move { display: none; }
   .spin, .spinner .icon,
   .status[data-tone='busy'] .status-icon .icon,
   .nav-item[data-busy='true'] .icon,
@@ -230,7 +233,6 @@ a { color: var(--cs-accent-text); }
 .brand-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .brand-mark { font-family: var(--cs-font-display); font-size: 15px; font-weight: 700; letter-spacing: -0.02em; color: var(--cs-text-strong); line-height: 1.1; }
 .brand-mark span { color: var(--cs-accent-ink); }
-.brand-sub { font-size: 11.5px; color: var(--cs-text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .nav-label {
   margin: 12px 10px 4px;
@@ -369,9 +371,6 @@ a { color: var(--cs-accent-text); }
   color: var(--cs-accent-ink);
 }
 .topbar h1 { margin: 0; font-family: var(--cs-font-display); font-size: 19px; font-weight: 600; letter-spacing: -0.015em; color: var(--cs-text-strong); line-height: 1.2; }
-.topbar-subtitle { margin-top: 2px; font-size: 12.5px; line-height: 1.45; color: var(--cs-text-muted); }
-/* The section's own line stands in until the open page puts its description in the slot. */
-.topbar-subtitle-slot:not(:empty) + .topbar-blurb { display: none; }
 .topbar-right { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 0 1 auto; margin-left: auto; }
 .topbar-actions { flex-wrap: nowrap; }
 .topbar-actions:empty { display: none; }
@@ -1081,7 +1080,6 @@ a { color: var(--cs-accent-text); }
 .signin-account:disabled { opacity: 0.55; cursor: not-allowed; }
 .signin-account-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .signin-account-name { font-weight: 600; color: var(--cs-text-strong); }
-.signin-account-meta { font-size: 12px; color: var(--cs-text-faint); }
 .signin-divider { display: flex; align-items: center; gap: 10px; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--cs-text-faint); }
 .signin-divider::before, .signin-divider::after { content: ''; flex: 1; height: 1px; background: var(--cs-border-faint); }
 .qr-frame { position: relative; display: grid; place-items: center; padding: 14px; background: var(--cs-qr-ground); border-radius: var(--cs-radius-lg); animation: cs-scale-in var(--cs-dur-slow) var(--cs-ease-out) both; }
@@ -1418,6 +1416,14 @@ a { color: var(--cs-accent-text); }
 
 /* ---------- progress bars ---------- */
 
+.history-rows { display: grid; gap: 12px; }
+.history-row { display: grid; gap: 5px; }
+.history-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.history-name { font-weight: 500; }
+.history-figure { color: var(--cs-text-muted); font-size: 11.5px; }
+.history-state { font-size: 11.5px; }
+.history-row[data-state='paused'] .history-state, .history-row[data-state='stopped'] .history-state { color: var(--cs-negative); }
+
 .progress-bar { height: 6px; border-radius: var(--cs-radius-full); background: var(--cs-wash); border: 1px solid var(--cs-border-faint); overflow: hidden; }
 .progress-bar-fill { height: 100%; border-radius: inherit; background: var(--cs-text-muted); transition: width var(--cs-dur-slow) var(--cs-ease); }
 .progress-bar[data-tone='accent'] .progress-bar-fill { background: var(--cs-accent); }
@@ -1451,11 +1457,12 @@ a { color: var(--cs-accent-text); }
 .settings-nav-item .conn-dot { margin-left: auto; }
 .settings-page { display: flex; flex-direction: column; gap: 16px; min-width: 0; animation: cs-rise var(--cs-dur-slow) var(--cs-ease-out) both; }
 .settings-foot { display: flex; justify-content: flex-end; padding-top: 4px; border-top: 1px solid var(--cs-border-faint); }
+/* A connected host's page: the frame its view is drawn over (remote engine host plan D12). */
+.host-page-frame { flex: 1; min-height: 480px; border: 1px dashed var(--cs-border-faint); border-radius: var(--cs-radius-lg, 10px); display: flex; align-items: center; justify-content: center; color: var(--cs-text-faint); font-size: 12px; }
 .settings-action { display: flex; align-items: center; gap: 14px; }
 .settings-action + .settings-action { padding-top: 12px; border-top: 1px solid var(--cs-border-faint); }
 .settings-action-text { flex: 1; min-width: 0; }
 .settings-action-title { font-size: 13px; font-weight: 600; color: var(--cs-text); }
-.settings-action-hint { margin-top: 2px; font-size: 12px; line-height: 1.45; color: var(--cs-text-faint); }
 @media (max-width: 860px) {
   .settings-layout { grid-template-columns: 1fr; }
   .settings-rail { position: static; flex-direction: row; flex-wrap: wrap; gap: 4px; }
@@ -1483,7 +1490,6 @@ a { color: var(--cs-accent-text); }
 .theme-option-label { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: var(--cs-text); }
 .theme-option-label .icon { color: var(--cs-text-muted); }
 .theme-option-label .theme-option-check { margin-left: auto; color: var(--cs-accent-ink); }
-.theme-option-hint { font-size: 12px; color: var(--cs-text-faint); }
 
 /* A small window: frame, rail, and a panel with a primary button and the two P&L marks. */
 .theme-preview {
@@ -2145,28 +2151,36 @@ a { color: var(--cs-accent-text); }
   font-size: 11.5px; color: var(--cs-text-faint);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.listing-dock .listing-bulk-summary > .venue-mark { margin-left: 8px; }
 .listing-dock .listing-bulk-body { display: flex; flex-direction: column; gap: 8px; padding: 2px 10px 10px; }
-.listing-dock .listing-bulk-foot { display: flex; align-items: flex-end; gap: 10px; }
-.listing-dock .listing-bulk-foot > .caption { flex: 1; min-width: 0; }
-/* A caption with an emphasised clause in it is a sentence, not a row of chips. */
-.listing-dock .listing-bulk .caption { display: block; line-height: 1.5; }
-.listing-dock .listing-bulk .caption > .icon { vertical-align: -2px; margin-right: 5px; }
+/* From the market in one press each: a strip of small buttons above the fields they write to. */
+.listing-dock .listing-strategies { display: flex; flex-wrap: wrap; gap: 6px; }
+.listing-dock .listing-bulk-summary .listing-figures > .icon { color: var(--cs-accent-text); }
+/* Apply to all and the ⓘ that says what the section does, at the end of the controls' row. */
+.listing-dock .listing-bulk-apply { display: inline-flex; align-items: center; gap: 4px; justify-self: end; }
+
+/* Two figures and the way between them: what you receive, what the buyer pays. The code once, after both. */
+.listing-dock .listing-figures { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.listing-dock .listing-figures > .icon { color: var(--cs-text-faint); }
+.listing-dock .listing-code { font-size: 10px; font-weight: 500; letter-spacing: 0.02em; color: var(--cs-text-faint); }
+
+/* An explanation on a mark or a chip: the tip's underline belongs under a word, not an icon. */
+.listing-dock .tip-target { display: inline-flex; align-items: center; text-decoration: none; }
 
 /*
  * The price and marketplace controls, for a row and for every row, on one grid.
  *
  * Each cell is a label over a control, and every control is the same height, so the bottoms line
- * up and so do the tops. They did not before: the Select takes `input-sm` on its wrapper, which
- * gave the wrapper the field's padding on top of the control's own and sat the marketplace a few
- * pixels off the money field beside it.
+ * up and so do the tops. The two money fields are fixed widths; the marketplace is its marks and
+ * takes what they need; the button is pushed to the end. For every row the last cell is Apply to
+ * all and its ⓘ instead of the button.
  */
 .listing-dock .listing-controls {
   display: grid;
-  grid-template-columns: 112px 112px minmax(0, 1fr) auto;
+  grid-template-columns: 112px 112px auto minmax(0, 1fr);
   align-items: end;
   column-gap: 8px;
 }
-.listing-dock .listing-controls[data-bulk] { grid-template-columns: 112px 112px minmax(0, 1fr); }
 .listing-dock .listing-control { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .listing-dock .listing-control-label {
   display: flex; align-items: baseline; gap: 4px;
@@ -2175,15 +2189,14 @@ a { color: var(--cs-accent-text); }
 }
 /* What the venue takes, beside the figure it is added to. The breakdown is its tooltip. */
 .listing-dock .listing-control-fee { margin-left: auto; font-size: 10.5px; color: var(--cs-text-faint); cursor: help; }
-.listing-dock .select-wrap.input-sm { padding: 0; width: 100%; }
-.listing-dock .select-wrap.input-sm > .select { padding: 0 30px 0 8px; font-size: 12px; }
 .listing-dock .price-input .input,
-.listing-dock .select-wrap.input-sm > .select,
-.listing-dock .listing-row-fixed,
+.listing-dock .listing-venue,
 .listing-dock .listing-controls .btn { height: 28px; box-sizing: border-box; }
 .listing-dock .price-input .input { padding-top: 0; padding-bottom: 0; }
 /* The figure worked out from the other one reads quieter than the one that was typed. */
 .listing-dock .price-input .input[data-derived] { color: var(--cs-text-muted); }
+/* Typed and not a price: the field says so itself. */
+.listing-dock .price-input .input[aria-invalid] { border-color: var(--cs-negative-border); color: var(--cs-negative); }
 
 /* A price field that says it is one. */
 .listing-dock .price-input { position: relative; display: block; min-width: 0; }
@@ -2194,12 +2207,38 @@ a { color: var(--cs-accent-text); }
 .listing-dock .price-input .input { padding-left: 19px; }
 
 /*
- * One row per item, in two bands: what it is, then what is being decided about it.
+ * Which marketplace: the venues' marks in one pill, the chosen one lit, a venue the row cannot
+ * reach greyed with why in its tip. A row with nowhere else to go shows its one mark and no choice.
+ */
+.listing-dock .listing-venue {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius);
+  background: var(--cs-surface-inset);
+}
+.listing-dock .listing-venue-item {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 22px; padding: 0; margin: 0;
+  border: 0; border-radius: calc(var(--cs-radius) - 2px);
+  background: transparent; color: inherit; cursor: pointer;
+  opacity: 0.55;
+  transition: background-color var(--cs-dur-fast), opacity var(--cs-dur-fast);
+}
+.listing-dock .listing-venue-item:hover:not(:disabled) { opacity: 1; background: var(--cs-hover); }
+.listing-dock .listing-venue-item[aria-checked='true'] { opacity: 1; background: var(--cs-accent-wash); box-shadow: inset 0 0 0 1px var(--cs-accent-border); }
+.listing-dock .listing-venue-item:disabled { opacity: 0.3; cursor: not-allowed; }
+.listing-dock .listing-venue-item:focus-visible { outline: 2px solid var(--cs-accent-ink); outline-offset: -2px; }
+.listing-dock .listing-venue-fixed { padding: 0 8px; gap: 0; }
+
+/*
+ * One row per item, in two bands: what it is and what the market says, then what is being
+ * decided about it.
  *
  * Side by side on one line looked tidier in a mock-up and did not survive real names — each row
  * is its own grid, so auto columns sized to that row's own content and no two rows lined up.
  * The controls band is the fix in both directions: the widths are fixed or flexible rather than
- * intrinsic, so every row's price box, marketplace and button share an edge.
+ * intrinsic, so every row's price box, marketplace and button share an edge. The name has a line
+ * to itself; under it, the facts on the left and the order book on the right.
  */
 .listing-dock .listing-rows { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .listing-dock .listing-row {
@@ -2212,8 +2251,8 @@ a { color: var(--cs-accent-text); }
   background: var(--cs-surface);
 }
 .listing-dock .listing-row > .item-thumbnail { grid-column: 1; grid-row: 1; }
-.listing-dock .listing-row-text { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.listing-dock .listing-row-drop { grid-column: 3; grid-row: 1; justify-self: end; color: var(--cs-text-faint); }
+.listing-dock .listing-row-text { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.listing-dock .listing-row-drop { grid-column: 3; grid-row: 1; justify-self: end; align-self: start; color: var(--cs-text-faint); }
 .listing-dock .listing-row > .listing-controls, .listing-dock .listing-row > .caption { grid-column: 1 / -1; }
 /* A pressed row leaves for the work panel at once; the only state that comes back is a refusal. */
 .listing-dock .listing-row[data-state='refused'] { border-color: var(--cs-negative-border); }
@@ -2221,23 +2260,62 @@ a { color: var(--cs-accent-text); }
   font-size: 12.5px; font-weight: 500; color: var(--cs-text-strong);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.listing-dock .listing-row-meta { display: flex; align-items: center; gap: 4px; font-size: 11.5px; min-width: 0; }
+.listing-dock .listing-row-line { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.listing-dock .listing-row-meta { display: flex; align-items: center; gap: 6px; font-size: 11.5px; min-width: 0; white-space: nowrap; }
+.listing-dock .listing-row-meta > .tip-target > .icon { color: var(--cs-text-faint); }
+.listing-dock .listing-row-float { display: inline-flex; align-items: center; gap: 5px; }
+.listing-dock .listing-row-account { color: var(--cs-text-faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.listing-dock .listing-row-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 
-.listing-dock .listing-row-fixed {
-  display: flex; align-items: center; gap: 6px;
-  padding: 0 9px;
-  border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius);
+/* A word or two on the row; the sentence is in its tip. */
+.listing-dock .listing-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 7px;
+  border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius-full);
   background: var(--cs-wash);
-  font-size: 12px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 10.5px; color: var(--cs-text-muted);
+  white-space: nowrap;
 }
-.listing-dock .listing-row-act { flex: none; }
+.listing-dock .listing-chip[data-tone='warn'] { border-color: var(--cs-accent-border); color: var(--cs-accent-text); }
+
+/*
+ * The Steam order book on a line: bid, mid, ask. On a dock row each is a press that prices the
+ * row at it; on the inspector each is a figure to read. The dot is lit while the read is current
+ * and goes grey as it ages; the code names the currency once.
+ */
+.listing-book { display: inline-flex; align-items: center; gap: 8px; flex: none; font-size: 11.5px; white-space: nowrap; }
+.listing-book[data-state='waiting'] .spin { animation: cs-spin 900ms linear infinite; }
+.listing-book .venue-mark { margin-right: 4px; opacity: 0.7; }
+.listing-quote {
+  display: inline-flex; align-items: baseline; gap: 4px;
+  padding: 1px 4px; margin: 0;
+  border: 0; border-radius: var(--cs-radius);
+  background: transparent; color: var(--cs-text); cursor: pointer;
+  font: inherit; font-size: 11.5px;
+  transition: background-color var(--cs-dur-fast);
+}
+.listing-quote:hover:not(:disabled) { background: var(--cs-hover); }
+.listing-quote:focus-visible { outline: 2px solid var(--cs-accent-ink); outline-offset: 0; }
+.listing-quote:disabled { cursor: default; }
+.listing-quote-label { font-size: 9.5px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--cs-text-faint); }
+.listing-quote[data-tone='bid'] .listing-quote-label { color: var(--cs-positive); }
+.listing-quote[data-tone='ask'] .listing-quote-label { color: var(--cs-negative); }
+.listing-quote[data-tone='mid'] > .num { color: var(--cs-text-muted); }
+.listing-book-code { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 500; letter-spacing: 0.02em; color: var(--cs-text-faint); cursor: help; }
+.listing-book-dot { width: 6px; height: 6px; border-radius: var(--cs-radius-full); background: var(--cs-border-strong); }
+.listing-book[data-live] .listing-book-dot { background: var(--cs-positive); }
+span.listing-quote { cursor: default; }
+/* The inspector: the book beside the way to the item page, and under an opened roster row. */
+.inspector-book { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.roster-detail-text .listing-book { align-self: flex-start; }
+
+.listing-dock .listing-row-act { flex: none; justify-self: end; }
 .listing-dock .listing-row > .caption { display: block; }
 .listing-dock .listing-row > .caption > .icon { vertical-align: -2px; margin-right: 5px; }
 
 .listing-dock .listing-total { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; flex: 1; min-width: 0; font-size: 11.5px; }
 .listing-dock .listing-tally {
-  display: inline-flex; align-items: center; gap: 5px;
+  display: inline-flex; align-items: center; gap: 6px;
   padding: 3px 8px;
   border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius-full);
   background: var(--cs-wash);
@@ -2247,13 +2325,12 @@ a { color: var(--cs-accent-text); }
 .listing-dock .listing-tally[data-tone='warn'] { border-color: var(--cs-accent-border); color: var(--cs-accent-text); }
 
 /* Narrow enough that two price boxes and a marketplace beside them no longer all fit: the prices
-   keep their row and the marketplace and its button take the next. */
+   keep their row, the marketplace and its button take the next, and the book drops under the facts. */
 @media (max-width: 560px) {
   .listing-dock .listing-controls { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: 6px; }
-  .listing-dock .listing-controls[data-bulk] { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .listing-dock .listing-controls > .listing-row-venue,
-  .listing-dock .listing-controls[data-bulk] > .listing-control:last-child { grid-column: 1 / -1; }
-  .listing-dock .listing-row-act { grid-column: 1 / -1; justify-self: end; }
+  .listing-dock .listing-controls > .listing-venue { grid-column: 1; justify-self: start; }
+  .listing-dock .listing-row-act, .listing-dock .listing-bulk-apply { grid-column: 2; justify-self: end; }
+  .listing-dock .listing-row-line { flex-wrap: wrap; }
 }
 
 /* A caption in the inspector is a sentence, not a row of chips. The column is narrow, and a flex
@@ -2495,28 +2572,6 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 @media (prefers-reduced-motion: reduce) {
   .toast { animation-name: cs-fade-in; }
 }
-
-/* The currency note beside the buy-order heading. The panel clips overflow, so the bubble opens downward into the page. */
-.buy-order-note { position: relative; display: inline-flex; vertical-align: -3px; }
-.buy-order-note-button {
-  display: inline-flex; padding: 0; margin: 0;
-  border: 0; background: transparent; color: var(--cs-text-faint);
-  cursor: help; border-radius: var(--cs-radius-full);
-}
-.buy-order-note-button:hover,
-.buy-order-note-button:focus-visible { color: var(--cs-text); }
-.buy-order-note-button:focus-visible { outline: 2px solid var(--cs-accent-ink); outline-offset: 2px; }
-.buy-order-note-bubble {
-  position: absolute; z-index: 5; top: calc(100% + 8px); left: 0;
-  width: max-content; max-width: 320px;
-  padding: 8px 10px;
-  border: 1px solid var(--cs-border); border-radius: var(--cs-radius);
-  background: var(--cs-surface-raised); box-shadow: var(--cs-shadow-pop);
-  color: var(--cs-text); font-size: 12.5px; font-weight: 400; line-height: 1.45; text-align: left;
-  opacity: 0; visibility: hidden; pointer-events: none;
-}
-.buy-order-note:hover .buy-order-note-bubble,
-.buy-order-note:focus-within .buy-order-note-bubble { opacity: 1; visibility: visible; }
 
 /* Buy orders: the fold caret, the picture on its halo and the venue mark beside the name, and the
    inline editor a CSFloat row opens. An open row lays the tile on its side: the picture at tile
@@ -2823,6 +2878,11 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .items-amount { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; color: var(--cs-text-strong); white-space: nowrap; line-height: 1.15; }
 .items-code { margin-left: 5px; font-size: 11px; font-weight: 500; letter-spacing: 0.02em; color: var(--cs-text-faint); }
 .items-figure[data-minor] .items-amount { font-size: 15px; font-weight: 500; color: var(--cs-text-muted); }
+.items-amount { position: relative; isolation: isolate; }
+/* Out of the flow, in the gap beside the figure: an arrow that came and went must not move the quote. */
+.items-move { position: absolute; left: 100%; top: 50%; margin: -7px 0 0 4px; font-size: 10px; line-height: 14px; opacity: 0; animation: cs-fade-out 2.4s ease-out; }
+.items-figure[data-move="up"] .items-move { color: var(--cs-positive); }
+.items-figure[data-move="down"] .items-move { color: var(--cs-negative); }
 
 /* The history beside the book, the curve across both; one column, in reading order, where two do not fit. */
 .items-grid {
@@ -2845,10 +2905,21 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .items-side { display: grid; gap: 3px; align-content: start; min-width: 0; }
 .items-side-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
 .items-side-head .holdings-label { margin-bottom: 0; }
-.items-level { display: grid; grid-template-columns: minmax(16px, 1fr) auto 3em; align-items: center; gap: 8px; font-size: 12px; padding: 2px 0; }
+.items-side-total { position: relative; isolation: isolate; }
+.items-level { position: relative; isolation: isolate; display: grid; grid-template-columns: minmax(16px, 1fr) auto 3em; align-items: center; gap: 8px; font-size: 12px; padding: 2px 0; }
 .items-level > .cell-sub { text-align: right; }
 .items-level-bar { display: block; height: 6px; border-radius: 3px; background: var(--cs-surface-inset); overflow: hidden; }
-.items-level-bar > span { display: block; height: 100%; border-radius: 3px; }
+.items-level-bar > span { display: block; height: 100%; border-radius: 3px; transform-origin: left center; transition: transform 420ms ease-out; }
+
+/* A live figure a read changed: a wash behind it that fades, keyed by the read so it plays once per change. */
+.items-flash { position: absolute; inset: -1px -5px; z-index: -1; border-radius: 4px; pointer-events: none; opacity: 0; animation: cs-flash 1.6s ease-out; }
+.items-flash[data-change="up"] { background: var(--cs-positive); }
+.items-flash[data-change="down"] { background: var(--cs-negative); }
+.items-flash[data-change="new"] { background: var(--cs-accent); }
+
+.items-live { display: inline-flex; align-items: center; gap: 6px; }
+.items-live[data-live="true"] .tip-target { color: var(--cs-positive); font-weight: 600; }
+.items-live-code::before { content: '·'; margin-right: 6px; color: var(--cs-text-faint); }
 .items-side[data-tone="bid"] .items-level-bar > span { background: var(--cs-positive); }
 .items-side[data-tone="ask"] .items-level-bar > span { background: var(--cs-negative); }
 
@@ -2864,6 +2935,17 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .price-chart-grid line { stroke: var(--cs-border-faint); stroke-width: 1; }
 .price-chart-grid text, .price-chart-tick { fill: var(--cs-text-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
 .price-chart-line { fill: none; stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }
+/* Sales per unit time behind the line: neutral and recessive, the one under the pointer raised. */
+.price-chart-volume path { fill: var(--cs-text-faint); opacity: 0.32; transition: opacity 120ms ease-out; }
+.price-chart-volume path[data-active] { opacity: 0.75; }
+/* A bar the series covers only part of (the day still going, the week the span starts in): fainter, so it is not read as a slump. */
+.price-chart-volume path[data-partial] { opacity: 0.14; }
+.price-chart-volume path[data-partial][data-active] { opacity: 0.4; }
+.price-chart-key { position: absolute; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-size: 11px; line-height: 14px; color: var(--cs-text-muted); pointer-events: none; }
+.price-chart-key-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.price-chart-key-line { width: 12px; height: 2px; border-radius: 1px; }
+.price-chart-key-bar { width: 6px; height: 10px; border-radius: 2px 2px 0 0; background: var(--cs-text-faint); opacity: 0.6; }
+.price-chart-key-peak { color: var(--cs-text-faint); }
 .price-chart-cursor line { stroke: var(--cs-text-muted); stroke-dasharray: 4 3; stroke-width: 1; }
 .price-chart-cursor circle { stroke: var(--cs-surface); stroke-width: 2; }
 .price-chart-tooltip {

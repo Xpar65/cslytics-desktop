@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { PageEnvelope } from '@cslytics/engine';
 import { Button, Empty, Notice, Skeleton } from './ui.js';
-import { Icon } from './Icon.js';
 
 /**
  * `PagedRows`, for tiles.
@@ -167,7 +166,6 @@ export function PagedGrid<T>({ load, render, rowKey, onRows, emptyTitle = 'Nothi
     <div className="paged-head">
       <span className="paged-total" data-testid="page-total">
         {total === undefined ? <Skeleton width={90} /> : <><strong className="num">{total.toLocaleString()}</strong> {total === 1 ? noun.replace(/s$/, '') : noun}</>}
-        <span className="badge" data-tone="quiet" title="Read from the local cache of the last complete observation. Nothing here reaches Steam."><Icon name="database" size={11} /> Cached observation</span>
       </span>
       {header}
     </div>
@@ -203,10 +201,10 @@ export function PagedGrid<T>({ load, render, rowKey, onRows, emptyTitle = 'Nothi
     </div>
     <div className="paged-foot">
       <span className="paged-page quiet">
-        {loading && rows.length > 0 ? 'Loading more…' : nextCursor ? `${rows.length.toLocaleString()} loaded` : rows.length > 0 ? 'end of list' : ''}
+        {loading && rows.length > 0 ? 'Loading more…' : ''}
       </span>
       <span className="toolbar">
-        <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void fetchPage()}>Refresh cached view</Button>
+        <Button size="sm" variant="ghost" icon="refresh" loading={loading} onClick={() => void fetchPage()}>Refresh</Button>
       </span>
     </div>
   </div>;

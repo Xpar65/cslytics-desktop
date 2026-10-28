@@ -1,19 +1,36 @@
-import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { MARKETPLACE_FEES, listPriceOf, quoteFromBuyer, quoteFromReceive, type PriceQuote } from '@cslytics/ports';
-import { Button, Caption, IconButton, Select, Thumbnail } from './ui.js';
+import { Button, Caption, IconButton, Thumbnail } from './ui.js';
 import { Icon, type IconName } from './Icon.js';
+import { Tip } from './Tip.js';
 import { VenueMark } from './VenueMark.js';
+import { OrderBookLine } from './OrderBookLine.js';
 import { useOutbox } from '../features/work/WorkIndicator.js';
+import { priceAtFloat } from '../features/items/curve-math.js';
 import { formatFloat, wearTier } from '../lib/format.js';
-import { convert } from '@cslytics/market-data';
+import { convert, type BookLevel, type StoredCurve } from '@cslytics/market-data';
 import { parseMoney, plural } from '../lib/labels.js';
 import { useCurrency } from '../lib/currency.js';
-import { conversionNote, currencyCodeOf, formatAmount, formatConverted } from '../lib/money.js';
+import { engine } from '../lib/engine.js';
+import { bookKey, useOrderBooks } from '../lib/order-books.js';
+import { conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick } from '../lib/money.js';
+import {
+  EMPTY,
+  bulkVenueOf,
+  dollars,
+  reduce,
+  type Applied,
+  type PriceBasis,
+  type StagedEntry,
+  type StagedRow,
+  type StrategyId,
+  type Venue,
+  type WorkspaceAction,
+  type WorkspaceIntent,
+  type WorkspaceState
+} from './listing-workspace-store.js';
 import type { OutboxOutcome } from '../features/work/outbox.js';
-import type { Message } from './ui.js';
-
-export type Venue = 'steam' | 'csfloat';
 
 /** What a venue is called on screen. What it charges is `MARKETPLACE_FEES`, and nowhere else. */
 const VENUE: Readonly<Record<Venue, { label: string; short: string }>> = {
@@ -27,9 +44,6 @@ const VENUE: Readonly<Record<Venue, { label: string; short: string }>> = {
  */
 const MINIMUM_LIST_CENTS: Readonly<Record<Venue, number>> = { steam: 1, csfloat: 3 };
 
-/** Which of the two money fields a figure was typed into. The other follows from the venue's fees. */
-export type PriceBasis = 'receive' | 'buyer';
-
 /**
  * `csfloat.list` takes at most 100 members (`apps/desktop/src/shared/api.ts`). The bound is shown
  * and enforced here rather than left to the schema, because a refusal from the request validator
@@ -37,99 +51,80 @@ export type PriceBasis = 'receive' | 'buyer';
  */
 const CSFLOAT_BATCH = 100;
 
+/**
+ * The ways *Price all rows* prices every row from the market, each a press. The three that read
+ * the order book price what the buyer pays, as every figure in a book is a buyer's; the float
+ * price reads the venue's curve at the row's float, in the row's currency.
+ */
+const STRATEGIES: ReadonlyArray<{ id: StrategyId; icon: IconName; label: string; title: string }> = [
+  {
+    id: 'instant', icon: 'zap', label: 'Sell now',
+    title: 'Price every row to sell into the buy orders as they stand: the first unit of a name at the highest bid, the next at the next unit the orders will take, and so on down the book. A row the orders would not take is left as it is.'
+  },
+  { id: 'bid', icon: 'shopping-cart', label: 'Top bid', title: 'Price every row at the highest buy order on its market, so it sells to that order at once.' },
+  { id: 'undercut', icon: 'arrow-down', label: 'Undercut', title: 'Price every row one cent under the cheapest listing on its market.' },
+  { id: 'float', icon: 'activity', label: 'Float price', title: "Price every row at its float's point on its marketplace's float curve, in the row's currency." }
+];
+
+/** What a strategy decided for one row: a buyer price, or why it left the row alone. */
+type Outcome = { cents: number } | { skip: string };
+
 /** The element the shell leaves in the account strip for this workspace's pill (`App.tsx`). */
 const SLOT = '[data-slot="listing-workspace"]';
 
 /** Where the panel sits before its pill has been measured — the window's own top right. */
 const FALLBACK_ANCHOR = { top: 56, right: 12 };
 
-/** `handed`: in the window's outbox. Off screen, and back as `refused` if the engine turns it down. */
-type RowState = 'ready' | 'handed' | 'refused';
-
 /**
- * One thing the workspace prices: an item about to be listed, or a standing listing about to be
- * repriced. It carries what a row prints and nothing about how it is sent — that is the intent's.
+ * A listing workspace as the shell holds it: its state, and the few things done to it from
+ * outside the panel — staging from an inspector, and the outbox's answer to a send.
  */
-export type StagedEntry = {
-  /** Stable for as long as the thing is staged. Staging the same key twice is one row. */
-  key: string;
-  accountId: string;
-  name: string;
-  imageUrl: string | null;
-  paintWear: number | null;
-  /** The handle a tile's busy state keys on, so the item reads as busy while its send is out. */
-  localId?: string | null | undefined;
-  /** Where it is, or what it is listed at: the fact the price is being decided against. */
-  place: { icon: IconName; label: string };
-  /** A step that sending implies before the listing itself, said before it is sent. */
-  caption?: { icon: IconName; text: string } | undefined;
+export type Workspace<E extends StagedEntry> = {
+  intent: WorkspaceIntent<E>;
+  state: WorkspaceState<E>;
+  dispatch: (action: WorkspaceAction<E>) => void;
+  /** Entries join the rows already staged, which keep what was typed, and the panel opens. */
+  stage: (entries: readonly E[]) => void;
+  /** Rows handed to the outbox: off screen until the engine answers. The shell hears which. */
+  hand: (keys: readonly string[]) => void;
   /**
-   * The same, for one marketplace, when it differs there. Staged before the marketplace is chosen,
-   * so the row prints the one for whichever is selected now.
+   * The outbox's answer for one batch. `true` says a refusal was shown on rows still here, so the
+   * outbox forgets it; `false` that the workspace was closed meanwhile and the work panel keeps it.
    */
-  venueCaption?: Partial<Record<Venue, { icon: IconName; text: string }>> | undefined;
-  /** The venues this entry can go to, the default first. One venue is a fixed venue. */
-  venues: readonly Venue[];
-  /**
-   * Venues shown in the marketplace control but not choosable, each with why, worded to follow the
-   * venue's name: "does not support this item". A venue in neither list is not shown at all.
-   */
-  unavailable?: Partial<Record<Venue, string>> | undefined;
-  /** The figure the row opens with. Absent, it opens with the workspace's own. */
-  seed?: { price: string; basis: PriceBasis } | undefined;
-  /**
-   * What it is listed at now, in the figure its venue's call takes. A row still at this figure
-   * has nothing to send: on Steam a reprice is a delist and a relist, and the relist costs a
-   * phone confirmation, so sending one that changes nothing is not harmless.
-   */
-  currentListCents?: number | undefined;
+  settle: (keys: readonly string[], outcome: OutboxOutcome) => boolean | undefined;
 };
 
-/** A row with a price its venue would take, as an intent is handed it. */
-export type PricedEntry<E extends StagedEntry> = { entry: E; venue: Venue; cents: number };
-
 /**
- * What the workspace is being used to do.
+ * One listing workspace, held by the shell so it outlives the page it was staged from.
  *
- * Listing and repricing are the same work — a figure per row, read through a venue's fees, sent
- * and then waited on — and differ only in words and in the call at the end. So the dock is one
- * component and this is the difference. Listing's is `list-intent.ts`; repricing's belongs to the
- * Listings page.
+ * `onHanded` is told the keys of every row handed to the outbox, in the render of the press, so
+ * the inventory selection can let go of exactly those: the item is busy on its tile from then on,
+ * and the rows still waiting for a price stay selected.
  */
-export type WorkspaceIntent<E extends StagedEntry> = {
-  /** "List", "Reprice": the button on a row, and the start of the footer's. */
-  verb: string;
-  /** What a row is: "item", "listing". */
-  noun: string;
-  /** What a venue turned down, for the notice that carries its words: "the listing". */
-  refused: string;
-  /**
-   * The sends these rows need, one per thing a venue accepts or refuses as a whole. A send that
-   * throws marks exactly its own rows refused, with the engine's words. `kind` is the work it
-   * becomes, as the work panel names it (`DESTINATION`), so the panel can say what it is before
-   * the engine has it.
-   */
-  batches: (rows: ReadonlyArray<PricedEntry<E>>) => Array<{ venue: Venue; kind: string; keys: readonly string[]; send: () => Promise<unknown> }>;
-};
-
-type Staged<E extends StagedEntry> = {
-  key: string;
-  entry: E;
-  /** The venues this row's own verdict allows. Never widened by a bulk control. */
-  venues: readonly Venue[];
-  venue: Venue;
-  /** The figure as typed, into the field `basis` names. */
-  price: string;
-  basis: PriceBasis;
-  /** This row's price was typed here, so a change to the price for every row leaves it alone. */
-  ownPrice: boolean;
-  /** Likewise for its marketplace. */
-  ownVenue: boolean;
-  state: RowState;
-  /** The engine's words, verbatim, when it refused this row's batch. */
-  detail?: string | undefined;
-};
-
+export function useListingWorkspace<E extends StagedEntry>(intent: WorkspaceIntent<E>, onHanded?: (keys: readonly string[]) => void): Workspace<E> {
+  const [state, dispatch] = useReducer((current: WorkspaceState<E>, action: WorkspaceAction<E>) => reduce(current, action), EMPTY as WorkspaceState<E>);
+  // The rows as last rendered, read when the engine answers a send: a refusal has somewhere to
+  // land only if its rows are still here.
+  const latest = useRef(state);
+  latest.current = state;
+  const handed = useRef(onHanded);
+  handed.current = onHanded;
+  const stage = useCallback((entries: readonly E[]) => dispatch({ type: 'stage', entries }), []);
+  const hand = useCallback((keys: readonly string[]) => {
+    dispatch({ type: 'hand', keys });
+    handed.current?.(keys);
+  }, []);
+  const settle = useCallback((keys: readonly string[], outcome: OutboxOutcome): boolean | undefined => {
+    if (outcome.accepted) {
+      dispatch({ type: 'accept', keys });
+      return undefined;
+    }
+    if (!latest.current.rows.some((row) => keys.includes(row.key))) return false;
+    dispatch({ type: 'refuse', keys, reason: outcome.reason });
+    return true;
+  }, []);
+  return useMemo(() => ({ intent, state, dispatch, stage, hand, settle }), [intent, state, stage, hand, settle]);
+}
 
 /**
  * The listing workspace: every item staged for sale, priced and routed before anything is sent —
@@ -142,6 +137,14 @@ type Staged<E extends StagedEntry> = {
  * listable on one of the two venues. Store and Transfer each take a single destination for the
  * whole batch and are answered in the inspector itself.
  *
+ * **Its state is the shell's, and this renders it** (`listing-workspace-store.ts`). The shell
+ * holds one workspace for listing and one for repricing (`useListingWorkspace` in `App.tsx`), so
+ * both outlive the page they were staged from and the selection they were staged with: a
+ * submitted row leaves the selection, and a person who stages items and then opens one's Items
+ * page keeps the pill and the rows where they left them. Staging adds to what is there — a
+ * second selection joins the first, each row keeping what was typed into it — and staging a row
+ * already here only opens the panel.
+ *
  * **It lives in the account strip, not in a window of its own.** A pill left of the work
  * indicator is there whenever the workspace holds a row and gone the moment it does not; the
  * panel opens under it, over everything else. Staging is the step before the work indicator has
@@ -151,8 +154,24 @@ type Staged<E extends StagedEntry> = {
  * no work in flight, so closing it over a row that had just been sent left no way back to that
  * row at all. It was then a free-floating dock over the work area, which covered the section it
  * was pricing from even when collapsed. Folding the panel into its pill is therefore the ordinary
- * gesture, the pill is always the way back, and the close button is destructive: it empties the
- * staging.
+ * gesture — a press on the page behind it folds it too, because that page is what a price is
+ * decided against — the pill is always the way back, and the close button is destructive: it
+ * empties the staging.
+ *
+ * **Every row shows the market it is priced against.** The Steam order book for the row's market
+ * name — highest bid, mid, lowest ask — is read live while the panel is open (`useOrderBooks`),
+ * and pressing a figure prices the row at it, as what the buyer pays. A wallet the anonymous book
+ * is not priced for gets the account's own read, in the wallet's currency, because a figure that
+ * is sent is never converted (AGENTS.md rule 9). A price is decided against the book, so the book
+ * is on the row rather than a page away. Nothing else on the row repeats
+ * what the name already says: the wear tier is in a market name, so the row keeps the float alone.
+ *
+ * **Price all rows prices from the market in one press.** Under the one price and one marketplace
+ * for every row sit four presses: *Sell now* walks each name's buy orders a unit at a time, *Top
+ * bid* takes the highest buy order, *Undercut* goes a cent under the cheapest listing, and *Float
+ * price* reads the venue's float curve at the row's float. Each writes what the buyer pays into
+ * every row it can price and says how many it did and why it left the rest; a book is read the
+ * moment a name is staged and kept fresh after, so the figures a press uses are the market's now.
  *
  * Three rules shape what is in it.
  *
@@ -180,98 +199,64 @@ type Staged<E extends StagedEntry> = {
  * worked out from that row's venue through `MARKETPLACE_FEES`, so switching a row's venue keeps
  * the figure the person chose and moves the other. What is sent is the figure the venue's list
  * call takes — what the seller receives for Steam (rule 4), what the buyer pays for CSFloat.
+ *
+ * What a row has to say beyond its figures is a chip, a word or two with the sentence in its tip:
+ * a retrieve before the listing, a phone confirmation, a listing the typed figure does not exist
+ * at. The one thing printed in full is a refusal, because those are the engine's words.
  */
-export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal, accounts, price = '', onPrice, onMessage, onSent, onUnstaged, onDismiss }: {
-  /**
-   * What is staged. A row is seeded from its entry once and never again, so nothing here re-seeds
-   * under a row that has already been priced or sent: the caller remounts this component (a fresh
-   * `key`) to start a new set, or adds entries to this one, which join the rows already here.
-   */
-  staged: readonly E[];
-  intent: WorkspaceIntent<E>;
-  /**
-   * Bumped when the same selection is staged again, which is the person asking to see the
-   * workspace rather than to start it over — so this opens a folded one instead of re-seeding it.
-   */
-  reveal: number;
+export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }: {
+  workspace: Workspace<E>;
   /** Each account with its wallet currency, which every Steam figure here is in; CSFloat figures are USD. */
   accounts: ReadonlyArray<{ id: string; name: string; currency?: number | null | undefined }>;
-  /** The inspector's price field, so a figure typed on either side survives the other. */
-  price?: string | undefined;
-  onPrice?: ((next: string) => void) | undefined;
-  onMessage: (message: Message | null) => void;
-  /** The keys of rows handed to the outbox, so the selection lets go of exactly those. */
-  onSent?: ((keys: readonly string[]) => void) | undefined;
-  /**
-   * A row has left for good — taken out by hand, or its send accepted — so a caller that adds
-   * entries does not add that one back.
-   */
-  onUnstaged?: ((key: string) => void) | undefined;
-  /** Nothing is staged any more: the workspace has been closed, or its last row taken out of it. */
-  onDismiss: () => void;
 }): React.JSX.Element | null {
-  const seed = (entry: E): Staged<E> => ({
-    key: entry.key,
-    entry,
-    venues: entry.venues,
-    venue: entry.venues.includes('steam') ? 'steam' : entry.venues[0] ?? 'steam',
-    // The inspector's field is what the seller receives, so a row seeded from it is too.
-    price: entry.seed?.price ?? price,
-    basis: entry.seed?.basis ?? 'receive',
-    ownPrice: false,
-    ownVenue: false,
-    state: 'ready'
-  });
-  const [rows, setRows] = useState<Array<Staged<E>>>(() => staged.map(seed));
-  const [open, setOpen] = useState(true);
-  // Entries staged after the workspace opened join it, and open it. Rows already here keep what
-  // was typed. Only a join opens it: the owner's list also shrinks when a send is accepted, and a
-  // folded workspace must not spring open because something left it.
-  useEffect(() => {
-    if (!staged.some((entry) => !rows.some((row) => row.key === entry.key))) return;
-    setRows((current) => {
-      const fresh = staged.filter((entry) => !current.some((row) => row.key === entry.key));
-      return fresh.length === 0 ? current : [...current, ...fresh.map(seed)];
-    });
-    setOpen(true);
-  }, [staged]);
-  useEffect(() => { setOpen(true); }, [reveal]);
-  const [bulkPrice, setBulkPrice] = useState(price);
-  const [bulkBasis, setBulkBasis] = useState<PriceBasis>('receive');
-  const [bulkVenue, setBulkVenue] = useState<Venue>(() => (staged.some((entry) => entry.venues.includes('steam')) ? 'steam' : 'csfloat'));
-  // Folded until asked for: most stagings are priced a row at a time, and the rows are what the
-  // person came to see.
-  const [bulkOpen, setBulkOpen] = useState(false);
+  const { intent, state, dispatch } = workspace;
+  const { rows, open, bulk } = state;
+  const bulkVenue = bulkVenueOf(state);
   const bulkId = useId();
   const outbox = useOutbox();
-  // A send can come back after the owner has closed the workspace. Its refusal then has no rows
-  // to return to, and the outbox keeps it on the work panel instead.
-  const live = useRef(true);
-  useEffect(() => {
-    live.current = true;
-    return () => { live.current = false; };
-  }, []);
 
   // What is on screen. A handed row is the outbox's until the engine answers, and a workspace
   // holding nothing else shows nothing — no pill, no panel — while it waits to hear.
   const shown = useMemo(() => rows.filter((row) => row.state !== 'handed'), [rows]);
   const slot = useSlot();
   const pill = useRef<HTMLButtonElement | null>(null);
+  const dock = useRef<HTMLElement | null>(null);
   const anchor = usePillAnchor(pill, open && shown.length > 0, slot);
+  // The Steam book behind every row, read as each is staged, every five seconds while the panel
+  // is open and once a minute while it is folded; by account as well as name, because a wallet
+  // the anonymous book is not priced for gets the account's own read (plan D17).
+  const keys = useMemo(() => shown.flatMap((row) => (typeof row.entry.marketHashName === 'string' && row.entry.marketHashName !== '' ? [{ accountId: row.entry.accountId, name: row.entry.marketHashName }] : [])), [shown]);
+  const books = useOrderBooks(keys, open);
+  // The float curves asked for, by venue and name. Only an answer is kept: a read that failed is asked again next press.
+  const curves = useRef(new Map<string, StoredCurve | null>());
+  const [curving, setCurving] = useState(false);
+  const { fx } = useCurrency();
 
-  // Nothing staged any more, on screen or on its way: the workspace is over.
+  // A press on the page behind the panel folds it: that page is the list a price is decided
+  // against, and a panel that stayed over it had to be folded by hand before the list could be
+  // read. The pill is the one control outside the panel that is about it, and takes its own
+  // press. A press that stages something folds and then opens in the same gesture, which is open.
+  const showing = open && shown.length > 0;
   useEffect(() => {
-    if (rows.length === 0) onDismiss();
-  }, [rows.length]);
+    if (!showing) return undefined;
+    const onPointerDown = (event: PointerEvent): void => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (dock.current?.contains(target) || pill.current?.contains(target)) return;
+      dispatch({ type: 'fold' });
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [showing, dispatch]);
 
   /**
    * The currency a row's figures are in: USD on CSFloat everywhere, the account's wallet on Steam
    * (portfolio and pricing plan §5.1). A typed price is in this currency and is sent as typed.
    */
   const currencyFor = (venue: Venue, accountId: string): number | null => (venue === 'csfloat' ? 1 : accounts.find((account) => account.id === accountId)?.currency ?? null);
-  const rowCurrency = (row: Staged<StagedEntry>): number | null => currencyFor(row.venue, row.entry.accountId);
+  const rowCurrency = (row: StagedRow<StagedEntry>): number | null => currencyFor(row.venue, row.entry.accountId);
   /** One currency for rows on one venue, or none when accounts with different wallets are mixed in. */
-  const currencyOfRows = (venue: Venue, rows: ReadonlyArray<Staged<StagedEntry>>): number | null => {
+  const currencyOfRows = (venue: Venue, rows: ReadonlyArray<StagedRow<StagedEntry>>): number | null => {
     const codes = new Set(rows.filter((row) => row.venue === venue).map((row) => currencyFor(venue, row.entry.accountId)));
     return codes.size === 1 ? [...codes][0]! : null;
   };
@@ -285,67 +270,117 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
   const routable = shown.some((row) => row.venues.length > 1);
   const accountName = (accountId: string): string => accounts.find((account) => account.id === accountId)?.name ?? accountId;
 
-  function update(key: string, change: (row: Staged<E>) => Staged<E>): void {
-    setRows((current) => current.map((row) => (row.key === key ? change(row) : row)));
+  /**
+   * What the three book strategies decide for each row, from the book held for its name now.
+   *
+   * Only a Steam row in the book's own currency can take a figure from it: CSFloat has no order
+   * book here, and a book in another currency is not a price this row could be sent, because a
+   * figure that is sent is never converted (AGENTS.md rule 9). *Sell now*
+   * walks each name's bids best-first, one row per unit, so two rows of one name take the first
+   * two units the orders would absorb, at whatever levels those are; a row past the last unit is
+   * left alone and counted.
+   */
+  function bookOutcomes(id: 'instant' | 'bid' | 'undercut'): Map<string, Outcome> {
+    const outcomes = new Map<string, Outcome>();
+    const taken = new Map<string, number>();
+    for (const row of shown) {
+      const name = row.entry.marketHashName ?? null;
+      if (row.venue === 'csfloat') { outcomes.set(row.key, { skip: 'on CSFloat, which has no order book here' }); continue; }
+      const book = name === null ? null : books.get(bookKey(row.entry.accountId, name))?.book ?? null;
+      if (book === null) { outcomes.set(row.key, { skip: 'without a Steam book yet' }); continue; }
+      const currency = rowCurrency(row);
+      if (book.currency !== currency) {
+        outcomes.set(row.key, { skip: `with a book in ${currencyCodeOf(book.currency)} and a price in ${currencyCodeOf(currency) || 'an unknown currency'}` });
+        continue;
+      }
+      if (id === 'bid') {
+        outcomes.set(row.key, book.highestBidCents === null ? { skip: 'with no buy orders' } : { cents: book.highestBidCents });
+      } else if (id === 'undercut') {
+        outcomes.set(row.key, book.lowestAskCents === null ? { skip: 'with no listing to undercut' } : { cents: book.lowestAskCents - 1 });
+      } else {
+        const unit = taken.get(name!) ?? 0;
+        taken.set(name!, unit + 1);
+        const level = levelForUnit(book.bids, unit);
+        outcomes.set(row.key, level === null ? { skip: 'past what the buy orders take' } : { cents: level });
+      }
+    }
+    return outcomes;
   }
 
   /**
-   * A bulk change writes only where the row has not spoken for itself.
-   *
-   * It writes the figure and which field it was typed into, not a converted amount: each row works
-   * the other figure out through its own venue's fees, so one buyer price spread over a Steam row
-   * and a CSFloat row pays their sellers different amounts, as it would.
+   * The float price for each row: its marketplace's curve at its float, from the free CDN through
+   * main (`item.curve`, which records an absence rather than asking again). The curve is in USD;
+   * a row in another currency takes the figure through the newest rate, or is left alone when
+   * there is none.
    */
-  function spreadPrice(next: string, basis: PriceBasis): void {
-    setBulkPrice(next);
-    setBulkBasis(basis);
-    // The inspector's field only ever means what the seller receives.
-    onPrice?.(basis === 'receive' ? next : pricing(bulkVenue, currencyOfRows(bulkVenue, shown), next, basis).receiveText);
-    setRows((current) => current.map((row) => (
-      row.ownPrice || row.state === 'handed' ? row : { ...row, price: next, basis }
-    )));
+  async function floatOutcomes(): Promise<Map<string, Outcome>> {
+    const wanted = new Map<string, { venue: Venue; name: string }>();
+    for (const row of shown) {
+      const name = row.entry.marketHashName;
+      if (name) wanted.set(`${row.venue}:${name}`, { venue: row.venue, name });
+    }
+    await Promise.all([...wanted].map(async ([key, { venue, name }]) => {
+      if (curves.current.has(key)) return;
+      try {
+        curves.current.set(key, await engine.itemCurve(name, venue));
+      } catch {
+        // Asked again on the next press.
+      }
+    }));
+    const outcomes = new Map<string, Outcome>();
+    for (const row of shown) {
+      const name = row.entry.marketHashName ?? null;
+      const doc = name === null ? null : curves.current.get(`${row.venue}:${name}`)?.doc ?? null;
+      if (row.entry.paintWear === null) { outcomes.set(row.key, { skip: 'without a float' }); continue; }
+      if (!doc) { outcomes.set(row.key, { skip: `without a ${VENUE[row.venue].short} float curve` }); continue; }
+      const price = priceAtFloat(doc.fairPrice?.vertices, row.entry.paintWear);
+      if (price === null) { outcomes.set(row.key, { skip: 'with no fair price on its curve' }); continue; }
+      const native = Math.round(price * 100);
+      const code = currencyCodeOf(rowCurrency(row));
+      if (code === doc.currency) { outcomes.set(row.key, { cents: native }); continue; }
+      const converted = code ? convert(native, doc.currency, code, fx) : null;
+      outcomes.set(row.key, converted === null ? { skip: `with no rate from ${doc.currency} to ${code || 'its currency'}` } : { cents: converted.cents });
+    }
+    return outcomes;
   }
 
-  function spreadVenue(next: Venue): void {
-    setBulkVenue(next);
-    setRows((current) => current.map((row) => (
-      row.ownVenue || row.state === 'handed' || !row.venues.includes(next) ? row : { ...row, venue: next }
-    )));
+  /** Write what a strategy decided, and say how many rows took a figure and why the rest did not. */
+  function applyStrategy(id: StrategyId, outcomes: ReadonlyMap<string, Outcome>): void {
+    const cents = new Map<string, number>();
+    const skipped = new Map<string, number>();
+    for (const [key, outcome] of outcomes) {
+      if ('cents' in outcome) cents.set(key, outcome.cents);
+      else skipped.set(outcome.skip, (skipped.get(outcome.skip) ?? 0) + 1);
+    }
+    const applied: Applied = { id, priced: cents.size, total: outcomes.size, skipped: [...skipped] };
+    dispatch({ type: 'priced', applied, cents });
   }
 
-  /** The one control that overrules a row: everything ready takes the bulk price and venue. */
-  function applyToAll(): void {
-    setRows((current) => current.map((row) => (
-      row.state === 'handed'
-        ? row
-        : { ...row, price: bulkPrice, basis: bulkBasis, ownPrice: false, ownVenue: false, ...(row.venues.includes(bulkVenue) ? { venue: bulkVenue } : {}) }
-    )));
-  }
-
-  /**
-   * Taking a row out of the workspace, and emptying it — pill and all — by taking out the last one.
-   *
-   * A row removed here is only unstaged — it stays selected, so *List for sale* stages it again.
-   */
-  function drop(key: string): void {
-    setRows((current) => current.filter((entry) => entry.key !== key));
-    onUnstaged?.(key);
+  async function pressStrategy(id: StrategyId): Promise<void> {
+    if (id !== 'float') {
+      applyStrategy(id, bookOutcomes(id));
+      return;
+    }
+    setCurving(true);
+    try {
+      applyStrategy(id, await floatOutcomes());
+    } finally {
+      setCurving(false);
+    }
   }
 
   /**
    * Hand the rows to the outbox and let go of them, in the same render as the press.
    *
-   * Each batch is atomic, and what goes in one is the intent's to say. The selection lets go of
-   * the rows now too: the workspace is the view's, not the inspector's, so an emptied selection no
-   * longer takes it down, and the item is busy on its tile from this render on.
+   * Each batch is atomic, and what goes in one is the intent's to say. The shell hears which rows
+   * went, so the selection lets go of exactly those and the item is busy on its tile from this
+   * render on. The engine's answer comes back through `settle`: accepted, the rows are gone for
+   * good; refused, they return marked with its words and the panel opens on them.
    */
-  function list(targets: ReadonlyArray<Staged<E>>): void {
+  function list(targets: ReadonlyArray<StagedRow<E>>): void {
     if (targets.length === 0) return;
-    const keys = targets.map((row) => row.key);
     const byKey = new Map(targets.map((row) => [row.key, row]));
-    onMessage(null);
-    setRows((current) => current.map((row) => (keys.includes(row.key) ? { ...row, state: 'handed', detail: undefined } : row)));
-    onSent?.(keys);
+    workspace.hand(targets.map((row) => row.key));
     for (const batch of intent.batches(targets.map((row) => ({ entry: row.entry, venue: row.venue, cents: priceOf(row, rowCurrency(row))! })))) {
       outbox.enqueue({
         kind: batch.kind,
@@ -361,28 +396,9 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
           };
         }),
         send: batch.send,
-        onSettled: (outcome) => settle(batch, outcome)
+        onSettled: (outcome) => workspace.settle(batch.keys, outcome)
       });
     }
-  }
-
-  /**
-   * What the engine said about one batch. Accepted, its rows are gone for good. Refused, they come
-   * back marked with its words and the panel opens on them, which is `true` to the outbox: this
-   * refusal has been shown where it can be fixed. A batch refused marks only its own rows, because
-   * every other batch either never existed or succeeded on its own terms.
-   */
-  function settle(batch: { venue: Venue; keys: readonly string[] }, outcome: OutboxOutcome): boolean | undefined {
-    if (!live.current) return false;
-    if (outcome.accepted) {
-      setRows((current) => current.filter((row) => !batch.keys.includes(row.key)));
-      for (const key of batch.keys) onUnstaged?.(key);
-      return undefined;
-    }
-    setRows((current) => current.map((row) => (batch.keys.includes(row.key) ? { ...row, state: 'refused', detail: outcome.reason } : row)));
-    setOpen(true);
-    onMessage({ tone: 'error', title: `${VENUE[batch.venue].label} did not accept ${intent.refused}`, detail: outcome.reason });
-    return true;
   }
 
   if (shown.length === 0) return null;
@@ -395,13 +411,14 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
   const unchanged = shown.filter((row) => priceOf(row, rowCurrency(row)) === null && pricing(row.venue, rowCurrency(row), row.price, row.basis).listCents !== null).length;
   const unpriced = shown.length - sendable.length - unchanged;
   const bulkCurrency = currencyOfRows(bulkVenue, shown);
-  const bulk = pricing(bulkVenue, bulkCurrency, bulkPrice, bulkBasis);
+  const bulkPriced = pricing(bulkVenue, bulkCurrency, bulk.price, bulk.basis);
+  const strategy = bulk.applied ? STRATEGIES.find((entry) => entry.id === bulk.applied!.id) : undefined;
   // What the header says in one line, so the pill still reports the state of the work folded up.
   const summary = [
     `${plural(shown.length, intent.noun)} staged`,
     ...(refused.length > 0 ? [`${refused.length} refused`] : []),
     ...(unchanged > 0 ? [`${unchanged} unchanged`] : []),
-    ...(unpriced > 0 ? [`${unpriced} without a price`] : [])
+    ...(unpriced > 0 ? [`${unpriced} unpriced`] : [])
   ].join(' · ');
   const attention = unpriced > 0 || refused.length > 0 ? 'true' : undefined;
 
@@ -417,9 +434,9 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
       aria-expanded={open}
       aria-label={`Listing workspace: ${summary}`}
       title={`Listing workspace · ${summary}`}
-      onClick={() => setOpen((current) => !current)}
+      onClick={() => dispatch({ type: open ? 'fold' : 'reveal' })}
     >
-      <span className="listing-pill-glyph"><Icon name="tag" size={14} /></span>
+      <span className="listing-pill-glyph"><Icon name={intent.icon} size={14} /></span>
       <span className="listing-pill-count num">{shown.length.toLocaleString()}</span>
       <Icon name={open ? 'chevron-up' : 'chevron-down'} size={12} className="listing-pill-chevron" />
     </button>
@@ -429,6 +446,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
     {createPortal(launcher, slot ?? document.body)}
     {open ? createPortal(
       <aside
+        ref={dock}
         className="listing-dock"
         role="region"
         aria-label="Listing workspace"
@@ -441,9 +459,9 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
             className="listing-dock-toggle"
             aria-expanded={true}
             title="Fold the listing workspace into its pill. Everything staged stays."
-            onClick={() => setOpen(false)}
+            onClick={() => dispatch({ type: 'fold' })}
           >
-            <span className="panel-icon"><Icon name="tag" size={15} /></span>
+            <span className="panel-icon"><Icon name={intent.icon} size={15} /></span>
             <span className="listing-dock-heading">
               <span className="listing-dock-title">Listing workspace</span>
               <span className="listing-dock-sub">{summary}</span>
@@ -457,7 +475,7 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
             size="sm"
             label="Close the listing workspace"
             title="Close the listing workspace — unstages everything here. The items stay selected."
-            onClick={onDismiss}
+            onClick={() => dispatch({ type: 'close' })}
           />
         </header>
 
@@ -465,45 +483,80 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
           {/* One price and one marketplace for everything. Folded by default, and its summary
               says what it would write, so a folded section is never a hidden setting. A row that
               has been given its own price or venue is left alone until Apply to all. */}
-          <section className="listing-bulk" data-open={bulkOpen || undefined}>
+          <section className="listing-bulk" data-open={bulk.open || undefined}>
             <button
               type="button"
               className="listing-bulk-toggle"
-              aria-expanded={bulkOpen}
+              aria-expanded={bulk.open}
               aria-controls={bulkId}
-              onClick={() => setBulkOpen((current) => !current)}
+              onClick={() => dispatch({ type: 'bulkOpen', open: !bulk.open })}
             >
-              <Icon name={bulkOpen ? 'chevron-down' : 'chevron-right'} size={13} className="listing-bulk-chevron" />
-              <span className="kicker">For every row</span>
-              {bulkOpen ? null : (
+              <Icon name={bulk.open ? 'chevron-down' : 'chevron-right'} size={13} className="listing-bulk-chevron" />
+              <span className="kicker">Price all rows</span>
+              {bulk.open ? null : (
                 <span className="listing-bulk-summary">
-                  {bulk.quote ? <>receive <span className="num">{formatAmount(bulk.quote.receiveCents, bulkCurrency)}</span> · buyer pays <span className="num">{formatAmount(bulk.quote.buyerCents, bulkCurrency)}</span> · </> : null}
-                  {routable ? VENUE[bulkVenue].short : null}
+                  {bulkPriced.quote ? (
+                    <span className="listing-figures" title={`Every row: you receive ${formatAmount(bulkPriced.quote.receiveCents, bulkCurrency)}, the buyer pays ${formatAmount(bulkPriced.quote.buyerCents, bulkCurrency)}`}>
+                      <span className="num">{formatTick(bulkPriced.quote.receiveCents, bulkCurrency)}</span>
+                      <Icon name="arrow-right" size={11} />
+                      <span className="num">{formatTick(bulkPriced.quote.buyerCents, bulkCurrency)}</span>
+                      <span className="listing-code">{currencyCodeOf(bulkCurrency)}</span>
+                    </span>
+                  ) : strategy ? (
+                    <span className="listing-figures" title={strategy.title}>
+                      <Icon name={strategy.icon} size={11} />
+                      {strategy.label}
+                    </span>
+                  ) : null}
+                  {routable ? <VenueMark venue={bulkVenue} size={13} /> : null}
                 </span>
               )}
             </button>
-            {bulkOpen ? (
+            {bulk.open ? (
               <div className="listing-bulk-body" id={bulkId}>
-                <div className="listing-controls" data-bulk="true">
-                  <PriceFields subject="every row" venue={bulkVenue} currency={bulkCurrency} priced={bulk} disabled={false} onChange={spreadPrice} />
-                  {routable ? (
-                    <label className="listing-control">
-                      <span className="listing-control-label">Marketplace</span>
-                      <Select label="Marketplace for every row" className="input-sm" value={bulkVenue} onChange={(next) => spreadVenue(next as Venue)}>
-                        <option value="steam">{VENUE.steam.label}</option>
-                        <option value="csfloat">{VENUE.csfloat.label}</option>
-                      </Select>
-                    </label>
-                  ) : null}
+                {/* From the market, in one press each. The figures land in every row as what the
+                    buyer pays, and the line under the strip says how many rows took one and why
+                    the rest did not. */}
+                <div className="listing-strategies" role="group" aria-label="Price every row from the market">
+                  {STRATEGIES.map((entry) => (
+                    <Button
+                      key={entry.id}
+                      size="sm"
+                      variant="subtle"
+                      icon={entry.icon}
+                      title={entry.title}
+                      loading={entry.id === 'float' && curving}
+                      disabled={curving}
+                      onClick={() => { void pressStrategy(entry.id); }}
+                    >
+                      {entry.label}
+                    </Button>
+                  ))}
                 </div>
-                {bulk.note ? <Caption icon={bulk.note.tone === 'warn' ? 'alert-circle' : 'info'} tone={bulk.note.tone === 'warn' ? 'warn' : undefined}>{bulk.note.text}</Caption> : null}
-                <div className="listing-bulk-foot">
-                  <Caption icon="info">
-                    Type either figure and the other follows from that marketplace's fees. A row you price or route
-                    yourself keeps that until you apply to all.
+                {bulk.applied && strategy ? (
+                  <Caption icon={strategy.icon}>
+                    {strategy.label}: {bulk.applied.priced} of {bulk.applied.total} priced
+                    {bulk.applied.skipped.map(([why, count]) => ` · ${count} ${why}`).join('')}
                   </Caption>
-                  <Button size="sm" icon="chevrons-right" onClick={applyToAll}>Apply to all rows</Button>
+                ) : null}
+                <div className="listing-controls" data-bulk="true">
+                  <PriceFields subject="every row" venue={bulkVenue} currency={bulkCurrency} priced={bulkPriced} disabled={false} onChange={(price, basis) => dispatch({ type: 'spread', price, basis })} />
+                  {routable ? (
+                    <VenueChoice label="Marketplace for every row" value={bulkVenue} venues={['steam', 'csfloat']} onChange={(venue) => dispatch({ type: 'route', venue })} />
+                  ) : null}
+                  <span className="listing-bulk-apply">
+                    <IconButton
+                      icon="chevrons-right"
+                      size="sm"
+                      variant="default"
+                      label="Apply to all rows"
+                      title="Apply to all rows — every row takes this price and marketplace, the ones priced by hand too"
+                      onClick={() => dispatch({ type: 'apply' })}
+                    />
+                    <Tip label="How the controls for every row work" content="Type either figure and the other follows from that marketplace's fees. A row you price or route yourself keeps that until you apply to all." />
+                  </span>
                 </div>
+                <NoteChips note={bulkPriced.note} />
               </div>
             ) : null}
           </section>
@@ -518,65 +571,79 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
           <ul className="listing-rows" aria-label="Staged for pricing">
             {shown.map((row) => {
               const { entry } = row;
-              const priced = pricingOf(row, rowCurrency(row));
+              const currency = rowCurrency(row);
+              const priced = pricingOf(row, currency);
               const cents = priced.listCents;
               const tier = wearTier(entry.paintWear);
+              const caption = entry.venueCaption?.[row.venue] ?? entry.caption;
+              const quote = entry.marketHashName ? books.get(bookKey(entry.accountId, entry.marketHashName)) : undefined;
               return (
                 <li className="listing-row" key={row.key} data-state={row.state}>
                   <Thumbnail url={entry.imageUrl} name={entry.name} size={34} />
                   <span className="listing-row-text">
                     <span className="listing-row-name" title={entry.name}>{entry.name}</span>
-                    <span className="listing-row-meta quiet">
-                      <Icon name={entry.place.icon} size={11} />
-                      {entry.place.label}
-                      {tier ? ` · ${tier.label}` : ''}
-                      {entry.paintWear !== null ? <> · <span className="num">{formatFloat(entry.paintWear)}</span></> : null}
-                      {multiAccount ? ` · ${accountName(entry.accountId)}` : ''}
+                    <span className="listing-row-line">
+                      <span className="listing-row-meta quiet">
+                        <Tip content={entry.place.label}><Icon name={entry.place.icon} size={12} /></Tip>
+                        {entry.paintWear !== null ? (
+                          <Tip content={`Float ${formatFloat(entry.paintWear)}${tier ? ` · ${tier.label}` : ''}`}>
+                            <span className="listing-row-float">
+                              {tier ? <span className="wear-dot" style={{ background: `var(${tier.variable})` }} /> : null}
+                              <span className="num">{formatFloat(entry.paintWear)}</span>
+                            </span>
+                          </Tip>
+                        ) : null}
+                        {multiAccount ? <span className="listing-row-account">{accountName(entry.accountId)}</span> : null}
+                      </span>
+                      {entry.marketHashName ? (
+                        <OrderBookLine
+                          quote={quote}
+                          currency={currency}
+                          onPick={(figure) => dispatch({ type: 'price', key: row.key, price: dollars(figure), basis: 'buyer' })}
+                        />
+                      ) : null}
                     </span>
+                    {/* What the row has to say beyond its figures, on a line of its own so the
+                        facts and the book above it keep theirs. */}
+                    {caption || (priced.note && priced.note.short !== null) ? (
+                      <span className="listing-row-chips">
+                        {caption ? <Chip icon={caption.icon} text={caption.text}>{caption.short}</Chip> : null}
+                        <NoteChips note={priced.note} />
+                      </span>
+                    ) : null}
                   </span>
+                  {/* Taking a row out, and emptying the workspace — pill and all — by taking out
+                      the last one. The row stays selected, so the next staging brings it back. */}
                   <IconButton
                     icon="x"
                     size="sm"
                     className="listing-row-drop"
                     label={`Take ${entry.name} off the list`}
-                    onClick={() => drop(row.key)}
+                    onClick={() => dispatch({ type: 'drop', key: row.key })}
                   />
 
                   <div className="listing-controls">
                     <PriceFields
-                      currency={rowCurrency(row)}
+                      currency={currency}
                       subject={entry.name}
                       venue={row.venue}
                       priced={priced}
                       disabled={false}
-                      onChange={(next, basis) => update(row.key, (current) => ({ ...current, price: next, basis, ownPrice: true }))}
+                      onChange={(price, basis) => dispatch({ type: 'price', key: row.key, price, basis })}
                     />
 
                     {/* Only the venues this row's own verdict allows can be chosen. A row Steam will
                         take and CSFloat will not is not a row to offer CSFloat on and refuse later —
                         but CSFloat is still shown, disabled, saying why, so its absence is not a
                         question the person has to ask. */}
-                    <span className="listing-control listing-row-venue">
-                      <span className="listing-control-label">Marketplace</span>
-                      {row.venues.length > 1 || Object.keys(entry.unavailable ?? {}).length > 0 ? (
-                        <Select
-                          label={`Marketplace for ${entry.name}`}
-                          className="input-sm"
-                          value={row.venue}
-                          onChange={(next) => update(row.key, (current) => ({ ...current, venue: next as Venue, ownVenue: true }))}
-                        >
-                          {(Object.keys(VENUE) as Venue[]).map((venue) => {
-                            if (row.venues.includes(venue)) return <option key={venue} value={venue}>{VENUE[venue].label}</option>;
-                            const why = entry.unavailable?.[venue];
-                            return why ? <option key={venue} value={venue} disabled>{`${VENUE[venue].short} — ${why}`}</option> : null;
-                          })}
-                        </Select>
-                      ) : (
-                        <span className="listing-row-fixed quiet" title={VENUE[row.venue].label}>
-                          <VenueMark venue={row.venue} size={13} />{VENUE[row.venue].label}
-                        </span>
-                      )}
-                    </span>
+                    <VenueChoice
+                      className="listing-row-venue"
+                      label={`Marketplace for ${entry.name}`}
+                      value={row.venue}
+                      venues={row.venues}
+                      unavailable={entry.unavailable}
+                      onChange={(venue) => dispatch({ type: 'venue', key: row.key, venue })}
+                    />
 
                     <Button
                       size="sm"
@@ -589,15 +656,6 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
                     </Button>
                   </div>
 
-                  {priced.note ? (
-                    <Caption icon={priced.note.tone === 'warn' ? 'alert-circle' : 'info'} tone={priced.note.tone === 'warn' ? 'warn' : undefined}>
-                      {priced.note.text}
-                    </Caption>
-                  ) : null}
-                  {(() => {
-                    const caption = entry.venueCaption?.[row.venue] ?? entry.caption;
-                    return caption ? <Caption icon={caption.icon}>{caption.text}</Caption> : null;
-                  })()}
                   {row.state === 'refused' && row.detail ? <Caption icon="ban" tone="warn">{row.detail}</Caption> : null}
                 </li>
               );
@@ -607,20 +665,10 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
 
         <footer className="listing-dock-foot">
           <span className="listing-total quiet">
-            {steamRows.length > 0 ? (
-              <span className="listing-tally" title="Before anything is listed: what these would pay you, and what their buyers would pay">
-                <VenueMark venue="steam" size={12} />{plural(steamRows.length, 'item')} · you receive <span className="num">{formatAmount(steamTotal.receiveCents, steamCurrency)}</span>
-                {' '}· buyers pay <span className="num">{formatAmount(steamTotal.buyerCents, steamCurrency)}</span>
-              </span>
-            ) : null}
-            {csfloatRows.length > 0 ? (
-              <span className="listing-tally" title="Before anything is listed: what these would pay you after CSFloat's fee, and what the listings would show">
-                <VenueMark venue="csfloat" size={12} />{plural(csfloatRows.length, 'item')} · you receive <span className="num">{formatAmount(csfloatTotal.receiveCents, 1)}</span>
-                {' '}· buyers pay <span className="num">{formatAmount(csfloatTotal.buyerCents, 1)}</span>
-              </span>
-            ) : null}
+            {steamRows.length > 0 ? <Tally venue="steam" count={steamRows.length} total={steamTotal} currency={steamCurrency} noun={intent.noun} /> : null}
+            {csfloatRows.length > 0 ? <Tally venue="csfloat" count={csfloatRows.length} total={csfloatTotal} currency={1} noun={intent.noun} /> : null}
             {unpriced > 0 ? (
-              <span className="listing-tally" data-tone="warn"><Icon name="alert-circle" size={12} />{plural(unpriced, intent.noun)} without a price</span>
+              <span className="listing-tally" data-tone="warn" title={`${plural(unpriced, intent.noun)} without a price`}><Icon name="alert-circle" size={12} />{unpriced.toLocaleString()} unpriced</span>
             ) : null}
           </span>
           <Button
@@ -639,12 +687,94 @@ export function ListingWorkspace<E extends StagedEntry>({ staged, intent, reveal
   </>;
 }
 
+/** A word or two on the row, with the sentence behind it in a tip. */
+function Chip({ icon, text, tone, children }: { icon: IconName; text: string; tone?: 'warn' | 'info' | undefined; children: React.ReactNode }): React.JSX.Element {
+  return (
+    <Tip content={text}>
+      <span className="listing-chip" data-tone={tone}><Icon name={icon} size={11} />{children}</span>
+    </Tip>
+  );
+}
+
+/** What a typed figure has to say for itself, as a chip; an unparsable figure is the field's own to show. */
+function NoteChips({ note }: { note: Pricing['note'] }): React.JSX.Element | null {
+  if (!note || note.short === null) return null;
+  return <Chip icon={note.tone === 'warn' ? 'alert-circle' : 'info'} tone={note.tone} text={note.text}>{note.short}</Chip>;
+}
+
+/** One venue's rows added up: how many, what they would pay, what their buyers would. */
+function Tally({ venue, count, total, currency, noun }: { venue: Venue; count: number; total: { receiveCents: number; buyerCents: number }; currency: number | null; noun: string }): React.JSX.Element {
+  return (
+    <span
+      className="listing-tally"
+      title={`${plural(count, noun)} to ${VENUE[venue].label}, before anything is listed: you receive ${formatAmount(total.receiveCents, currency)} in all, buyers pay ${formatAmount(total.buyerCents, currency)}`}
+    >
+      <VenueMark venue={venue} size={12} />
+      <span className="num">{count.toLocaleString()}</span>
+      <span className="listing-figures">
+        <span className="num">{formatTick(total.receiveCents, currency)}</span>
+        <Icon name="arrow-right" size={11} />
+        <span className="num">{formatTick(total.buyerCents, currency)}</span>
+        <span className="listing-code">{currencyCodeOf(currency)}</span>
+      </span>
+    </span>
+  );
+}
+
+/**
+ * Which marketplace, as the venues' marks: a radio per venue the row can reach, and a disabled
+ * one, saying why in its tip, for a venue it cannot. A row with one venue and no alternative to
+ * explain is a fixed venue and shows the one mark. Each mark carries the venue's name for a
+ * reader who cannot see it.
+ */
+function VenueChoice({ label, value, venues, unavailable, onChange, className }: {
+  /** "Marketplace for every row", or for the item by name. */
+  label: string;
+  value: Venue;
+  venues: readonly Venue[];
+  unavailable?: Partial<Record<Venue, string>> | undefined;
+  onChange: (next: Venue) => void;
+  className?: string | undefined;
+}): React.JSX.Element {
+  const offered = (Object.keys(VENUE) as Venue[]).filter((venue) => venues.includes(venue) || unavailable?.[venue]);
+  if (offered.length <= 1) {
+    return (
+      <span className={['listing-venue', 'listing-venue-fixed', className].filter(Boolean).join(' ')} title={VENUE[value].label}>
+        <VenueMark venue={value} size={14} decorative />
+        <span className="visually-hidden">{VENUE[value].label}</span>
+      </span>
+    );
+  }
+  return (
+    <span className={['listing-venue', className].filter(Boolean).join(' ')} role="radiogroup" aria-label={label}>
+      {offered.map((venue) => {
+        const why = venues.includes(venue) ? null : unavailable?.[venue] ?? null;
+        return (
+          <button
+            key={venue}
+            type="button"
+            role="radio"
+            className="listing-venue-item"
+            aria-checked={value === venue}
+            disabled={why !== null}
+            title={why ? `${VENUE[venue].short} — ${why}` : VENUE[venue].label}
+            onClick={() => onChange(venue)}
+          >
+            <VenueMark venue={venue} size={14} decorative />
+            <span className="visually-hidden">{VENUE[venue].label}</span>
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
 /**
  * A price field that says it is one. `parseMoney` already ignores a leading currency mark, so a
  * typed $ is harmless; the class is not called `money`, which this sheet already uses for the
  * cross-venue figure that carries its own currency.
  */
-function MoneyInput({ label, currency, value, onChange, disabled, derived }: {
+function MoneyInput({ label, currency, value, onChange, disabled, derived, invalid }: {
   label: string;
   /** What a typed figure is in; the mark beside the field says so. */
   currency: number | null;
@@ -653,6 +783,8 @@ function MoneyInput({ label, currency, value, onChange, disabled, derived }: {
   disabled?: boolean | undefined;
   /** Worked out from the other field rather than typed, which it shows by being quieter. */
   derived?: boolean | undefined;
+  /** Typed, and not a price: the field says so itself, in red, rather than a sentence under it. */
+  invalid?: boolean | undefined;
 }): React.JSX.Element {
   return (
     <span className="price-input">
@@ -660,6 +792,7 @@ function MoneyInput({ label, currency, value, onChange, disabled, derived }: {
       <input
         className="input input-sm input-money"
         aria-label={label}
+        aria-invalid={invalid || undefined}
         data-currency={currencyCodeOf(currency) || undefined}
         inputMode="decimal"
         data-derived={derived || undefined}
@@ -695,6 +828,8 @@ function PriceFields({ subject, venue, currency, priced, disabled, onChange }: {
   const { settings, base, fx } = useCurrency();
   const code = currencyCodeOf(currency);
   const hint = settings.showAccountPagesInBase && priced.quote && code && code !== base ? convert(priced.quote.receiveCents, code, base, fx) : null;
+  // Something was typed and it is not a price: the typed field shows it, the other stays quiet.
+  const invalid = priced.quote === null && (priced.basis === 'receive' ? priced.receiveText : priced.buyerText).trim() !== '';
   return (
     <>
       {hint ? <span className="listing-control-hint cell-sub" data-testid="price-converted-hint" title={conversionNote(hint)}>you receive {formatConverted(hint)}</span> : null}
@@ -705,6 +840,7 @@ function PriceFields({ subject, venue, currency, priced, disabled, onChange }: {
           label={`You receive for ${subject}`}
           value={priced.receiveText}
           derived={priced.basis !== 'receive'}
+          invalid={invalid && priced.basis === 'receive'}
           disabled={disabled}
           onChange={(next) => onChange(next, 'receive')}
         />
@@ -713,7 +849,7 @@ function PriceFields({ subject, venue, currency, priced, disabled, onChange }: {
         <span className="listing-control-label">
           Buyer pays
           {fees !== null && fees > 0 ? (
-            <span className="listing-control-fee num" title={`${VENUE[venue].label}: ${breakdown}`}>+{formatAmount(fees, currency)}</span>
+            <span className="listing-control-fee num" title={`${VENUE[venue].label}: ${breakdown}`}>+{formatTick(fees, currency)}</span>
           ) : null}
         </span>
         <MoneyInput
@@ -721,6 +857,7 @@ function PriceFields({ subject, venue, currency, priced, disabled, onChange }: {
           label={`Buyer pays for ${subject}`}
           value={priced.buyerText}
           derived={priced.basis !== 'buyer'}
+          invalid={invalid && priced.basis === 'buyer'}
           disabled={disabled}
           onChange={(next) => onChange(next, 'buyer')}
         />
@@ -783,8 +920,12 @@ type Pricing = {
   /** The text each field shows: the typed one as typed, the other worked out to the cent. */
   receiveText: string;
   buyerText: string;
-  /** Why there is no list price, or how the listing differs from the figure typed. */
-  note: { tone: 'warn' | 'info'; text: string } | null;
+  /**
+   * Why there is no list price, or how the listing differs from the figure typed. `short` is the
+   * chip on the row and `text` the sentence in its tip; a note with no `short` is the field's own
+   * to show.
+   */
+  note: { tone: 'warn' | 'info'; short: string | null; text: string } | null;
 };
 
 /** A typed figure, read through one venue's fees. Every price on this screen goes through here. */
@@ -794,7 +935,7 @@ function pricing(venue: Venue, currency: number | null, text: string, basis: Pri
   const receiveText = basis === 'receive' ? text : quote ? dollars(quote.receiveCents) : '';
   const buyerText = basis === 'buyer' ? text : quote ? dollars(quote.buyerCents) : '';
   if (typed === null || quote === null) {
-    return { basis, quote: null, listCents: null, receiveText, buyerText, note: { tone: 'warn', text: 'Not a price.' } };
+    return { basis, quote: null, listCents: null, receiveText, buyerText, note: { tone: 'warn', short: null, text: 'Not a price.' } };
   }
   const listCents = listPriceOf(venue, quote);
   const minimum = MINIMUM_LIST_CENTS[venue];
@@ -802,7 +943,11 @@ function pricing(venue: Venue, currency: number | null, text: string, basis: Pri
     const least = MARKETPLACE_FEES[venue].listPrice === 'receive' ? quoteFromReceive(venue, minimum) : quoteFromBuyer(venue, minimum);
     return {
       basis, quote, listCents: null, receiveText, buyerText,
-      note: { tone: 'warn', text: `The cheapest ${VENUE[venue].short} listing has the buyer pay ${formatAmount(least.buyerCents, currency)}, which pays you ${formatAmount(least.receiveCents, currency)}.` }
+      note: {
+        tone: 'warn',
+        short: `min ${formatTick(least.buyerCents, currency)}`,
+        text: `The cheapest ${VENUE[venue].short} listing has the buyer pay ${formatAmount(least.buyerCents, currency)}, which pays you ${formatAmount(least.receiveCents, currency)}.`
+      }
     };
   }
   // Not every buyer price exists on a venue that adds its fees on top: 44¢ does not on Steam.
@@ -810,7 +955,11 @@ function pricing(venue: Venue, currency: number | null, text: string, basis: Pri
   const shown = basis === 'receive' ? quote.receiveCents : quote.buyerCents;
   const note = shown === typed
     ? null
-    : { tone: 'info' as const, text: `No ${VENUE[venue].short} listing has the buyer pay ${formatAmount(typed, currency)}. The nearest below is ${formatAmount(quote.buyerCents, currency)}, which pays you ${formatAmount(quote.receiveCents, currency)}.` };
+    : {
+      tone: 'info' as const,
+      short: `lists at ${formatTick(quote.buyerCents, currency)}`,
+      text: `No ${VENUE[venue].short} listing has the buyer pay ${formatAmount(typed, currency)}. The nearest below is ${formatAmount(quote.buyerCents, currency)}, which pays you ${formatAmount(quote.receiveCents, currency)}.`
+    };
   return { basis, quote, listCents, receiveText, buyerText, note };
 }
 
@@ -819,26 +968,34 @@ function pricing(venue: Venue, currency: number | null, text: string, basis: Pri
  * already listed at. A figure that changes nothing is still a price, so both fields show it, but
  * it is not something to send.
  */
-function pricingOf(row: Staged<StagedEntry>, currency: number | null): Pricing {
+function pricingOf(row: StagedRow<StagedEntry>, currency: number | null): Pricing {
   const priced = pricing(row.venue, currency, row.price, row.basis);
   if (priced.listCents === null || priced.listCents !== row.entry.currentListCents) return priced;
-  return { ...priced, listCents: null, note: { tone: 'info', text: 'This is the price it is already listed at.' } };
+  return { ...priced, listCents: null, note: { tone: 'info', short: 'unchanged', text: 'This is the price it is already listed at.' } };
 }
 
 /** A row's list price in integer cents, or `null` when it has none its venue would take. */
-function priceOf(row: Staged<StagedEntry>, currency: number | null): number | null {
+function priceOf(row: StagedRow<StagedEntry>, currency: number | null): number | null {
   return pricingOf(row, currency).listCents;
 }
 
+/**
+ * The bid level that takes the `unit`th unit of a name (counting from zero), walking the levels
+ * best-first by the units each rests for; `null` once the orders are used up.
+ */
+function levelForUnit(bids: readonly BookLevel[], unit: number): number | null {
+  let seen = 0;
+  for (const level of bids) {
+    seen += level.quantity;
+    if (unit < seen) return level.priceCents;
+  }
+  return null;
+}
+
 /** Both figures, summed over rows that each have a list price. */
-function tally(rows: ReadonlyArray<Staged<StagedEntry>>, currencyOf: (row: Staged<StagedEntry>) => number | null): { receiveCents: number; buyerCents: number } {
+function tally(rows: ReadonlyArray<StagedRow<StagedEntry>>, currencyOf: (row: StagedRow<StagedEntry>) => number | null): { receiveCents: number; buyerCents: number } {
   return rows.reduce((sum, row) => {
     const quote = pricing(row.venue, currencyOf(row), row.price, row.basis).quote;
     return quote ? { receiveCents: sum.receiveCents + quote.receiveCents, buyerCents: sum.buyerCents + quote.buyerCents } : sum;
   }, { receiveCents: 0, buyerCents: 0 });
-}
-
-/** Cents as a money field holds them: no currency mark, always two places. */
-export function dollars(cents: number): string {
-  return `${cents < 0 ? '-' : ''}${(Math.abs(cents) / 100).toFixed(2)}`;
 }

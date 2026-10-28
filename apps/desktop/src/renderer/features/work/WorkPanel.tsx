@@ -12,8 +12,8 @@ import { ACTION_DESTINATION, DESTINATION, VENUE_NAME, commandCounts, commandHead
 /** Which half of the drawer is showing. The app's work, or the person's. */
 export type WorkTab = 'work' | 'waiting';
 
-/** Work the engine reports under a bare action's kind: there is no command for Stop to halt. */
-const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL']);
+/** Work of one hop with nothing for Stop to halt: a bare action's kind, or a confirmation that follows work already sent. */
+const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL', 'CONFIRM']);
 
 /**
  * Everything queued, in flight and waiting to be observed — and, beside it, everything waiting
@@ -47,6 +47,9 @@ const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'BUY_ORDER_CREATE', 
  * thing read rather than a thing to work out. It is also, for a listing, literally the same row
  * seen from two ends: `AWAITING_CONFIRMATION` in the work tab is the member, and the waiting tab
  * is the listing that member is stuck behind.
+ *
+ * **A strategy's work says so.** A rule the person set up acts through the same commands, and its
+ * work reads "by a strategy" beside the time; a person's needs no word (strategy authority plan D5).
  *
  * **A send is here from the moment it is pressed.** The listing workspace hands its rows to the
  * outbox and lets go of them at once, so the first states a listing shows are the window's own —
@@ -128,9 +131,6 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
       wide
       icon={tab === 'waiting' ? 'smartphone' : 'activity'}
       title={tab === 'waiting' ? 'Waiting on you' : 'Work in progress'}
-      subtitle={tab === 'waiting'
-        ? 'Steam is holding these until you confirm them on your phone. This app cannot confirm for you.'
-        : 'Every step is confirmed by a later observation. Sent is not the same as done.'}
       onClose={onClose}
     >
       <div className="work-tabs">{tabs}</div>
@@ -145,7 +145,7 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
       ) : <>
       {error ? <div className="caption" data-tone="warn" role="alert">{error}</div> : null}
       {ordered.length === 0 ? (
-        <Empty icon="check-circle" title="Nothing in progress" hint="Commands you submit appear here until an observation confirms each step." />
+        <Empty icon="check-circle" title="Nothing in progress" />
       ) : ordered.map(([commandId, members]) => {
         const first = members[0]!;
         const kind = DESTINATION[first.commandKind] ?? { icon: 'package' as const, verb: 'Working on' };
@@ -168,6 +168,7 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
                 <span className="work-command-title">{first.outbox ? `${kind.verb} ${plural(quantity, kind.noun ?? 'item')}` : commandHeadline(kind, tally)}<Venue of={kind} /></span>
                 <span className="work-command-meta quiet">
                   {formatRelative(first.submittedAt)}
+                  {first.authority === 'STRATEGY' ? <> · by a strategy</> : null}
                   {accountIds.length > 1 ? <> · {first.accountId}</> : null}
                   {counts.map((part) => <React.Fragment key={part}> · {part}</React.Fragment>)}
                 </span>

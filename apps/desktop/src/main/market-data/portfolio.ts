@@ -1,14 +1,16 @@
 import {
   convert, currencyById, dayOf, unitPrice, valuePositions,
-  type Converted, type FillEntry, type FxRates, type Position, type Valuation, type ValuedPosition
+  type Converted, type FillEntry, type FxRates, type NameStatus, type Position, type StoredBook, type Valuation, type ValuedPosition
 } from '@cslytics/market-data';
 import type { AccountHoldings, InventoryPositionRow, PositionsEnvelope } from '@cslytics/engine';
 import { baseCurrencyOf, type DesktopSettings, type EngineCommand } from '../../shared/api.js';
 import type {
-  AccountFigures, BaseSum, ItemCurve, ItemHistory, ItemHolding, ItemPage, ItemVariants, ObservedByCurrency, ObservedFigure, ObservedKey, PortfolioValuation
+  AccountFigures, BaseSum, BookConverted, ItemBook, ItemCurve, ItemHistory, ItemHolding, ItemPage, ItemVariants, ObservedByCurrency, ObservedFigure, ObservedKey,
+  PortfolioValuation
 } from '../../shared/market.js';
 import type { CatalogueMediator, EnrichedRow } from '../catalogue/mediator.js';
 import type { MarketDataHost } from './host.js';
+import type { AccountBooks } from './account-books.js';
 
 /**
  * The portfolio's figures, assembled in main (portfolio and pricing plan §3): identity and counts
@@ -27,6 +29,8 @@ export type PortfolioDeps = {
    * not name now fails the typecheck instead.
    */
   invoke: (command: EngineCommand) => Promise<unknown>;
+  /** An account's own read of a book, for a wallet the anonymous book is not priced for (plan D17). */
+  accountBooks: AccountBooks;
   now?: () => Date;
 };
 
@@ -248,7 +252,10 @@ function newestBookCurrency(valuation: Valuation): string | null {
   return newest === null ? null : currencyById(newest.currency)?.code ?? null;
 }
 
-function writeSnapshots(deps: PortfolioDeps, holdings: readonly AccountHoldings[], rows: readonly Position[], books: ReadonlyMap<string, import('@cslytics/market-data').StoredBook>, statuses: ReadonlyMap<string, import('@cslytics/market-data').NameStatus>, fx: FxRates | null, base: string): void {
+function writeSnapshots(
+  deps: PortfolioDeps, holdings: readonly AccountHoldings[], rows: readonly Position[], books: ReadonlyMap<string, StoredBook>, statuses: ReadonlyMap<string, NameStatus>,
+  fx: FxRates | null, base: string
+): void {
   const day = dayOf((deps.now ?? (() => new Date()))().toISOString());
   for (const account of holdings) {
     const own = rows.filter((row) => row.accountId === account.accountId);
@@ -270,7 +277,7 @@ export async function itemPage(deps: PortfolioDeps, name: string, accountIds: re
   const settings = deps.settings();
   const base = baseCurrencyOf(settings);
   const fx = deps.host.store.latestFx() ?? null;
-  const book = deps.host.watch(name);
+  const book = deps.host.ask(name);
   const positions = await deps.invoke({ type: 'inventory.positions', accountIds: [...accountIds] }) as PositionsEnvelope;
   const holdings: ItemHolding[] = positions.kind === 'positions'
     ? deps.catalogue.enrich(positions.rows).filter((row) => row.marketHashName === name)
@@ -280,13 +287,30 @@ export async function itemPage(deps: PortfolioDeps, name: string, accountIds: re
   // the holding and the kept days are already in the cache. Each has its own command.
   const status = deps.host.store.status(name) ?? null;
   const daily = book ? deps.host.store.bookDaily(name, book.currency) : [];
+  return { name, holdings, book, status, daily, base, converted: convertedOf(book, base, fx) };
+}
+
+/**
+ * The open Items page's live read (`item.watch`): the book once the read it asked for has landed,
+ * with its figures converted afresh, so the header's conversions move with the book rather than
+ * keeping the first book's. Asked for an account, as the listing workspace asks, a wallet whose
+ * currency the anonymous book is not in gets the account's own read instead (`AccountBooks`,
+ * portfolio and pricing plan D17): a figure the venue named in the wallet's currency, which a
+ * price may be pressed from, where a converted one may not.
+ */
+export async function itemWatch(deps: PortfolioDeps, name: string, accountId?: string): Promise<ItemBook> {
+  const anonymous = await deps.host.watch(name);
+  const own = accountId === undefined ? null : await deps.accountBooks.read(accountId, name, anonymous);
+  const book = own ?? anonymous;
+  const status = deps.host.store.status(name) ?? null;
+  return { book, status, own: own !== null, converted: convertedOf(book, baseCurrencyOf(deps.settings()), deps.host.store.latestFx() ?? null) };
+}
+
+function convertedOf(book: import('@cslytics/market-data').StoredBook | null, base: string, fx: FxRates | null): BookConverted {
   const code = book ? currencyById(book.currency)?.code ?? null : null;
   const convertTo = (cents: number | null): Converted | null => (cents === null || code === null || code === base ? null : convert(cents, code, base, fx));
   const mid = book ? unitPrice(book) : null;
-  return {
-    name, holdings, book, status, daily, base,
-    converted: { mid: convertTo(mid?.cents ?? null), ask: convertTo(book?.lowestAskCents ?? null), bid: convertTo(book?.highestBidCents ?? null) }
-  };
+  return { mid: convertTo(mid?.cents ?? null), ask: convertTo(book?.lowestAskCents ?? null), bid: convertTo(book?.highestBidCents ?? null) };
 }
 
 /** The Steam series for a name: from the cache, or fetched once when it is missing or a day old. */

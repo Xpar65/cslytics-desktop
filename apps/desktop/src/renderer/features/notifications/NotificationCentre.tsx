@@ -23,11 +23,10 @@ export function NotificationCentre({ open, onClose }: { open: boolean; onClose: 
       open={open}
       icon="bell"
       title="Notifications"
-      subtitle="What the app raised on its own, whether or not you were looking."
       onClose={onClose}
     >
       {groups.now.length === 0 && groups.earlier.length === 0 ? (
-        <Empty icon="bell" title="Nothing yet" hint="Messages the app raises on its own are kept here." />
+        <Empty icon="bell" title="Nothing yet" />
       ) : null}
       {groups.now.length > 0 ? <Group title="Now" rows={groups.now} onGo={go} /> : null}
       {groups.earlier.length > 0 ? <Group title="Earlier" rows={groups.earlier} onGo={go} /> : null}

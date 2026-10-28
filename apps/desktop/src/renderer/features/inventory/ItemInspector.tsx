@@ -11,6 +11,8 @@ import { itemIsBusy } from '../work/work-busy.js';
 import { submitCommand, type CommandKind } from './commands.js';
 import type { StagedItem } from './list-intent.js';
 import { InspectorHero, InspectorKind, InspectorWear } from '../../components/InspectorParts.js';
+import { OrderBookLine } from '../../components/OrderBookLine.js';
+import { bookKey, useOrderBooks } from '../../lib/order-books.js';
 import { UnitFill, UnitName } from './UnitParts.js';
 import { ItemMoreDetails } from './ItemMoreDetails.js';
 import { isStorageUnit, itemName, unitOfItem } from './storage-unit.js';
@@ -42,8 +44,10 @@ import type { Message } from '../../components/ui.js';
  * The two names never contain one another, so "Store" and "Store 3 items" are separate controls
  * to a screen reader and to a test driving by role and name.
  */
-const GROUP_META: Readonly<Record<ActionGroup, { label: string; icon: IconName; submit: (count: number) => string }>> = {
-  LIST: { label: 'List for sale', icon: 'tag', submit: (count) => `List ${plural(count, 'item')}` },
+const GROUP_META: Readonly<Record<ActionGroup, { label: string; icon: IconName; submit: (count: number) => string; tab?: (count: number) => string }>> = {
+  // The verb's tab names what choosing it does: the selection joins the listing workspace, which
+  // is where the sale is priced and sent. `label` is the verb wherever a count is not to hand.
+  LIST: { label: 'Stage listing', icon: 'tag', submit: (count) => `List ${plural(count, 'item')}`, tab: (count) => (count === 1 ? 'Stage listing' : 'Stage listings') },
   STORE: { label: 'Store', icon: 'archive', submit: (count) => `Store ${plural(count, 'item')}` },
   TRANSFER: { label: 'Transfer', icon: 'send', submit: (count) => `Transfer ${plural(count, 'item')}` },
   RETRIEVE: { label: 'Retrieve', icon: 'download', submit: (count) => `Retrieve ${plural(count, 'item')}` },
@@ -68,10 +72,10 @@ const GROUP_META: Readonly<Record<ActionGroup, { label: string; icon: IconName; 
  * then asks for a price, a unit or an account. Rendering every allowed action with its own inputs
  * at once put three or four half-filled forms on a 320px column and made the venue — the rarest
  * decision of the lot — look like a second verb. Choosing a group opens exactly one detail panel;
- * choosing **List for sale** stages the selection in the [listing workspace](./ListingWorkspace.tsx),
- * because listing is the one action whose details differ per item. That dock belongs to the view
- * above rather than to this panel: it has to outlive the selection it was staged from, since
- * submitting a row is what takes that row out of the selection.
+ * choosing **Stage listing** stages the selection in the [listing workspace](../../components/ListingWorkspace.tsx),
+ * because listing is the one action whose details differ per item. That dock belongs to the shell
+ * rather than to this panel: it has to outlive the selection it was staged from, since submitting
+ * a row is what takes that row out of the selection, and staging adds to what is already there.
  *
  * Two rules run through the whole thing. **The engine is the gate** — hiding a button never
  * replaces a refusal, so whatever the engine says comes back verbatim in the notice. And **a
@@ -81,7 +85,7 @@ const GROUP_META: Readonly<Record<ActionGroup, { label: string; icon: IconName; 
  * Store is the one exception (`PARTIAL_GROUPS`): it is offered when some of the selection can be
  * stored, and its panel ([StoreDetail](./StoreDetail.tsx)) sends only those and says what it leaves out.
  */
-export function ItemInspector({ accountIds, accounts, units, selection, subject, busyKeys, onMessage, destinations, onDestinations, price, onPrice, onSubmitted, onStage, onDeselect, onUnitRenamed, onOpenItem }: {
+export function ItemInspector({ accountIds, accounts, units, selection, subject, busyKeys, onMessage, destinations, onDestinations, price, onPrice, onSubmitted, onStage, onDeselect, onUnitRenamed, onOpenItem, onShowUnit }: {
   accountIds: readonly string[];
   accounts: ReadonlyArray<{ id: string; name: string; steamId64?: string | null | undefined }>;
   units: readonly StoragePageRow[];
@@ -102,6 +106,8 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   onOpenItem?: ((name: string) => void) | undefined;
   /** A rename of the selected storage unit has settled, so `units` should be read again. */
   onUnitRenamed?: (() => void) | undefined;
+  /** Narrows the view to what the selected storage unit holds, as picking it in the filter bar does. */
+  onShowUnit?: ((unit: StoragePageRow) => void) | undefined;
 }): React.JSX.Element {
   const [submitting, setSubmitting] = useState<ActionKind | null>(null);
   const [eligibility, setEligibility] = useState<Record<string, CsfloatState>>({});
@@ -134,6 +140,14 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   }
   const count = selectionQuantity(selection) || rows.length;
   const frozen = Boolean(selection.manifest);
+  // The Steam order book for the one item shown, or for the roster row open, read live while it is
+  // on screen and for no other row: a selection of hundreds costs the market nothing until a row
+  // opens. Asked with the account, so a wallet the anonymous book is not priced for sees its own.
+  const shownRow = single ?? rows.find((row) => selectionKey(row) === openRow) ?? null;
+  const bookAccount = shownRow?.accountId ?? null;
+  const bookName = shownRow?.marketHashName ?? null;
+  const bookKeys = useMemo(() => (bookAccount !== null && bookName !== null ? [{ accountId: bookAccount, name: bookName }] : []), [bookAccount, bookName]);
+  const books = useOrderBooks(bookKeys, true);
 
   // Whether the venue is connected at all, which is a different question from whether this item is
   // eligible on it. A disconnected venue hides the action; an unchecked item explains itself.
@@ -214,7 +228,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
 
   if (rows.length === 0) {
     return <aside className="inspector" aria-label="Item inspector">
-      <Empty icon="package" title="No item selected" hint="Click an item to see what can be done with it." />
+      <Empty icon="package" title="No item selected" />
     </aside>;
   }
 
@@ -291,6 +305,9 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   const lock = single ? lockOf(single, now) : null;
   // A storage unit selected as an item: its own name, which can be changed here, and how full it is.
   const selectedUnit = single ? unitOfItem(single, units) : null;
+  // The item page is the item's market. A storage unit, a display item and a holding Steam reads as
+  // unmarketable are sold on none, so they have no page to open.
+  const hasItemPage = single !== null && !isStorageUnit(single) && !isDisplayOnly(single) && single.marketable !== 0;
 
   const unitFor = (row: NamedItem): string => (
     units.find((unit) => unit.accountId === row.accountId && unit.casketId === row.casketId)?.label
@@ -392,8 +409,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
       return (
         <>
           <Caption icon="tag">
-            {plural(rows.length, 'item')} staged. Price each one and choose where it goes, then list them one at a
-            time or all at once.
+            {plural(rows.length, 'item')} in the listing workspace, priced and sent from there.
           </Caption>
           <Caption icon="info">
             {venues.has('steam') ? <><VenueMark venue="steam" size={12} /> Steam</> : null}
@@ -496,14 +512,25 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
         selection listed underneath, an answer you have to scroll to find is not an answer. The
         intersection rule is unchanged: the engine accepts or refuses a batch atomically, so an
         action one item blocks is withheld for all of them. */}
-    {single && single.marketHashName && onOpenItem ? (
-      <div className="inspector-actions">
-        <Button size="sm" variant="ghost" icon="trending-up" data-testid="open-item-page" onClick={() => onOpenItem(single.marketHashName!)}>
-          Item page
-        </Button>
+    {/* The market the item is priced against, read live while it is shown: bid, mid and ask in
+        the book's currency, the account's own read when its wallet is in another (plan D17).
+        To read, not to press: a price is typed in the listing workspace, from the book on its row. */}
+    {single && single.marketHashName ? (
+      <div className="inspector-book" data-testid="inspector-book">
+        <OrderBookLine quote={books.get(bookKey(single.accountId, single.marketHashName))} />
+        {onOpenItem && hasItemPage ? (
+          <Button size="sm" variant="ghost" icon="trending-up" data-testid="open-item-page" onClick={() => onOpenItem(single.marketHashName!)}>
+            Item page
+          </Button>
+        ) : null}
       </div>
     ) : null}
     <div className="inspector-actions">
+      {selectedUnit && onShowUnit ? (
+        <Button size="sm" icon="search" data-testid="show-unit-items" onClick={() => onShowUnit(selectedUnit)}>
+          Show items in storage unit
+        </Button>
+      ) : null}
       {groups.allowed.length === 0 ? (
         <Caption icon="info">
           {single && isStorageUnit(single)
@@ -528,7 +555,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
                 onClick={() => choose(option)}
               >
                 <Icon name={GROUP_META[option].icon} size={15} />
-                <span>{GROUP_META[option].label}</span>
+                <span>{GROUP_META[option].tab?.(count) ?? GROUP_META[option].label}</span>
               </button>
             ))}
           </div>
@@ -636,6 +663,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
                     <InspectorKind rarity={row.rarity} collection={row.collection} />
                     {accountIds.length > 1 ? <div className="inspector-meta quiet">{accountName(row.accountId)}</div> : null}
                     <InspectorWear paintWear={wear} paintSeed={row.paintSeed} range={row} />
+                    {row.marketHashName ? <OrderBookLine quote={books.get(bookKey(row.accountId, row.marketHashName))} /> : null}
                     {rowLock ? <Caption icon="lock" tone="warn">{lockLabel(rowLock.kind, rowLock.until)}</Caption> : null}
                     {/* What this one allows, which is not always what the batch allows: it is how
                         a person finds the item that is holding an action back. */}

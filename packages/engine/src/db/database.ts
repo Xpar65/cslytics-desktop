@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { AccountId } from '@cslytics/ports';
-import type { CommandMemberState } from './alphabets.js';
+import type { CommandAuthority, CommandMemberState } from './alphabets.js';
 import { applySchema, existingVersion, SchemaNewerThanAppError, SCHEMA_VERSION } from './index.js';
 import { backupBeforeUpgrade } from './backup.js';
 import { WorkStore, isSettled } from './work.js';
@@ -50,7 +50,9 @@ export type ObservationRow = {
 };
 export type AttemptRow = {
   id: string; action_id: string; started_at: string; finished_at: string | null;
-  outcome: string | null; request_ref: string | null;
+  outcome: string | null; request_ref: string | null; response_ref: string | null;
+  /** When the venue that refused this attempt says the same request may go again; null for every other answer. */
+  retry_after: string | null;
 };
 
 export type ItemRow = {
@@ -186,6 +188,8 @@ export type CommandRow = {
   observed_completed?: number;
   revision?: number;
   filter_json?: string | null;
+  /** Whose the command is (strategy authority plan D1); a person's when not said. */
+  authority?: CommandAuthority;
 };
 
 /** The kind of a command that is a selection draft (consolidation plan §4.4). */
@@ -455,8 +459,8 @@ export class EngineDatabase {
 
   insertCommand(row: CommandRow): void {
     this.sqlite.prepare(`
-      INSERT INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed, revision, filter_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed, revision, filter_json, authority)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       row.id,
       row.correlation_id,
@@ -468,7 +472,8 @@ export class EngineDatabase {
       row.manifest_token ?? null,
       row.observed_completed ?? 0,
       row.revision ?? 1,
-      row.filter_json ?? null
+      row.filter_json ?? null,
+      row.authority ?? 'HUMAN'
     );
   }
 
@@ -794,14 +799,14 @@ export class EngineDatabase {
     return attemptId;
   }
 
-  finishAttempt(actionId: string, attemptId: string, outcome: string, response: unknown, now: string, error?: string): void {
+  finishAttempt(actionId: string, attemptId: string, outcome: string, response: unknown, now: string, error?: string, retryAfter: string | null = null): void {
     this.transaction(() => {
       const action = this.action(actionId);
       if (!action) throw new Error(`Unknown action ${actionId}`);
       const desired = action.desired_id === null ? { superseded_by: null }
         : this.sqlite.prepare(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null };
       const state = outcome === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION';
-      this.sqlite.prepare(`UPDATE attempt SET finished_at=?, outcome=?, response_ref=? WHERE id=?`).run(now, outcome, JSON.stringify(response), attemptId);
+      this.sqlite.prepare(`UPDATE attempt SET finished_at=?, outcome=?, response_ref=?, retry_after=? WHERE id=?`).run(now, outcome, JSON.stringify(response), retryAfter, attemptId);
       this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, desired.superseded_by ? 'superseded' : error ?? null, actionId);
     });
   }

@@ -11,9 +11,9 @@
  * `ALTER` statements add them, so that a freshly created database and a migrated one have their
  * columns in the same positions. `tests/unit/migrations.test.ts` fails if they diverge.
  */
-import { ACTION_STATES, COMMAND_MEMBER_STATES, COMMAND_STATES, EVIDENCE_SOURCES, EXECUTED_TRADE_STATUSES, ORDER_CONFIDENCES, ORDER_SIDES, ORDER_STATES, ORDER_VENUES, RESERVATION_STATES, STEAM_LISTING_BUCKETS, STORAGE_UNIT_STATES, STORE_SHEET_PARSE_STATES, TRADE_OFFER_STATUSES, TRADE_STATUS_EVENT_STATUSES, VENUE_CONNECTION_STATUSES, WORK_STEP_KINDS, WORK_STEP_STATES, sqlList } from './alphabets.js';
+import { ACTION_STATES, COMMAND_AUTHORITIES, COMMAND_MEMBER_STATES, COMMAND_STATES, EVIDENCE_SOURCES, EXECUTED_TRADE_STATUSES, ORDER_CONFIDENCES, ORDER_SIDES, ORDER_STATES, ORDER_VENUES, RESERVATION_STATES, STEAM_LISTING_BUCKETS, STORAGE_UNIT_STATES, STORE_SHEET_PARSE_STATES, TRADE_OFFER_STATUSES, TRADE_STATUS_EVENT_STATUSES, VENUE_CONNECTION_STATUSES, WORK_STEP_KINDS, WORK_STEP_STATES, sqlList } from './alphabets.js';
 
-export const SCHEMA_VERSION = 29;
+export const SCHEMA_VERSION = 31;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migration (
@@ -272,8 +272,15 @@ CREATE TABLE IF NOT EXISTS attempt (
   finished_at TEXT,
   outcome TEXT,
   request_ref TEXT,
-  response_ref TEXT
+  response_ref TEXT,
+  -- The venue's own wait before the same request may be made again, as an instant on the engine's
+  -- clock: a rate limit read from its headers, a cap on outstanding offers. Set by finishAttempt
+  -- from the refusal's retryAfterMs; null for every other answer (delivery retries plan D1, D2).
+  retry_after TEXT
 );
+-- An action's attempts: how many were made and the latest, asked per waiting row and per retry
+-- decision (kernel/not-applied.ts, read/queries/waiting.ts; strategy authority and confirmations plan D13).
+CREATE INDEX IF NOT EXISTS attempt_action ON attempt(action_id);
 
 CREATE TABLE IF NOT EXISTS event (
   id TEXT PRIMARY KEY,
@@ -371,7 +378,10 @@ CREATE TABLE IF NOT EXISTS command (
   manifest_token TEXT,
   observed_completed INTEGER NOT NULL DEFAULT 0,
   revision INTEGER NOT NULL DEFAULT 1,
-  filter_json TEXT
+  filter_json TEXT,
+  -- Appended by migration 30: whose the command is, a person or a strategy acting for one (strategy
+  -- authority and confirmations plan D1). What a person said about a holding stands (D3).
+  authority TEXT NOT NULL DEFAULT 'HUMAN' CHECK(authority IN (${sqlList(COMMAND_AUTHORITIES)}))
 );
 
 -- A member names the holding a command is about (local_id is its local id once a group member
@@ -392,6 +402,8 @@ CREATE TABLE IF NOT EXISTS command_member (
 );
 -- The resume after a restart and the purge ask for an account's members by state.
 CREATE INDEX IF NOT EXISTS command_member_account ON command_member(account_id, state);
+-- Who may act on a holding asks which commands named it (db/authority.ts, strategy authority plan D2).
+CREATE INDEX IF NOT EXISTS command_member_account_local ON command_member(account_id, local_id);
 
 -- One row per hop of a command (consolidation plan D2): the holding or the remote object it is
 -- about, the one action that carries it when one exists, the observation that settled it, and the
@@ -421,6 +433,9 @@ CREATE INDEX IF NOT EXISTS work_step_account_state ON work_step(account_id, stat
 CREATE INDEX IF NOT EXISTS work_step_account_local ON work_step(account_id, local_id);
 CREATE INDEX IF NOT EXISTS work_step_target ON work_step(account_id, kind, target_id);
 CREATE UNIQUE INDEX IF NOT EXISTS work_step_action ON work_step(action_id) WHERE action_id IS NOT NULL;
+-- Which hop sent an offer: whose an offer waiting on the phone is (read/queries/waiting.ts, strategy
+-- authority and confirmations plan D13).
+CREATE INDEX IF NOT EXISTS work_step_offer ON work_step(account_id, offer_id) WHERE offer_id IS NOT NULL;
 -- A cursor into a page of work is bound to these marks (read/queries/paging.ts); a hop that moves
 -- invalidates it, as a transfer's row did before the hops.
 

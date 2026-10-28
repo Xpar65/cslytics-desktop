@@ -174,9 +174,7 @@ export function StoreDetail({ selection, verdicts, destinations, unitPickers, un
           <Caption icon="alert-triangle" tone="warn">{plural(flagged.size, 'item')} of {total} {flagged.size === 1 ? 'needs' : 'need'} a decision</Caption>
           {claims.map(({ claim, count, asOf }) => (
             <Caption key={claim} icon="info">
-              <Tip content={CLAIMS[claim].consequence}>{count} {count === 1 ? CLAIMS[claim].one : CLAIMS[claim].many}</Tip>
-              {' · '}
-              <span className="quiet">{asOf.every((at) => at === null) ? 'never read' : `as of ${asOf.filter((at): at is string => at !== null).map((at) => formatRelative(at)).join(', ')}`}</span>
+              <Tip content={`${CLAIMS[claim].consequence} ${asOf.every((at) => at === null) ? 'Never read.' : `As of ${asOf.filter((at): at is string => at !== null).map((at) => formatRelative(at)).join(', ')}.`}`}>{count} {count === 1 ? CLAIMS[claim].one : CLAIMS[claim].many}</Tip>
             </Caption>
           ))}
           <Button size="sm" variant="primary" icon="archive" disabled={blocked || leaveCount === 0 || leaveRoom.length > 0} loading={sending === 'leave'} onClick={() => void send(false)}>

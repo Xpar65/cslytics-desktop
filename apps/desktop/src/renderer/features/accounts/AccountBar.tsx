@@ -31,6 +31,7 @@ export function AccountBar({
   scope,
   onSelect,
   onAddAccount,
+  canAdd = true,
   busy,
   aside,
   venues,
@@ -50,6 +51,8 @@ export function AccountBar({
   scope: string | null;
   onSelect: (accountId: string | null) => void;
   onAddAccount: () => void;
+  /** False when accounts are added elsewhere: a connected engine host's are its own (remote engine host plan D5). */
+  canAdd?: boolean | undefined;
   busy: boolean;
   /**
    * The right-hand end of this row, outside the part that scrolls.
@@ -107,7 +110,7 @@ export function AccountBar({
                 // The tooltip carries the sentence; the dot carries the glance. A dot alone
                 // cannot say "close CS2 on the other computer", which is the only useful thing
                 // to know when it is amber.
-                title={`${account.accountName} · Steam ID ${account.steamId64}\n${isConnecting ? 'Connecting…' : connection.detail}${flag ? `\n${flag.title}` : ''}`}
+                title={`${account.accountName} · Steam ID ${account.steamId64}\n${isConnecting ? 'Connecting…' : connection.detail}${holding?.wallet ? `\nWallet read ${age.label}` : ''}${flag ? `\n${flag.title}` : ''}`}
                 onClick={() => onSelect(account.accountId)}
               >
                 <Avatar name={account.accountName} size={30} presence={isConnecting ? 'connecting' : connection.tone} photo={account.avatarRef} />
@@ -121,7 +124,6 @@ export function AccountBar({
                       <>
                         <Icon name="wallet" size={11} />
                         {formatAmount(holding.wallet.balanceCents, holding.currency)}
-                        <span className="quiet">· {age.label}</span>
                       </>
                     ) : (
                       <span className="account-tab-conn" data-tone={connection.tone}>{isConnecting ? 'connecting…' : connection.label}</span>
@@ -133,10 +135,12 @@ export function AccountBar({
           })}
         </div>
 
-        <button type="button" className="account-tab account-tab-add" disabled={busy} onClick={onAddAccount} title="Sign in to another Steam account">
-          <Icon name="user-plus" size={15} />
-          <span className="account-tab-name" style={{ fontWeight: 500 }}>Add account</span>
-        </button>
+        {canAdd ? (
+          <button type="button" className="account-tab account-tab-add" disabled={busy} onClick={onAddAccount} title="Sign in to another Steam account">
+            <Icon name="user-plus" size={15} />
+            <span className="account-tab-name" style={{ fontWeight: 500 }}>Add account</span>
+          </button>
+        ) : null}
       </div>
 
       {aside ? <div className="account-bar-aside">{aside}</div> : null}

@@ -83,3 +83,89 @@ export function isHourly(xs: readonly number[], index: number): boolean {
   const after = index < xs.length - 1 ? xs[index + 1]! - here : Infinity;
   return Math.min(before, after) < DAY_MS - 60_000;
 }
+
+const HOUR_MS = 3_600_000;
+
+/** How long one volume bar is. Every bar on a chart is the same length, so their heights compare. */
+export type VolumeUnit = 'hour' | 'six-hours' | 'day' | 'week' | 'month';
+/**
+ * One bar. `partial` marks the bar at either end that the series covers only part of: the week the
+ * span starts inside, or the day still going on, whose low bar is time missing, not sales.
+ */
+export type VolumeBucket = { start: number; end: number; volume: number; partial?: 'start' | 'end' | undefined };
+export type VolumeBars = { unit: VolumeUnit; buckets: VolumeBucket[]; peak: number };
+
+const UNITS: readonly VolumeUnit[] = ['hour', 'six-hours', 'day', 'week', 'month'];
+
+/** The start of the bucket holding `at`, in UTC, which is how Steam dates its rows: a week starts on Monday. */
+export function bucketStart(at: number, unit: VolumeUnit): number {
+  switch (unit) {
+    case 'hour': return Math.floor(at / HOUR_MS) * HOUR_MS;
+    case 'six-hours': return Math.floor(at / (6 * HOUR_MS)) * 6 * HOUR_MS;
+    case 'day': return Math.floor(at / DAY_MS) * DAY_MS;
+    case 'week': {
+      const day = Math.floor(at / DAY_MS) * DAY_MS;
+      return day - ((new Date(day).getUTCDay() + 6) % 7) * DAY_MS;
+    }
+    case 'month': {
+      const date = new Date(at);
+      return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+    }
+  }
+}
+
+function bucketEnd(start: number, unit: VolumeUnit): number {
+  switch (unit) {
+    case 'hour': return start + HOUR_MS;
+    case 'six-hours': return start + 6 * HOUR_MS;
+    case 'day': return start + DAY_MS;
+    case 'week': return start + 7 * DAY_MS;
+    case 'month': {
+      const date = new Date(start);
+      return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1);
+    }
+  }
+}
+
+/**
+ * Sales per unit time, as bars of one length: the finest of an hour, six hours, a day, a week or a
+ * month that the series can be cut into and that fits `maxBars` across the plot.
+ *
+ * Steam's series is a row a day and then a row an hour for about the last month, so a bar per row
+ * would fall twenty-fold where the rows turn hourly, a drop in sales that never happened. Rows are
+ * summed into buckets instead, and a series with any daily row is never cut finer than a day. Every
+ * bucket from the first row's to the last row's is drawn, and one with no row in it is a zero: Steam
+ * leaves out a day or an hour with no sales. `null` when no point carries a sales count.
+ */
+export function volumeBars(points: readonly { x: number; volume?: number | undefined }[], maxBars: number): VolumeBars | null {
+  const sold = points.filter((point): point is { x: number; volume: number } => point.volume !== undefined);
+  if (sold.length === 0) return null;
+  const xs = sold.map((point) => point.x);
+  const hourly = sold.length > 1 && xs.every((_, index) => isHourly(xs, index));
+  const from = Math.min(...xs);
+  const to = Math.max(...xs);
+  const units = hourly ? UNITS : UNITS.slice(UNITS.indexOf('day'));
+  for (const unit of units) {
+    // A month is the coarsest there is, so it is never cut short however narrow the plot.
+    const cap = unit === 'month' ? Infinity : maxBars;
+    const starts: number[] = [];
+    for (let start = bucketStart(from, unit); start <= to && starts.length <= cap; start = bucketEnd(start, unit)) starts.push(start);
+    if (starts.length > cap) continue;
+    const volumes = new Map(starts.map((start) => [start, 0]));
+    for (const point of sold) {
+      const start = bucketStart(point.x, unit);
+      if (volumes.has(start)) volumes.set(start, volumes.get(start)! + point.volume);
+    }
+    const buckets: VolumeBucket[] = starts.map((start) => ({ start, end: bucketEnd(start, unit), volume: volumes.get(start)! }));
+    // A row stands for its hour or its day, so a bar is partial when its first row starts a row's
+    // length or more after the bar does, or its last row's period ends before the bar does.
+    const first = buckets[0]!;
+    const last = buckets[buckets.length - 1]!;
+    const firstRow = isHourly(xs, xs.indexOf(from)) ? HOUR_MS : DAY_MS;
+    const lastRow = isHourly(xs, xs.indexOf(to)) ? HOUR_MS : DAY_MS;
+    if (from - first.start >= firstRow) first.partial = 'start';
+    if (last.end - to > lastRow) last.partial = 'end';
+    return { unit, buckets, peak: Math.max(0, ...buckets.map((bucket) => bucket.volume)) };
+  }
+  return null;
+}

@@ -16,6 +16,27 @@ export type ExecutedTradeRow = {
   settled_at: string | null; reverses_trade_id: string | null; first_seen_obs: number; last_seen_obs: number;
 };
 
+/**
+ * What the record holds of an account's executed trades: one segment, contiguous from the newest
+ * trade down to a boundary, kept in `surface_state` as the `steam-trade-history` cursor.
+ *
+ * `afterTimeSeconds` and `afterTradeId` name the newest trade, the shape the checkpoint has carried
+ * since the surface was built, so `covered_through` is still that trade's time. `boundary*` name
+ * the oldest, the keyset an older page is read after. `total` is Steam's own count when it named
+ * one, `reachedEnd` whether a page past the boundary said there was nothing older, and `stopped`
+ * why a backfill gave up when it did (history backfill plan D1).
+ */
+export type TradeHistoryCoverage = {
+  afterTimeSeconds: number;
+  afterTradeId: string;
+  boundaryTimeSeconds: number;
+  boundaryTradeId: string;
+  coveredCount: number;
+  total: number | null;
+  reachedEnd: boolean;
+  stopped?: string;
+};
+
 export type TradeLineRow = {
   account_id: string; line_key: string; trade_id: string | null; offer_id: string | null;
   side: 'GIVE' | 'RECEIVE'; app_id: number; context_id: string; asset_id: string; new_asset_id: string | null;
@@ -131,6 +152,36 @@ export class TradeStore {
       .all(accountId) as TradeOfferRow[];
   }
 
+  /**
+   * The committed coverage of the account's executed trades, or undefined before a walk committed
+   * one. A checkpoint written before the backfill existed carried the newest trade alone, and moved
+   * only on a walk that had read to the end of the log, so it is read as one segment holding every
+   * trade the record has: the oldest row is its boundary and nothing is owed below it.
+   */
+  historyCoverage(accountId: string): TradeHistoryCoverage | undefined {
+    const row = this.db.checkpoint(accountId, 'steam-trade-history');
+    if (!row) return undefined;
+    const cursor = JSON.parse(row.cursor_json) as Partial<TradeHistoryCoverage>;
+    const integer = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value);
+    if (typeof cursor.afterTradeId !== 'string' || !integer(cursor.afterTimeSeconds)) return undefined;
+    if (typeof cursor.boundaryTradeId === 'string' && integer(cursor.boundaryTimeSeconds) && integer(cursor.coveredCount)) {
+      return {
+        afterTimeSeconds: cursor.afterTimeSeconds, afterTradeId: cursor.afterTradeId,
+        boundaryTimeSeconds: cursor.boundaryTimeSeconds, boundaryTradeId: cursor.boundaryTradeId,
+        coveredCount: cursor.coveredCount, total: integer(cursor.total) ? cursor.total : null,
+        reachedEnd: cursor.reachedEnd === true, ...(typeof cursor.stopped === 'string' ? { stopped: cursor.stopped } : {})
+      };
+    }
+    const oldest = this.db.raw().prepare(`SELECT trade_id, initiated_at FROM executed_trade WHERE account_id=? ORDER BY initiated_at, trade_id LIMIT 1`)
+      .get(accountId) as { trade_id: string; initiated_at: string } | undefined;
+    const held = (this.db.raw().prepare(`SELECT COUNT(*) AS n FROM executed_trade WHERE account_id=?`).get(accountId) as { n: number }).n;
+    return {
+      afterTimeSeconds: cursor.afterTimeSeconds, afterTradeId: cursor.afterTradeId,
+      boundaryTimeSeconds: oldest ? Math.floor(Date.parse(oldest.initiated_at) / 1000) : 0, boundaryTradeId: oldest?.trade_id ?? '',
+      coveredCount: held, total: held, reachedEnd: true
+    };
+  }
+
   executedTrade(accountId: string, tradeId: string): ExecutedTradeRow | undefined {
     return this.db.raw().prepare(`SELECT * FROM executed_trade WHERE account_id=? AND trade_id=?`)
       .get(accountId, tradeId) as ExecutedTradeRow | undefined;
@@ -161,7 +212,11 @@ export class TradeStore {
    * Asset ids currently pledged by an offer this account has not seen end.
    *
    * The store/list preflight asks this (TRD-06). It reads `GIVE` lines only: an item this
-   * account expects to *receive* is not yet ours to move.
+   * account expects to *receive* is not yet ours to move. An accepted offer pledges its assets
+   * until Steam's history says what became of them (delivery retries plan D8): complete, and they
+   * moved; reversed or rolled back, and they came back by a trade of their own; failed, and they
+   * never moved. Steam leaves the offer at `ACCEPTED` for ever in every one of those, so the offer
+   * alone would keep an item that came back pledged to the trade that gave it away.
    */
   committedTradeAssets(accountId: string, openStatuses: readonly string[]): Array<{ asset_id: string; offer_id: string; status: string }> {
     if (!openStatuses.length) return [];
@@ -170,6 +225,8 @@ export class TradeStore {
       JOIN trade_offer offer ON offer.account_id=line.account_id AND offer.offer_id=line.offer_id
       WHERE line.account_id=? AND line.side='GIVE' AND offer.status IN (${openStatuses.map(() => '?').join(',')})
       AND NOT EXISTS (SELECT 1 FROM work_step s WHERE s.account_id=offer.account_id AND s.kind='SEND' AND s.offer_id=offer.offer_id AND s.state='DONE')
+      AND NOT EXISTS (SELECT 1 FROM executed_trade t WHERE t.account_id=offer.account_id AND t.trade_id=offer.trade_id
+        AND t.status IN ('COMPLETE','REVERSED','ROLLED_BACK','FAILED'))
     `).all(accountId, ...openStatuses) as Array<{ asset_id: string; offer_id: string; status: string }>;
     // Before Steam supplies an offer id, the durable command is the pledge. An ambiguous
     // send must still exclude these assets from every other mutation, including after restart.

@@ -1,4 +1,4 @@
-import React, { useId, useState } from 'react';
+import React, { useState } from 'react';
 import {
   SYSTEM_THEMES,
   THEME_PREFERENCES,
@@ -43,7 +43,7 @@ export function AppearancePanel(): React.JSX.Element {
 
   return (
     <Panel>
-      <PanelHeader title="Appearance" icon="palette" subtitle="How this window looks. Remembered on this computer." />
+      <PanelHeader title="Appearance" icon="palette" />
       <div className="panel-body stack">
         <div className="theme-picker" role="radiogroup" aria-label="Theme">
           {THEME_PREFERENCES.map((id) => (
@@ -68,10 +68,8 @@ function ThemeOption({ id, checked, disabled, onChoose }: {
   disabled: boolean;
   onChoose: () => void;
 }): React.JSX.Element {
-  const describedBy = useId();
   const system = id === 'system';
   const label = system ? 'Match Windows' : THEMES[id].label;
-  const description = system ? 'Dark or light, as Windows is set' : THEMES[id].description;
   const icon: IconName = system ? 'monitor' : THEME_ICONS[id] ?? (THEMES[id].scheme === 'light' ? 'sun' : 'moon');
   return (
     <label className="theme-option" data-checked={checked} data-disabled={disabled || undefined}>
@@ -82,7 +80,6 @@ function ThemeOption({ id, checked, disabled, onChoose }: {
         checked={checked}
         disabled={disabled}
         aria-label={label}
-        aria-describedby={describedBy}
         onChange={onChoose}
       />
       {system ? (
@@ -98,7 +95,6 @@ function ThemeOption({ id, checked, disabled, onChoose }: {
           {label}
           {checked ? <Icon name="check" size={14} className="theme-option-check" /> : null}
         </span>
-        <span className="theme-option-hint" id={describedBy}>{description}</span>
       </span>
     </label>
   );

@@ -1,4 +1,4 @@
-import type { AccountId, CredentialVault, CsfloatCredentialRef, CsfloatTrade, CsfloatTradePort } from '@cslytics/ports';
+import type { AccountId, CredentialVault, CsfloatCredentialRef, CsfloatTrade, CsfloatTradePort, MutationOutcome } from '@cslytics/ports';
 import { CsfloatTransport, requireKey } from './transport.js';
 import { id, mutationResult, readResult, record, timestamp } from './outcome.js';
 import { readListing } from './listings.js';
@@ -15,6 +15,16 @@ export class CsfloatTradeAdapter implements CsfloatTradePort {
   async accept(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string) {
     return mutationResult(await this.transport.send({ accountId, method: 'POST', path: '/trades/bulk/accept', key: await requireKey(this.vault, credential), body: { trade_ids: [tradeId] } }),
       body => { const data = record(body)?.['data']; return Array.isArray(data) && data.length === 1 && record(data[0])?.['id'] === tradeId && record(data[0])?.['state'] === 'pending'; });
+  }
+  async acceptMany(accountId: AccountId, credential: CsfloatCredentialRef, tradeIds: readonly string[]): Promise<Record<string, MutationOutcome>> {
+    const result = await this.transport.send({ accountId, method: 'POST', path: '/trades/bulk/accept', key: await requireKey(this.vault, credential), body: { trade_ids: [...tradeIds] } });
+    const whole = mutationResult(result, body => Array.isArray(record(body)?.['data']));
+    if (whole.kind !== 'SUBMITTED' || result.kind !== 'response') return Object.fromEntries(tradeIds.map(tradeId => [tradeId, whole]));
+    const rows = (record(result.body)?.['data'] as unknown[]).map(record);
+    const pending = new Set(rows.filter(row => row?.['state'] === 'pending').map(row => row?.['id']));
+    return Object.fromEntries(tradeIds.map(tradeId => [tradeId, pending.has(tradeId)
+      ? { kind: 'SUBMITTED', evidence: 'CSFloat answered the trade pending; observation required', raw: { status: result.status, id: tradeId } }
+      : { kind: 'AMBIGUOUS', cause: 'unclassified', raw: { status: result.status, unnamed: tradeId } }] as const));
   }
   async notifyOffer(accountId: AccountId, credential: CsfloatCredentialRef, offerId: string, assetIds: readonly string[]) {
     return mutationResult(await this.transport.send({ accountId, method: 'POST', path: '/trades/steam-status/new-offer', key: await requireKey(this.vault, credential),

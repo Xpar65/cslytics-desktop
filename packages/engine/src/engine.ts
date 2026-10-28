@@ -1,7 +1,9 @@
 import type { AccountId, BuyOrderRequest, ClockPort, CsfloatMePatch, EnginePorts, GcEvent, GcStatus, MutationOutcome } from '@cslytics/ports';
 import { EngineDatabase, type AccountRow, type ActionRow, type ItemRow } from './db/database.js';
 import { AccountEndpointGovernors } from './kernel/governor.js';
-import { AccountLock } from './kernel/support.js';
+import { AccountLock, required } from './kernel/support.js';
+import { AUTHORITY_LIMIT, AuthorityStore, type HoldingSay } from './db/authority.js';
+import type { CommandAuthority } from './db/alphabets.js';
 import { createContext, type EngineContext } from './kernel/context.js';
 import { InventoryService } from './surfaces/inventory.js';
 import { StorageService } from './surfaces/storage.js';
@@ -40,6 +42,7 @@ import { FRESHNESS, type Surface, type SurfaceRef } from './kernel/evidence.js';
 import type { ObservationRow } from './db/database.js';
 import { proofDemand, type ProofOwner } from './policy/proof.js';
 import { RetryService, type RetrySenders } from './orchestrate/retry.js';
+import { ConfirmationService } from './orchestrate/confirmation.js';
 
 export type { MarketSyncResult } from './surfaces/market.js';
 export type { TradeSyncResult } from './surfaces/trades.js';
@@ -94,6 +97,8 @@ export type ServiceOverrides = {
   retention?: (database: EngineDatabase) => RetentionStore;
   /** The one resender. A saboteur substitutes one that never sends, to prove a retry is noticed. */
   retry?: (context: EngineContext, senders: RetrySenders) => RetryService;
+  /** The engine's own confirmations. A saboteur substitutes one that believes the port, or confirms what is not ours. */
+  confirmations?: (context: EngineContext) => ConfirmationService;
 };
 
 /**
@@ -123,6 +128,8 @@ export class TradingEngine {
    */
   readonly proofOwners: Readonly<Partial<Record<string, ProofOwner>>>;
   readonly retry: RetryService;
+  /** Inert unless a host composed `ports.confirmation` (strategy authority and confirmations plan D7). */
+  readonly confirmations: ConfirmationService;
   readonly transfers: TransferService;
   readonly csfloatAccount: CsfloatAccountService;
   readonly csfloatListings: CsfloatListingService;
@@ -172,7 +179,7 @@ export class TradingEngine {
       csfloatAccount: this.csfloatAccount, steamInventory: this.inventoryService, steamMarket: this.marketService, steamTrades: this.tradeService,
       policy: overrides.csfloatPolicy?.(this.context) ?? new CsfloatSellingPolicy(this.context), storage: this.storageService, settle: settling, reads: reading };
     this.csfloatSelling = overrides.csfloatSelling?.(this.context,csfloatServices) ?? new CsfloatSellingService(this.context,csfloatServices);
-    const deliveryServices = { trades: this.csfloatTrades, steamTrades: this.tradeService, reads: reading };
+    const deliveryServices = { trades: this.csfloatTrades, steamTrades: this.tradeService, reads: reading, settle: settling };
     this.csfloatDelivery = overrides.csfloatDelivery?.(this.context,deliveryServices) ?? new CsfloatDeliveryService(this.context,deliveryServices);
     this.inGameStore = overrides.inGameStore?.(this.context) ?? new InGameStoreService(this.context);
     this.accountPurge = overrides.accountPurge?.(database) ?? new AccountPurgeStore(database);
@@ -187,8 +194,10 @@ export class TradingEngine {
     this.sessions = overrides.session?.(this.context) ?? new SessionService(this.context);
     const commandServices = { storage: this.storageService, inventory: this.inventoryService, trades: this.tradeService, market: this.marketService, settle: settling, reads: reading };
     this.commands = overrides.command?.(this.context, commandServices) ?? new CommandService(this.context, commandServices);
+    this.confirmations = overrides.confirmations?.(this.context) ?? new ConfirmationService(this.context);
     const settleServices: SettleServices = { storage: this.storageService, market: this.marketService, buyOrders: this.buyOrderService, inGameStore: this.inGameStore,
-      csfloat: { reconcileSelling: (accountId) => this.csfloatSelling.reconcile(accountId), reconcileBuying: (accountId) => this.csfloatBuying.reconcile(accountId) } };
+      csfloat: { reconcileSelling: (accountId) => this.csfloatSelling.reconcile(accountId), reconcileBuying: (accountId) => this.csfloatBuying.reconcile(accountId) },
+      confirmations: { reconcile: (accountId) => this.confirmations.reconcile(accountId) } };
     const wake: WakeDrivers = (accountId, surfaces) => this.wakeDrivers(accountId, surfaces);
     this.settler = overrides.settle?.(this.context, settleServices, wake) ?? new SettleService(this.context, settleServices, wake);
     // Proof demand comes from the code that settles each kind (plan D5): one owner per kind.
@@ -196,7 +205,8 @@ export class TradingEngine {
       CREATE_SELL_LISTING: this.marketService, REMOVE_SELL_LISTING: this.marketService,
       CREATE_BUY_ORDER: this.buyOrderService, CANCEL_BUY_ORDER: this.buyOrderService,
       STORE_IN_CASKET: this.storageService, RETRIEVE_FROM_CASKET: this.storageService, RENAME_CASKET: this.storageService,
-      CSFLOAT_CANCEL: this.csfloatSelling, CSFLOAT_REPRICE: this.csfloatSelling
+      CSFLOAT_CANCEL: this.csfloatSelling, CSFLOAT_REPRICE: this.csfloatSelling,
+      CONFIRM: this.confirmations
     };
     const demand = (accountId: AccountId, provedByDispatch: readonly string[]) => proofDemand(this.database, accountId, proofOwners, [this.marketService.orders], provedByDispatch);
     // One sender per kind whose `RETRY_POLICY` row names the service: the same executor the
@@ -223,7 +233,9 @@ export class TradingEngine {
       this.csfloatBuying.schedule(accountId);
       // A resend the last run was counting down to: its schedule is in the rows, so it resumes.
       this.retry.schedule(accountId);
-    }, (accountId) => this.reads.start(accountId), (accountId) => { this.reads.stopAccount(accountId); this.retry.stopAccount(accountId); });
+      // A confirmation the last run opened and had not seen applied, where a port is composed.
+      this.confirmations.schedule(accountId);
+    }, (accountId) => this.reads.start(accountId), (accountId) => { this.reads.stopAccount(accountId); this.retry.stopAccount(accountId); this.confirmations.stopAccount(accountId); });
     // Wake-ups that follow a session rather than a walk. The ones that follow a walk run after
     // the settle that walk earned (`wakeDrivers`), so no driver starts from unsettled state.
     this.context.signals.subscribe((signal) => {
@@ -258,6 +270,8 @@ export class TradingEngine {
     // looks once. A command's chain whose hop it proved continues from here too: a reprice whose
     // cancel landed, a transfer whose retrieve a unit walk showed, a store the walk showed done.
     this.retry.schedule(accountId);
+    // A walk of the book or the offers is what opens a confirmation and what proves one.
+    if (seen.some((surface) => surface === 'steam-market' || surface === 'steam-trade-offers')) this.confirmations.schedule(accountId);
     // A Game Coordinator item event too: a retrieve is proved by its own SO create, and the panel's
     // hop must move when it lands rather than at the next walk (bulk storage plan D5, BULK-06).
     if (seen.some((surface) => ['steam-market', 'steam-market-history', 'gc-inventory', 'gc-casket', 'gc-event'].includes(surface))) this.commands.advanceSteps(accountId);
@@ -376,6 +390,7 @@ export class TradingEngine {
   shutdown(): void {
     this.commands.shutdown();
     this.retry.stop();
+    this.confirmations.stop();
     this.transfers.stop();
     this.csfloatSelling.stop();
     this.csfloatBuying.stop();
@@ -429,6 +444,11 @@ export class TradingEngine {
   /** Tells the broker which account the window is showing; `null` is the all-accounts scope. */
   setActiveAccount(accountId: AccountId | null): void {
     this.reads.setActiveAccount(accountId);
+  }
+
+  /** The accounts kept on the active cadence, as a set; the empty set is the all-accounts scope. */
+  setActiveAccounts(accountIds: readonly AccountId[]): void {
+    this.reads.setActiveAccounts(accountIds);
   }
 
   set onChanged(listener: ((notice: RefreshNotice) => void) | undefined) {
@@ -505,6 +525,19 @@ export class TradingEngine {
 
   setListingGoal(accountId: AccountId, localId: string, priceReceiveCents: number, commandId: string | null = null) {
     return this.listingPlanner.setListingGoal(accountId, localId, priceReceiveCents, commandId);
+  }
+
+  /**
+   * A person's word on who may act on these holdings (strategy authority and confirmations plan
+   * D4): `STRATEGY` hands them to a strategy, `HUMAN` keeps them. Answers each holding's say after
+   * it. A strategy must never send this; whoever drives the engine keeps it a person's press.
+   */
+  setAuthority(accountId: AccountId, localIds: readonly string[], authority: CommandAuthority): HoldingSay[] {
+    if (!localIds.length || localIds.length > AUTHORITY_LIMIT) throw new Error(`Name between 1 and ${AUTHORITY_LIMIT} items`);
+    for (const localId of localIds) required(this.database.itemByLocalId(accountId, localId), `Unknown item ${localId}`);
+    const store = new AuthorityStore(this.database);
+    store.set(accountId, localIds, authority, this.context.now());
+    return store.say(accountId, localIds);
   }
 
   planListing(accountId: AccountId, localId: string) { return this.listingPlanner.next(accountId, localId); }

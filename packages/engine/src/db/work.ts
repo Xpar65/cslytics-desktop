@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { MutationOutcome } from '@cslytics/ports';
 import type { ActionRow, EngineDatabase } from './database.js';
-import { OPEN_STEP_STATES, SETTLED_STEP_STATES, sqlList, type WorkStepKind, type WorkStepState } from './alphabets.js';
+import { OPEN_STEP_STATES, SETTLED_STEP_STATES, sqlList, type CommandAuthority, type WorkStepKind, type WorkStepState } from './alphabets.js';
 
 /**
  * One row per hop of a command (consolidation plan D2). A step names the holding or the remote
@@ -77,9 +77,9 @@ export class WorkStore {
    * Admits a command row for work that arrives with its own id, as a CSFloat edit or a store
    * purchase does. A command that exists is returned as it is: the same id is the same command.
    */
-  adoptCommand(id: string, kind: string, now: string): void {
-    this.db.raw().prepare(`INSERT OR IGNORE INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed)
-      VALUES (?, ?, ?, 'ADMITTED', NULL, ?, 0, NULL, 0)`).run(id, randomUUID(), kind, now);
+  adoptCommand(id: string, kind: string, now: string, authority: CommandAuthority = 'HUMAN'): void {
+    this.db.raw().prepare(`INSERT OR IGNORE INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed, authority)
+      VALUES (?, ?, ?, 'ADMITTED', NULL, ?, 0, NULL, 0, ?)`).run(id, randomUUID(), kind, now, authority);
   }
 
   insert(input: StepInput): WorkStepRow {
@@ -195,9 +195,9 @@ export class WorkStore {
    * A command of one hop, admitted with its own id: a delist asked for by hand, a buy order placed
    * or cancelled. The work panel reads it as any other hop (consolidation plan §4.4).
    */
-  lone(commandKind: string, input: Omit<StepInput, 'id' | 'commandId' | 'ordinal'>): WorkStepRow {
+  lone(commandKind: string, input: Omit<StepInput, 'id' | 'commandId' | 'ordinal'>, authority: CommandAuthority = 'HUMAN'): WorkStepRow {
     const commandId = randomUUID();
-    this.adoptCommand(commandId, commandKind, input.now);
+    this.adoptCommand(commandId, commandKind, input.now, authority);
     return this.insert({ ...input, id: `${commandId}:0`, commandId, ordinal: 0 });
   }
 

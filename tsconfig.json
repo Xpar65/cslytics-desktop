@@ -50,9 +50,6 @@
       ],
       "@cslytics/runtime/lock": [
         "packages/runtime/src/lock.ts"
-      ],
-      "@cslytics/host": [
-        "apps/host/src/index.ts"
       ]
     }
   },

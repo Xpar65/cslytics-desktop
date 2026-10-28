@@ -4,6 +4,8 @@ import { steamListedSql } from '../db/commitment.js';
 import { pageCsfloat, csfloatOverview, csfloatEligibility, csfloatGroupEligibility, type CsfloatBook, type CsfloatEligibility, type CsfloatGroupEligibility } from './queries/csfloat.js';
 import { CSFLOAT_CURRENCY, pageListings as readListingsPage, summariseListings as readListingsSummary, type ListingPageRequest, type ListingPageRow, type ListingsSummary } from './queries/listings.js';
 import { pageWaiting as readWaiting, type WaitingPage } from './queries/waiting.js';
+import { readAuthority, type AuthorityPage } from './queries/authority.js';
+import { historyCoverage as readHistoryCoverage, type HistoryCoverageRow } from './queries/coverage.js';
 import { readBuyOrders as readBuyOrderBook, type BuyOrderBook } from './queries/buy-orders.js';
 import type { PageEnvelope, ScopedPageRequest } from './queries/paging.js';
 import {
@@ -27,6 +29,7 @@ import {
   type HistoryPageRow
 } from './queries/records.js';
 import { pageOpenWork as readOpenWork, type WorkPage } from './queries/work.js';
+import { factsSince as readFactsSince, type FactsPage, type FactsRequest } from './queries/facts.js';
 import { pageTradeEntries as readTradeEntries, pageTradeItems as readTradeItems, readTradeEntry as readOneTradeEntry, summariseTrades as readTradeSummary, type TradeEntry, type TradeEntryRequest, type TradeItemRow, type TradeItemsRequest, type TradeListRequest, type TradeListRow, type TradeSummary, type TradeSummaryRequest } from './queries/trades.js';
 import { LedgerStore } from '../db/ledger.js';
 import { MarketplaceStore } from '../db/marketplace.js';
@@ -174,6 +177,11 @@ export class EngineViews {
    * infer that something is happening from the absence of a completion, which is exactly the
    * inference rule 1 forbids.
    */
+  /** The facts the bell carries, after the desktop's watermark (notifications plan §7.2). */
+  factsSince(request: FactsRequest): FactsPage {
+    return readFactsSince(this.database, request);
+  }
+
   pageOpenWork(request: { accountIds: readonly string[] }): WorkPage {
     return readOpenWork(this.database, request);
   }
@@ -182,12 +190,23 @@ export class EngineViews {
    * Everything observed to be waiting on the person, not on this app.
    *
    * The counterpart to `pageOpenWork`, and deliberately a separate read rather than a filter over
-   * it: open work drains by itself and these rows never do. This app cannot hold the secret that
-   * would let it confirm anything (rule 2), so a pending confirmation is a hand-off that stays
-   * until a human taps a phone. `queries/waiting.ts` has why the two sources are one list.
+   * it: open work drains by itself and these rows never do. The desktop cannot hold the secret that
+   * would let it confirm anything (rule 2), so there a pending confirmation is a hand-off that stays
+   * until a human taps a phone; a host with a confirmation port confirms only the rows its own hops
+   * made. `queries/waiting.ts` has why the two sources are one list, and whose each row is.
    */
   pageWaiting(request: { accountIds: readonly string[] }): WaitingPage {
     return readWaiting(this.database, request);
+  }
+
+  /** Who may act on each holding: a person, a strategy, or nobody yet (strategy authority plan D5). */
+  /** How much of each history the record holds for one account, and what its walks still owe. */
+  historyCoverage(accountId: string): HistoryCoverageRow[] {
+    return readHistoryCoverage(this.database, accountId);
+  }
+
+  holdingAuthority(request: { accountId: string; localIds: readonly string[] }): AuthorityPage {
+    return readAuthority(this.database, request);
   }
 
   inventory(accountId: AccountId): ItemRow[] {

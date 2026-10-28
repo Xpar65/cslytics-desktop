@@ -6,7 +6,7 @@
  * its adapter, its Oracle and its contract test. Adding a port method is then the same four
  * filenames every time — see cslytics-app-docs/architecture.md.
  */
-import type { SteamPorts } from './steam/index.js';
+import type { SteamConfirmationPort, SteamPorts } from './steam/index.js';
 import type { CsfloatPorts } from './csfloat/index.js';
 
 export type * from './kernel.js';
@@ -26,5 +26,9 @@ export { WEAR_TIERS, wearBand, wearBandSql } from './wear.js';
  *
  * CSFloat is optional because a Steam-only profile is a supported product state, not a
  * degraded one: no key, no venue, and every Steam surface still works (plan §4.1).
+ *
+ * `confirmation` is optional the other way round: the desktop never composes it, and a listing or
+ * an offer then waits on the person's phone as it always has. Only a host that confirms through
+ * its own gateway composes one (`steam/confirmation.ts`).
  */
-export type EnginePorts = SteamPorts & { csfloat?: CsfloatPorts };
+export type EnginePorts = SteamPorts & { csfloat?: CsfloatPorts; confirmation?: SteamConfirmationPort };

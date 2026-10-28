@@ -26,7 +26,11 @@ export type CsfloatBuyOrderRow = { account_id: string; order_id: string; hash_na
  * `csfloat_order`. `state` is the venue's own word, `observation_id` the read that last stated it.
  */
 export type CsfloatContract = { account_id: string; order_id: string; listing_id: string; asset_id: string; local_id: string | null;
-  state: string; price_cents: number; item_json: string; type: string; observation_id: number };
+  state: string; price_cents: number; item_json: string; type: string; observation_id: number;
+  /** When the venue says the listing was created, else when the read that first stated it finished. */
+  opened_at: string | null;
+  /** The stall walk that first showed it, or null for a listing no stall walk has shown. */
+  first_seen_obs: number | null };
 export type CsfloatTradeRow = { account_id: string; trade_id: string; listing_id: string; asset_id: string; local_id: string | null;
   state_word: string; seller_steam_id: string; data_json: string; observation_id: number; offer_id: string | null };
 export type StoredCsfloatTrade = Omit<CsfloatTrade, 'tradeToken'>;
@@ -74,7 +78,11 @@ export function csfloatDeliveryView(db: EngineDatabase, commandId: string): Csfl
     updated_at: steps.map((step) => step.updated_at).sort().at(-1)!
   };
   if (trade?.state === 'verified') return { ...base, state: 'DONE', error: null };
-  if (trade && ['failed', 'cancelled'].includes(trade.state)) return { ...base, state: 'CANCELLED', error: `CSFloat trade ${trade.state}` };
+  if (trade && ['failed', 'cancelled'].includes(trade.state)) {
+    const row = new CsfloatStore(db).trade(first.account_id, params.tradeId);
+    const reversed = row && new CsfloatStore(db).saleEnding(first.account_id, row) === 'reversed';
+    return { ...base, state: 'CANCELLED', error: reversed ? 'Reversed: Steam returned the item and CSFloat refunded the buyer' : `CSFloat trade ${trade.state}` };
+  }
   if (current.state === 'FAILED') return { ...base, state: 'BLOCKED', error: current.reason };
   if (current.state === 'QUEUED') return { ...base, state: current.reason ? 'BLOCKED' : 'QUEUED', error: current.reason };
   if (current.state === 'SENT') return { ...base, state: 'RUNNING', error: null };
@@ -91,7 +99,7 @@ export function csfloatDeliveryView(db: EngineDatabase, commandId: string): Csfl
 }
 
 const CONTRACT_SELECT = `SELECT v.account_id, v.order_id, v.venue_order_id AS listing_id, v.asset_id, v.local_id, s.state_word AS state,
-    v.price_cents, s.item_json, s.type, s.observation_id
+    v.price_cents, s.item_json, s.type, s.observation_id, v.opened_at, v.first_seen_obs
   FROM venue_order v JOIN csfloat_order s ON s.account_id=v.account_id AND s.order_id=v.order_id`;
 const BUY_ORDER_SELECT = `SELECT v.account_id, v.order_id, v.hash_name, v.price_cents, v.quantity, v.filled AS bought, s.properties_json, s.created_at,
     v.first_seen_obs, v.last_seen_obs
@@ -129,13 +137,21 @@ export class CsfloatStore {
    * def 1314 here, is `def_index` 58 there (the storage test account's read of 2026-09-22;
    * `fixtures/csfloat/INDEX.md`). Asking for either made every one of them unresolved, so none
    * could be listed.
+   *
+   * When the tuple matches several rows, the asset id picks among them (delivery retries plan D7):
+   * a skin that left and came back under a new id is two holdings with one fingerprint, the old
+   * row MISSING under the id it was seen under, and CSFloat's item names which. MISSING rows stay in
+   * the match on purpose: a verified old sale legitimately names the holding that left.
    */
   associate(accountId: string, item: CsfloatListingItem): string | null {
     if (item.paintIndex !== undefined && item.floatValue !== undefined && item.paintSeed !== undefined && item.quality !== undefined) {
-      const rows = this.db.raw().prepare(`SELECT local_id FROM item WHERE account_id=? AND def_index=? AND paint_index=? AND paint_wear=? AND paint_seed=? AND quality=?`)
-        .all(accountId,item.defIndex,item.paintIndex,item.floatValue,item.paintSeed,item.quality) as Array<{ local_id: string }>;
+      const rows = this.db.raw().prepare(`SELECT local_id, asset_id FROM item WHERE account_id=? AND def_index=? AND paint_index=? AND paint_wear=? AND paint_seed=? AND quality=?`)
+        .all(accountId,item.defIndex,item.paintIndex,item.floatValue,item.paintSeed,item.quality) as Array<{ local_id: string; asset_id: string | null }>;
       if (rows.length === 1) return rows[0]!.local_id;
-      if (rows.length > 1) return null;
+      if (rows.length > 1) {
+        const named = rows.filter((row) => row.asset_id === item.assetId);
+        return named.length === 1 ? named[0]!.local_id : null;
+      }
     }
     const unit = this.db.itemByAssetId(accountId,item.assetId);
     if (!unit) return null;
@@ -258,10 +274,33 @@ export class CsfloatStore {
     return this.db.raw().prepare(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND v.venue_order_id=?`)
       .get(accountId,listingId) as CsfloatContract | undefined;
   }
-  /** The advertisements that name a holding, by its row or by its asset id, in any state. */
-  contractsFor(accountId: string, localId: string | null, assetId: string | null): CsfloatContract[] {
-    return this.db.raw().prepare(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND (v.local_id=? OR v.asset_id=?)`)
+  /**
+   * When this listing's price last changed on this app's word: the latest reprice of it a read
+   * proved (`CSFLOAT_REPRICE` hop `DONE`, by `work_step_target`), or `null` for a listing never
+   * repriced from here. Read by the price-change cadence (`kernel/price-cadence.ts`) and by the
+   * listings page; the same statement has a registered query plan.
+   */
+  lastPriceChangeAt(accountId: string, listingId: string): string | null {
+    const row = this.db.raw().prepare(`SELECT MAX(w.updated_at) AS at FROM work_step w INDEXED BY work_step_target WHERE w.account_id=? AND w.kind='CSFLOAT_REPRICE' AND w.target_id=? AND w.state='DONE'`)
+      .get(accountId,listingId) as { at: string | null } | undefined;
+    return row?.at ?? null;
+  }
+  /**
+   * The advertisements that name a holding, by its row or by its asset id, in any state. With a
+   * `window`, only those that could be the product of an attempt begun then: created by the venue
+   * at or after `createdAfter` (the attempt's start, less the venue's clock), and shown by no stall
+   * walk at or before `knownBefore` (the attempt's observation watermark). A holding keeps every
+   * contract it ever had, and a refunded or delisted one is not the relist's (delivery retries plan
+   * D6). The window is applied here rather than in SQL: the venue's `created_at` carries
+   * microseconds and the engine's instants milliseconds, so the comparison is on parsed times.
+   */
+  contractsFor(accountId: string, localId: string | null, assetId: string | null, window?: { createdAfter: string; knownBefore: number }): CsfloatContract[] {
+    const rows = this.db.raw().prepare(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND (v.local_id=? OR v.asset_id=?)`)
       .all(accountId, localId, assetId) as CsfloatContract[];
+    if (!window) return rows;
+    const since = Date.parse(window.createdAfter);
+    return rows.filter((row) => !(row.first_seen_obs !== null && row.first_seen_obs <= window.knownBefore)
+      && !(row.opened_at !== null && Number.isFinite(Date.parse(row.opened_at)) && Date.parse(row.opened_at) < since));
   }
   /**
    * The advertisements still standing against a holding, by its row or by its asset id, and, when
@@ -280,7 +319,7 @@ export class CsfloatStore {
    * its own read. A listing the venue calls `sold` whose trade the sales book carries is explained
    * by that trade, which the trades walk keeps current, and is not among them: on a long-lived
    * account every past sale would otherwise be read one at a time at the endpoint's budget, and
-   * again on the next refresh (CSF-48, 1,545 of them on the first headless run, 2026-10-20).
+   * again on the next refresh (CSF-48; a first run over a long history found thousands, 2026-10-20).
    */
   unexplainedListings(accountId: string, limit = 250): string[] {
     return (this.db.raw().prepare(`SELECT v.venue_order_id AS listing_id FROM venue_order v JOIN csfloat_order s ON s.account_id=v.account_id AND s.order_id=v.order_id
@@ -290,5 +329,24 @@ export class CsfloatStore {
   }
   trade(accountId: string, tradeId: string): CsfloatTradeRow | undefined {
     return this.db.raw().prepare('SELECT * FROM csfloat_trade WHERE account_id=? AND trade_id=?').get(accountId,tradeId) as CsfloatTradeRow | undefined;
+  }
+  /**
+   * How a sale ended, beyond the venue's word (delivery retries plan D10): `reversed` when CSFloat
+   * calls the trade `failed` after the buyer had taken the item on Steam — the offer at `ACCEPTED`
+   * on the offers walk, its trade `REVERSED` in the history, or CSFloat's own copy of the offer at
+   * 3 — which is Steam's trade-protection rollback and CSFloat's refund of the buyer, about twenty
+   * minutes apart (captured 2026-10-27). Null for every other sale: a refund before the buyer
+   * accepted is a sale that failed, not one reversed.
+   */
+  saleEnding(accountId: string, trade: Pick<CsfloatTradeRow, 'state_word' | 'data_json' | 'offer_id'>): 'reversed' | null {
+    if (trade.state_word !== 'failed') return null;
+    let offerState: unknown;
+    try { offerState = (JSON.parse(trade.data_json) as { offerState?: unknown }).offerState; } catch { offerState = null; }
+    if (offerState === 3) return 'reversed';
+    if (!trade.offer_id) return null;
+    const steam = this.db.raw().prepare(`SELECT o.status AS offer_status, t.status AS trade_status FROM trade_offer o
+        LEFT JOIN executed_trade t ON t.account_id=o.account_id AND t.trade_id=o.trade_id WHERE o.account_id=? AND o.offer_id=?`)
+      .get(accountId,trade.offer_id) as { offer_status: string; trade_status: string | null } | undefined;
+    return steam && (steam.offer_status === 'ACCEPTED' || steam.trade_status === 'REVERSED') ? 'reversed' : null;
   }
 }

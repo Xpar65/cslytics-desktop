@@ -1,24 +1,28 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, ipcMain, Menu, nativeTheme, powerMonitor, protocol, utilityProcess, type UtilityProcess } from 'electron';
+import { mkdirSync } from 'node:fs';
+import { app, BrowserWindow, ipcMain, Menu, nativeTheme, powerMonitor, protocol } from 'electron';
+import { RUNTIME_COMMAND_TYPES } from '@cslytics/runtime/api';
 import { CATALOGUE_HOST, HttpCatalogueSource, IMAGE_SCHEME } from '@cslytics/catalogue';
 import { currencyById } from '@cslytics/market-data';
 import { MarketDataHost } from './market-data/host.js';
+import { AccountBooks } from './market-data/account-books.js';
 import { marketFetch } from './market-data/fetch.js';
-import { itemCurve, itemHistory, itemPage, itemVariants, portfolioValuation } from './market-data/portfolio.js';
+import { itemCurve, itemHistory, itemPage, itemVariants, itemWatch, portfolioValuation } from './market-data/portfolio.js';
 import { ImageCache } from './images/cache.js';
 import { imageFetch } from './images/fetch.js';
 import { ElectronCredentialVault } from './credential-vault.js';
 import { answerCslytics, createCslyticsAccount } from './cslytics-account/index.js';
 import { trustInterceptedHostsUnpackaged } from './unpackaged-certificates.js';
-import { reapRuntimeLock, reapRuntimeLockWhenGone } from '@cslytics/runtime/lock';
-import { purgeArgument, type PurgeOutcome, type PurgeRequest } from './runtime/account-clear.js';
-import { CHANGE_CHANNEL, engineCommandSchema } from '../shared/api.js';
+import { createEngineSide, type EngineSide } from './engine/engine-side.js';
+import { LocalRuntimeTransport } from './engine/local-runtime.js';
+import { HostPageView } from './engine/host-page-view.js';
+import { CHANGE_CHANNEL, ENGINE_HOST_SURFACE, engineCommandSchema, type ChangeNotification, type EngineCommand, type EngineConnection, type HostPage } from '../shared/api.js';
 import { catalogueFetch, csfloatSchemaFetch } from './catalogue/fetch.js';
 import { CatalogueMediator } from './catalogue/mediator.js';
 import { HoldingCounts, type GroupPage } from './catalogue/holding-counts.js';
 import { openCheckout } from './checkout/checkout-window.js';
 import { enrichStoreSheet, resolveStoreLines } from './store-names.js';
-import { DESKTOP_PRELOAD_ENTRY } from '../shared/build-contract.js';
+import { DESKTOP_PRELOAD_ENTRY, HOST_PAGE_PRELOAD_ENTRY } from '../shared/build-contract.js';
 import { compareNames } from '../shared/name-order.js';
 import type { ReleaseStatus } from '../shared/release.js';
 import { desktopUserAgent, policyFetch } from './release/fetch.js';
@@ -28,6 +32,7 @@ import { ReleasePolicySource } from './release/policy-source.js';
 import { DesktopUpdater } from './release/updater.js';
 import { DESKTOP_VERSION } from './release/version.js';
 import { SettingsStore } from './settings-store.js';
+import { NotificationsStateStore } from './notifications-state-store.js';
 import { resolveTheme, THEMES, windowChrome, type ThemePreference } from '../shared/themes/index.js';
 
 // On a network that filters TLS, Chrome reached api.cslytics.com over HTTP/3 while
@@ -62,27 +67,17 @@ protocol.registerSchemesAsPrivileged([
   { scheme: IMAGE_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: false, corsEnabled: false, stream: true } }
 ]);
 
-type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void };
-
-let runtime: UtilityProcess | null = null;
-let runtimeReady = false;
-let runtimeFailure: string | null = null;
-/** Why the runtime refused to open the trading record, in its own words; outlives its exit code. */
-let runtimeFatal: string | null = null;
 let quitting = false;
 let shuttingDownRuntime = false;
-/** The runtime `stopRuntime` is stopping, whose exit is therefore not a failure. */
-let stoppingRuntime: UtilityProcess | null = null;
-/**
- * A remove or reset in progress. Commands that arrive meanwhile wait for it: the runtime that
- * answers them is not running yet, or not yet listening.
- */
-let restarting: Promise<void> | null = null;
-let lockPath: string | null = null;
-let requestSequence = 1;
 /** The account the window last said it was showing; `null` is the all-accounts scope. */
 let focusedAccountId: string | null = null;
-const pending = new Map<number, Pending>();
+/**
+ * The engine this desktop drives, local or on another machine, behind the one seam every command
+ * goes through (remote engine host plan D1). Set once the app is ready.
+ */
+let engineSide: EngineSide | null = null;
+/** The view a connected host's page is shown in (plan D12), once there is a window to show it over. */
+let hostPageView: HostPageView | null = null;
 /** The caption strip's height in pixels; `--cs-titlebar` in `renderer/tokens.css` must equal it. */
 const TITLEBAR_HEIGHT = 32;
 
@@ -105,7 +100,6 @@ if (!acquiredLock) {
   if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
   app.whenReady().then(() => {
     const userData = app.getPath('userData');
-    lockPath = join(userData, 'trading.sqlite.runtime.lock');
     const vault = new ElectronCredentialVault(join(userData, 'credentials.enc.json'));
     // The optional CSlytics sign-in (CSlytics account sign-in plan §6). Read and verified beside the
     // runtime, never ahead of it: nothing about Steam waits on the website.
@@ -116,6 +110,10 @@ if (!acquiredLock) {
     // Preferences, read before the window exists so its first frame is already in the chosen theme.
     const settings = new SettingsStore(join(userData, 'settings.json'));
     settings.load();
+    // What the bell has told the person: main's file beside the settings (notifications plan §7.2),
+    // kept per connection so a host's account and a local one that share an id never share a
+    // watermark (remote engine host plan D11).
+    let notificationsState = notificationsStateFor(userData, settings.current().engine);
     // Telling Chromium which way the theme leans is what makes scrollbars, a select's list and the
     // page's `prefers-color-scheme` agree with it; `system` hands the question back to Windows.
     const followTheme = (preference: ThemePreference): void => {
@@ -186,7 +184,14 @@ if (!acquiredLock) {
     });
     marketHost = market;
     market.start();
-    const marketDeps = { host: market, catalogue, settings: () => settings.current(), invoke: invokeRuntime };
+    // An account's own read of a book, for a wallet the anonymous book is not priced for (plan
+    // D17): relayed by the runtime, or a journey's seed when the profile carries one.
+    const accountBooks = new AccountBooks({
+      invoke: invokeRuntime,
+      now: () => new Date(),
+      ...(market.oracle ? { seeded: (accountId: string, name: string) => market.seededAccountBook(accountId, name) } : {})
+    });
+    const marketDeps = { host: market, catalogue, settings: () => settings.current(), invoke: invokeRuntime, accountBooks };
     // CSFloat's own catalogue, which says why an item cannot go there (`csfloat-kinds.ts`): read at
     // start, then asked hourly and fetched once the copy held is four hours old. A failure keeps
     // the last copy; with none, rows carry no answer and the window says only what the read said.
@@ -217,126 +222,57 @@ if (!acquiredLock) {
         notifyCatalogueChanged();
       });
     /**
-     * Forks the Engine Runtime and answers once it is ready, with how the purge it was asked for
-     * went. Every handler checks that its child is still *the* runtime: across a restart the old
-     * one's last messages and its exit can arrive after the new one exists.
+     * The engine side (remote engine host plan D1–D3): the Engine Runtime forked beside the window
+     * over this profile's record, or a host on another machine over its four routes, as
+     * `settings.json` says. Either way every command below goes through `invokeRuntime`, and every
+     * change notice comes back through `relayChanged`; the local transport keeps the fork, the vault
+     * and checkout relays and the purge restart that used to live here.
      */
-    const startRuntime = (purge?: PurgeRequest): Promise<PurgeOutcome | null> => new Promise((resolve, reject) => {
-      runtimeReady = false;
-      runtimeFailure = null;
-      runtimeFatal = null;
-      const child = utilityProcess.fork(join(__dirname, 'engine-runtime.js'), [join(userData, 'trading.sqlite'), ...(purge ? [purgeArgument(purge)] : [])], {
-        serviceName: 'CSlytics Engine Runtime',
-        // The engine persists through `node:sqlite`, which is unflagged only from Node 24.
-        // Electron 37 bundles Node 22, where the module exists but throws without this flag —
-        // so tests can pass on a modern local Node while the packaged app fails to open its
-        // database. Decide from the Node actually running, not from the Electron version.
-        execArgv: sqliteRequiresFlag() ? ['--experimental-sqlite'] : []
-      });
-      runtime = child;
-      child.on('message', (message: any) => {
-        if (runtime !== child) return;
-        if (message?.kind === 'ready') {
-          runtimeReady = true;
-          console.info('Engine Runtime ready');
-          // The preference the engine steers by, applied before any page can ask it (consolidation plan D13).
-          void invokeRuntime({ type: 'csfloat.protection', enabled: settings.current().csfloat.protection }).catch(() => undefined);
-          resolve((message.purge ?? null) as PurgeOutcome | null);
-          return;
-        }
-        if (message?.kind === 'fatal') {
-          // The record was refused and left untouched: a newer build wrote it, or the backup before
-          // an upgrade could not be made. The runtime waits for this kill so the sentence arrives
-          // before its exit does, and every later command answers with the sentence.
-          runtimeFatal = String(message.reason ?? 'The Engine Runtime could not open the trading record.');
-          console.error('Engine Runtime refused the trading record:', runtimeFatal);
-          try { child.kill(); } catch { /* already gone */ }
-          return;
-        }
-        if (message?.kind === 'response') {
-          const waiter = pending.get(message.id);
-          if (!waiter) return;
-          pending.delete(message.id);
-          if (message.ok) waiter.resolve(message.value);
-          else waiter.reject(new Error(String(message.error)));
-          return;
-        }
-        if (message?.kind === 'vault-request') {
-          void handleVaultRequest(vault, message, child);
-          return;
-        }
-        if (message?.kind === 'checkout-request') {
-          void handleCheckoutRequest(message, child);
-          return;
-        }
-        if (message?.kind === 'changed') {
-          // Relayed, not interpreted. Main has no read model and must never grow one; the one thing
-          // it does with a notice is let go of the suggestion counts it kept for that account.
-          holdingCounts.forget(message.accountId);
-          for (const open of BrowserWindow.getAllWindows()) {
-            if (!open.isDestroyed()) open.webContents.send(CHANGE_CHANNEL, {
-              kind: 'changed',
-              accountId: message.accountId,
-              surfaces: message.surfaces,
-              at: message.at
-            });
-          }
-        }
-      });
-      child.on('exit', (code) => {
-        const deliberate = quitting || stoppingRuntime === child;
-        const phase = deliberate ? 'restarted' : runtimeReady ? `exited with code ${code}` : `failed to start with code ${code}`;
-        const error = new Error(runtimeFatal ?? `Engine Runtime ${phase}`);
-        reject(error);
-        if (runtime !== child) return;
-        if (!deliberate) runtimeFailure = error.message;
-        runtimeReady = false;
-        for (const waiter of pending.values()) waiter.reject(error);
-        pending.clear();
-        runtime = null;
-      });
+    const engine = createEngineSide({
+      settings,
+      vault,
+      desktopVersion: DESKTOP_VERSION,
+      local: () => new LocalRuntimeTransport({
+        userData,
+        entry: join(__dirname, 'engine-runtime.js'),
+        vault,
+        checkout: (request) => openCheckout(request, BrowserWindow.getAllWindows()[0]),
+        onNotice: relayChanged,
+        // The preference the engine steers by, applied before any page can ask it (consolidation plan D13).
+        onReady: () => { void invokeRuntime({ type: 'csfloat.protection', enabled: settings.current().csfloat.protection }).catch(() => undefined); },
+        isQuitting: () => quitting
+      }),
+      onNotice: relayChanged,
+      onHostState: notifyEngineHostChanged
     });
-    void startRuntime().catch(() => undefined);
-
-    /**
-     * Remove and reset (steam/auth.md, "Removing or resetting an account"): the runtime stopped as
-     * closing the app stops it, then started again with the account cleared before it answers
-     * anything. Nothing short of that can stop one account's refresh loop, supervisor, event queue
-     * and schedulers, so all of them restart; the window reloads and reconnects the other accounts.
-     */
-    const restartWithPurge = async (request: PurgeRequest): Promise<PurgeOutcome> => {
-      if (restarting) throw new Error('Another account is being removed or reset. Try again in a moment.');
-      // Asked of the running runtime first, so a refusal costs nobody their session.
-      const { refusal } = await invokeRuntime({ type: 'accounts.clearable', accountId: request.accountId }) as { refusal: string | null };
-      if (refusal) throw new Error(refusal);
-      let finished!: () => void;
-      restarting = new Promise<void>((resolve) => { finished = resolve; });
-      try {
-        await stopRuntime();
-        // A runtime that never exited is abandoned; nothing it was asked will be answered.
-        for (const waiter of pending.values()) waiter.reject(new Error('Engine Runtime restarted'));
-        pending.clear();
-        if (quitting) throw new Error('CSlytics is closing.');
-        let outcome: PurgeOutcome | null;
-        try {
-          outcome = await startRuntime(request);
-        } catch (error) {
-          // The purge is one transaction, so a runtime that died in it left the record whole.
-          // Start one without it rather than leave the app with no runtime at all.
-          if (lockPath) reapRuntimeLock(lockPath);
-          if (!quitting) await startRuntime().catch(() => undefined);
-          throw error;
-        }
-        return outcome ?? { ...request, ok: false, error: 'The Engine Runtime did not say whether the account was cleared.' };
-      } finally {
-        restarting = null;
-        finished();
-      }
+    engineSide = engine;
+    engine.start();
+    // A connected host's pages, over the content area (plan D12). The list is read when the window
+    // asks for it and kept until the connection changes, so moving a page's frame reads nothing.
+    const hostPage = new HostPageView({
+      preload: join(__dirname, `../preload/${HOST_PAGE_PRELOAD_ENTRY}`),
+      host: () => {
+        const origin = engine.hostOrigin();
+        const token = engine.hostToken();
+        return origin !== null && token !== null ? { origin, token } : null;
+      },
+      window: () => appWindow
+    });
+    hostPageView = hostPage;
+    let hostPages: HostPage[] | null = null;
+    const pagesOfHost = async (): Promise<HostPage[]> => {
+      hostPages ??= await engine.pages();
+      return hostPages;
+    };
+    /** The connection changed under the window: its per-connection files and the host's pages start over. */
+    const reconnected = (): void => {
+      hostPage.close();
+      hostPages = null;
+      notificationsState = notificationsStateFor(userData, engine.connection);
+      holdingCounts.forgetAll();
     };
 
-    ipcMain.handle('trading:command', async (_event, raw: unknown) => {
-      const command = engineCommandSchema.parse(raw);
-      if (restarting && command.type !== 'accounts.remove' && command.type !== 'accounts.reset') await restarting;
+    const answer = async (command: EngineCommand): Promise<unknown> => {
       if (command.type === 'release.status') return releaseStatus();
       if (command.type === 'release.check') {
         await updater.check();
@@ -350,6 +286,36 @@ if (!acquiredLock) {
       // runtime nor a venue, and its reason is the error every page already knows how to show.
       const refusal = decide(policy.current(), DESKTOP_VERSION, command.type);
       if (refusal.refused) throw new Error(refusal.message);
+      // Which engine this desktop drives (remote engine host plan): answered here, never forwarded.
+      if (command.type === 'engine.status') return engine.status();
+      if (command.type === 'engine.connect') {
+        const status = await engine.connect(command);
+        reconnected();
+        return status;
+      }
+      if (command.type === 'engine.disconnect') {
+        const status = await engine.disconnect();
+        reconnected();
+        return status;
+      }
+      if (command.type === 'engine.pages') {
+        hostPages = null;
+        return pagesOfHost();
+      }
+      if (command.type === 'engine.showPage') {
+        const page = (await pagesOfHost()).find((row) => row.id === command.id);
+        if (!page) throw new Error('The engine host no longer serves that page.');
+        hostPage.show(page, command.bounds);
+        return null;
+      }
+      if (command.type === 'engine.hidePage') {
+        hostPage.hide();
+        return null;
+      }
+      // What the host owns when the engine is on another machine (plan D5): the sessions, the
+      // process, its cadence and its one preference. Each answers with the sentence, and nothing is sent.
+      const owned = engine.refusal(command.type);
+      if (owned) throw new Error(owned);
       // This desktop's preferences: main's file, never the runtime's.
       if (command.type === 'settings.read') return settings.current();
       if (command.type === 'csfloat.protection') {
@@ -368,13 +334,16 @@ if (!acquiredLock) {
       const cslyticsAnswer = answerCslytics(cslytics, cslyticsReady, command);
       if (cslyticsAnswer) return cslyticsAnswer;
       if (command.type === 'settings.currency') return settings.writeCurrency(command.currency);
+      // The bell's watermarks: main's file, never the runtime's.
+      if (command.type === 'notifications.state') return notificationsState.current();
+      if (command.type === 'notifications.seen') return notificationsState.markSeen(command.accountId, command.watermark);
       // Prices, from main's own cache over the engine's reads; the runtime never sees one.
       if (command.type === 'portfolio.valuation') return portfolioValuation(marketDeps, command.accountIds);
       if (command.type === 'market.status') return market.status();
       if (command.type === 'market.fx') return market.store.latestFx() ?? null;
       if (command.type === 'portfolio.history') return market.store.valuationSnapshots(command.accountIds);
       if (command.type === 'item.page') return itemPage(marketDeps, command.name, command.accountIds);
-      if (command.type === 'item.watch') return market.watch(command.name);
+      if (command.type === 'item.watch') return itemWatch(marketDeps, command.name, command.accountId);
       if (command.type === 'item.history') return itemHistory(marketDeps, command.name);
       if (command.type === 'item.curve') return itemCurve(marketDeps, command.name, command.venue ?? 'steam');
       if (command.type === 'item.variants') return itemVariants(marketDeps, command.name, command.accountIds);
@@ -397,11 +366,12 @@ if (!acquiredLock) {
         // A refusal throws before anything restarts. Past that point the outcome comes back either
         // way: the runtime has restarted, and the window has sessions to bring back even when the
         // purge rolled back.
-        const outcome = await restartWithPurge({ accountId: command.accountId, mode });
+        const outcome = await engine.restartWithPurge({ accountId: command.accountId, mode });
         holdingCounts.forget(command.accountId);
         // Its preferences are data about it on this computer too. Reset keeps them.
         if (outcome.ok && mode === 'remove') {
           try { settings.forgetAccount(command.accountId); } catch (error) { console.warn('Could not forget the removed account\'s settings', error); }
+          try { notificationsState.forgetAccount(command.accountId); } catch (error) { console.warn('Could not forget the removed account\'s notifications watermark', error); }
         }
         return outcome;
       }
@@ -424,7 +394,7 @@ if (!acquiredLock) {
       // The window is the only thing that knows which account it is showing, and the tier hooks
       // above fire without it. Remembering the last scope it named is what lets a focus event
       // restore the right one rather than guessing.
-      if (command.type === 'refresh.scope') focusedAccountId = command.accountId;
+      if (command.type === 'refresh.scope') focusedAccountId = command.accountIds[0] ?? null;
       if (command.type === 'work.open' || command.type === 'waiting.open') {
         // Names and pictures, and nothing else. A `waiting.open` offer row carries the identity
         // of the item the trades walk matched to its first given line, so it is named here the
@@ -517,6 +487,32 @@ if (!acquiredLock) {
         return invokeRuntime({ ...command, lines: resolveStoreLines(command.lines) });
       }
       return invokeRuntime(command);
+    };
+    ipcMain.handle('trading:command', (_event, raw: unknown) => answer(engineCommandSchema.parse(raw)));
+
+    // A connected host's page, in its view (plan D12): the engine's commands and the reads main
+    // makes over them, answered as the window's are, and nothing this desktop answers about itself.
+    // Only the view may ask; a page cannot change this desktop's settings, sign-in or connection.
+    ipcMain.handle('host-page:command', (event, raw: unknown) => {
+      if (!hostPage.isSender(event.sender)) throw new Error('Not a host page.');
+      const command = engineCommandSchema.parse(raw);
+      if (!hostPageMaySend(command.type)) throw new Error(`A host page may not send ${command.type}.`);
+      return answer(command);
+    });
+    ipcMain.handle('host-page:host', async (event, raw: unknown) => {
+      if (!hostPage.isSender(event.sender)) throw new Error('Not a host page.');
+      const reply = await engine.hostRequest('POST', '/host/command', raw);
+      let parsed: unknown = null;
+      try {
+        parsed = reply.body ? JSON.parse(reply.body) : null;
+      } catch {
+        throw new Error(`The engine host answered ${reply.status} with something that is not JSON.`);
+      }
+      if (reply.status < 200 || reply.status >= 300) {
+        const error = (parsed as { error?: unknown } | null)?.error;
+        throw new Error(typeof error === 'string' ? error : `The engine host answered ${reply.status}.`);
+      }
+      return parsed;
     });
 
     // No File/Edit/View menu in any build, and so none of its hidden shortcuts. Text fields keep
@@ -578,7 +574,9 @@ if (!acquiredLock) {
      * budget.
      */
     const tier = (accountId: string | null): void => {
-      void invokeRuntime({ type: 'refresh.scope', accountId }).catch(() => undefined);
+      // A host sets its own cadence (plan D5); a hint from this window would re-tier its accounts.
+      if (engine.connection.kind !== 'local') return;
+      void invokeRuntime({ type: 'refresh.scope', accountIds: accountId === null ? [] : [accountId] }).catch(() => undefined);
     };
     window.on('focus', () => tier(focusedAccountId));
     window.on('blur', () => tier(null));
@@ -598,7 +596,7 @@ if (!acquiredLock) {
       marketVisible();
       // Only the accounts the runtime is already keeping current. Naming every account here would
       // sign in the ones their owner left signed out, because reading an account signs it in.
-      void invokeRuntime({ type: 'refresh.resume' }).catch(() => undefined);
+      if (engine.connection.kind === 'local') void invokeRuntime({ type: 'refresh.resume' }).catch(() => undefined);
     });
   });
 
@@ -616,56 +614,88 @@ if (!acquiredLock) {
     const market = marketHost;
     marketHost = null;
     if (market) void market.stop().catch(() => undefined);
-    if (!runtime || shuttingDownRuntime) {
-      if (lockPath) reapRuntimeLock(lockPath);
+    if (shuttingDownRuntime) return;
+    const side = engineSide;
+    if (!side) return;
+    hostPageView?.close();
+    const local = side.local;
+    if (!local || !local.running) {
+      // Nothing to wait for: a remote stream ends as the process does, and a lock left by a
+      // runtime that already went is reaped.
+      local?.reapLock();
+      shuttingDownRuntime = true;
+      void side.close().catch(() => undefined);
       return;
     }
     event.preventDefault();
     shuttingDownRuntime = true;
-    void stopRuntime().then(() => {
-      runtime = null;
-      app.quit();
-    });
+    void side.close().then(() => app.quit());
   });
 }
 
 /**
- * Asks the Engine Runtime to stop the way closing the app does, and resolves once it has gone: a
- * clean shutdown, or a kill after two seconds and up to two more for the exit to land. A restart
- * needs the exit itself, because the next runtime refuses the record while this one holds its
- * lock. The lock is reaped either way.
+ * The bell's watermark file for this connection (remote engine host plan D11): beside the settings
+ * for the local engine, under `remote/<host>/` for a host, so two records never share one.
  */
-function stopRuntime(): Promise<void> {
-  const child = runtime;
-  if (!child) {
-    if (lockPath) reapRuntimeLock(lockPath);
-    return Promise.resolve();
+function notificationsStateFor(userData: string, connection: EngineConnection): NotificationsStateStore {
+  let directory = userData;
+  if (connection.kind === 'remote') {
+    directory = join(userData, 'remote', hostFolderName(connection.url));
+    mkdirSync(directory, { recursive: true });
   }
-  stoppingRuntime = child;
-  return new Promise((resolve) => {
-    let finished = false;
-    let giveUp: ReturnType<typeof setTimeout> | undefined;
-    const finish = (): void => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(kill);
-      if (giveUp) clearTimeout(giveUp);
-      // The runtime has exited or been killed; the lock goes once its pid is really gone.
-      if (lockPath) void reapRuntimeLockWhenGone(lockPath).finally(() => resolve());
-      else resolve();
-    };
-    child.once('exit', finish);
-    const kill = setTimeout(() => {
-      console.warn('engine runtime: still running two seconds after being asked to stop; killing it');
-      try { child.kill(); } catch { /* already gone */ }
-      giveUp = setTimeout(finish, 2_000);
-    }, 2_000);
-    try {
-      child.postMessage({ kind: 'shutdown' });
-    } catch {
-      try { child.kill(); } catch { /* already gone */ }
-    }
-  });
+  const store = new NotificationsStateStore(join(directory, 'notifications-state.json'));
+  store.load();
+  return store;
+}
+
+/** A host URL as a folder name: its host and port, every other character replaced. */
+function hostFolderName(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname}_${parsed.port || (parsed.protocol === 'https:' ? '443' : '80')}`.replace(/[^A-Za-z0-9._-]/g, '_');
+  } catch {
+    return url.replace(/[^A-Za-z0-9._-]/g, '_');
+  }
+}
+
+/**
+ * What a connected host's page may ask through its view (plan D12): the engine's own commands and
+ * the reads main makes over them, which name items and price them. Nothing about this desktop.
+ */
+function hostPageMaySend(type: string): boolean {
+  return RUNTIME_COMMAND_TYPES.has(type)
+    || type.startsWith('catalogue.')
+    || type.startsWith('item.')
+    || type === 'portfolio.valuation'
+    || type === 'portfolio.history'
+    || type === 'market.status'
+    || type === 'market.fx';
+}
+
+/**
+ * A change notice from whichever engine is driven: relayed, not interpreted. Main has no read model
+ * and must never grow one; the one thing it does with a notice is let go of the suggestion counts
+ * it kept for that account. A host's page hears it the way the window does.
+ */
+function relayChanged(notice: ChangeNotification): void {
+  holdingCounts.forget(notice.accountId);
+  for (const open of BrowserWindow.getAllWindows()) {
+    if (!open.isDestroyed()) open.webContents.send(CHANGE_CHANNEL, notice);
+  }
+  hostPageView?.notify(notice);
+}
+
+/** The engine connection's state moved: the window re-reads `engine.status`. */
+function notifyEngineHostChanged(): void {
+  for (const open of BrowserWindow.getAllWindows()) {
+    if (open.isDestroyed()) continue;
+    open.webContents.send(CHANGE_CHANNEL, {
+      kind: 'changed',
+      accountId: ENGINE_HOST_SURFACE,
+      surfaces: [ENGINE_HOST_SURFACE],
+      at: new Date().toISOString()
+    });
+  }
 }
 
 /**
@@ -800,66 +830,13 @@ function notifyMarketChanged(): void {
   }, 1_500);
 }
 
-/** True when this Node needs `--experimental-sqlite` to expose `node:sqlite`. */
-function sqliteRequiresFlag(): boolean {
-  const major = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
-  return Number.isFinite(major) && major < 24;
-}
-
 /**
- * One request to the Engine Runtime. Rejects rather than throws, so a caller that does not await
- * it — the focus and wake hints — cannot become an uncaught exception in main; and waits out a
- * remove or reset, whose runtime is not listening yet.
+ * One request to whichever engine is driven. Rejects rather than throws, so a caller that does not
+ * await it — the focus and wake hints — cannot become an uncaught exception in main. The local
+ * transport waits out a remove or reset itself; the remote one answers with the host's sentence.
  */
 async function invokeRuntime(command: unknown): Promise<unknown> {
-  if (restarting) await restarting;
-  const child = runtime;
-  if (!child) throw new Error(runtimeFailure ?? 'Engine Runtime is not running');
-  const id = requestSequence++;
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    child.postMessage({ kind: 'request', id, command });
-  });
-}
-
-/**
- * The Engine Runtime cannot open a window, so Valve's checkout page is main's to show. The URL
- * and the cookies arrive here and go to the checkout session only; the answer is one word.
- */
-async function handleCheckoutRequest(message: any, child: UtilityProcess): Promise<void> {
-  try {
-    const outcome = await openCheckout({
-      accountId: String(message.accountId),
-      txnId: String(message.txnId),
-      url: String(message.url),
-      cookies: Array.isArray(message.cookies) ? message.cookies.map(String) : [],
-      timeoutMs: Number(message.timeoutMs) || 600_000
-    }, BrowserWindow.getAllWindows()[0]);
-    replyTo(child, { kind: 'checkout-response', id: message.id, ok: true, outcome });
-  } catch (error) {
-    replyTo(child, { kind: 'checkout-response', id: message.id, ok: false, error: error instanceof Error ? error.message : String(error) });
-  }
-}
-
-/**
- * Answers the runtime that asked, and only while it is still the runtime. Request ids restart in
- * every runtime, so an answer meant for one that a remove or reset stopped could otherwise settle
- * an unrelated request in the next.
- */
-function replyTo(child: UtilityProcess, message: unknown): void {
-  if (runtime !== child) return;
-  try { child.postMessage(message); } catch { /* it has gone */ }
-}
-
-async function handleVaultRequest(vault: ElectronCredentialVault, message: any, child: UtilityProcess): Promise<void> {
-  try {
-    let value: unknown;
-    if (message.operation === 'get') value = await vault.get(String(message.key));
-    else if (message.operation === 'set') value = await vault.set(String(message.key), String(message.value));
-    else if (message.operation === 'delete') value = await vault.delete(String(message.key));
-    else throw new Error('Unknown vault operation');
-    replyTo(child, { kind: 'vault-response', id: message.id, ok: true, value });
-  } catch (error) {
-    replyTo(child, { kind: 'vault-response', id: message.id, ok: false, error: error instanceof Error ? error.message : String(error) });
-  }
+  const side = engineSide;
+  if (!side) throw new Error('Engine Runtime is not running');
+  return side.invoke(command);
 }

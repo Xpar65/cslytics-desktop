@@ -137,6 +137,10 @@ export class MarketDataScheduler {
   private lastObserved = new Map<string, number>();
   /** Names the store said not to ask again before a time, by that time. */
   private readonly due = new Map<string, number>();
+  /** Callers waiting for a name's read to land, by name (`settled`). */
+  private readonly waiters = new Map<string, Array<() => void>>();
+  /** Ends the loop's idle wait early: set while it waits with nothing to read. */
+  private wake: (() => void) | null = null;
 
   constructor(
     private readonly deps: { source: MarketDataSource; store: MarketDataStore; clock: ClockPort; onEvent?: (event: SchedulerEvent) => void },
@@ -159,7 +163,24 @@ export class MarketDataScheduler {
       if (observed !== undefined && nowMs - observed < this.options.demandMinIntervalMs) continue;
       this.demandSet.add(name);
       this.demandQueue.unshift(name);
+      this.wake?.();
     }
+  }
+
+  /**
+   * Resolves once no read of `name` is queued on the demand lane or in the air, and at once when
+   * none is. A caller that has just asked `demand` therefore waits for the read it asked for, or
+   * for the read already in the air that made its own unnecessary. A stop resolves every waiter;
+   * a pause or a 429 holds them, which is why the open page bounds its wait
+   * (`MarketDataHost.watch`).
+   */
+  settled(name: string): Promise<void> {
+    if (!this.demandSet.has(name) && !this.inFlight.has(name)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiting = this.waiters.get(name);
+      if (waiting) waiting.push(resolve);
+      else this.waiters.set(name, [resolve]);
+    });
   }
 
   /**
@@ -251,7 +272,7 @@ export class MarketDataScheduler {
         if (this.isPaused(nowMs)) { await this.deps.clock.sleep(1_000); continue; }
         if (this.inFlight.size >= this.options.maxInFlight) { await this.deps.clock.sleep(50); continue; }
         const next = this.pick(nowMs);
-        if (next === null) { await this.deps.clock.sleep(1_000); continue; }
+        if (next === null) { await this.idle(1_000); continue; }
         const rps = next.lane === 'trickle' ? this.options.trickleRps : this.offeredRps;
         const slotMs = Math.max(this.nextSlotMs, nowMs);
         if (slotMs > nowMs) {
@@ -268,6 +289,7 @@ export class MarketDataScheduler {
       while (this.inFlight.size > 0) await this.deps.clock.sleep(10);
       this.running = false;
       this.stopRequested = null;
+      for (const name of [...this.waiters.keys()]) this.release(name);
     }
   }
 
@@ -349,6 +371,7 @@ export class MarketDataScheduler {
       this.emit({ kind: 'unknown', name, detail });
     } finally {
       this.inFlight.delete(name);
+      if (!this.demandSet.has(name)) this.release(name);
       if (lane === 'fill') {
         this.fillInFlight -= 1;
         this.fillDone += 1;
@@ -438,6 +461,25 @@ export class MarketDataScheduler {
   private medianLatency(nowMs: number): number | null {
     const recent = this.latencies.filter((sample) => sample.atMs >= nowMs - this.options.governor.windowMs).map((sample) => sample.ms);
     return recent.length === 0 ? null : median(recent);
+  }
+
+  /**
+   * The loop's wait when nothing is due, which a name put on screen ends at once: an open page's
+   * read waits for its rate slot, never for the rest of an idle second, so the page keeps Steam's
+   * five-second cadence rather than drifting up to a second behind it.
+   */
+  private idle(ms: number): Promise<void> {
+    return Promise.race([
+      this.deps.clock.sleep(ms),
+      new Promise<void>((resolve) => { this.wake = resolve; })
+    ]).finally(() => { this.wake = null; });
+  }
+
+  private release(name: string): void {
+    const waiting = this.waiters.get(name);
+    if (!waiting) return;
+    this.waiters.delete(name);
+    for (const resolve of waiting) resolve();
   }
 
   private emit(event: SchedulerEvent): void {
