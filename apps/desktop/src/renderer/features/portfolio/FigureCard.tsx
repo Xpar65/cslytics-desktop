@@ -15,13 +15,15 @@ export type CardLine = { label: React.ReactNode; value: string | Shown; tip?: st
  * `.metric-value` holds the figure and nothing else, so a reader, and a test, reading it gets the
  * amount and its code alone.
  */
-export function FigureCard({ title, icon, tip, testId, hue, value, lines = [], index = 0, children }: {
+export function FigureCard({ title, icon, tip, testId, state, hue, value, lines = [], index = 0, children }: {
   title: React.ReactNode;
   icon: IconName;
   tip?: React.ReactNode | undefined;
   testId: string;
+  /** Where a card that fills on its own is, for a reader and a test: `data-state`. */
+  state?: string | undefined;
   /** The holdings hue for the card's top edge, when the card counts one of the venues' buckets. */
-  hue?: 'wallet' | 'listed' | 'unconfirmed' | 'inventory' | undefined;
+  hue?: 'wallet' | 'listed' | 'inventory' | undefined;
   value: string | Shown | null;
   lines?: readonly CardLine[] | undefined;
   index?: number | undefined;
@@ -31,6 +33,7 @@ export function FigureCard({ title, icon, tip, testId, hue, value, lines = [], i
     <article
       className="metric value-card enter"
       data-testid={testId}
+      data-state={state}
       data-hue={hue}
       style={{ animationDelay: `${60 + index * 40}ms` }}
     >

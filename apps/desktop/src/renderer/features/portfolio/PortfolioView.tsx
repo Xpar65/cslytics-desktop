@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { CSFLOAT_CURRENCY } from '@cslytics/ports';
 import type { AccountHoldings } from '../../lib/types.js';
 import type { AccountFigures, ObservedKey, PortfolioValuation } from '../../../shared/market.js';
 import { aggregate, freshness, heldCounts, quantity, share } from '../../lib/portfolio.js';
@@ -14,7 +15,7 @@ import { MoneyFigures, shown, type Shown } from './money-figures.js';
 /**
  * Portfolio: the observed money, and the per-account table you click through into an account.
  * Every number here is one a venue named — a wallet balance, a listing's proceeds, a buy order's
- * total — as main grouped it by currency and converted it (plan §3, §5.2). The headline that adds
+ * total — as main grouped it by currency and converted it (portfolio and pricing plan §3; money and currency page §3). The headline that adds
  * the inventory's appraisal to these is the holdings panel above; what the inventory is *worth* is
  * the Value panel's question.
  *
@@ -26,9 +27,6 @@ import { MoneyFigures, shown, type Shown } from './money-figures.js';
  * The table is for the scope of every account; scoped to one account the page leaves it out,
  * because a one-row table is a worse way to read one row.
  */
-
-/** CSFloat's balance is US dollars, whatever the account's Steam wallet is in. */
-const CSFLOAT_CURRENCY = 'USD';
 
 export function PortfolioView({
   holdings,
@@ -111,16 +109,6 @@ export function PortfolioView({
           />
           <FigureCard
             index={1}
-            icon="smartphone"
-            hue="unconfirmed"
-            title="Awaiting confirmation"
-            testId="portfolio-awaiting"
-            tip="Listings waiting for a tap in the Steam mobile app. This app never confirms them."
-            value={show('awaitingConfirmation', steamHome)}
-            lines={[{ label: 'Listings', value: totals.counts.listingsAwaitingConfirmation.toLocaleString() }]}
-          />
-          <FigureCard
-            index={2}
             icon="shopping-cart"
             hue="wallet"
             title="Buy orders"

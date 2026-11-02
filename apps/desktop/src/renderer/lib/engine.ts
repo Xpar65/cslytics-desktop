@@ -150,6 +150,8 @@ export const engine = {
   releaseStatus: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.status' }),
   checkForUpdate: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.check' }),
   installUpdate: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.install' }),
+  // What changed, on cslytics.com/changelog: the version waiting to install if there is one, else this one. Opened by main.
+  openReleaseNotes: () => invoke<import('../../shared/release.js').ReleaseStatus>({ type: 'release.notes' }),
   // The optional CSlytics sign-in, answered by main. Each answers with the account's status, never a token.
   cslyticsStatus: () => invoke<CslyticsStatus>({ type: 'cslytics.status' }),
   cslyticsSignIn: () => invoke<CslyticsStatus>({ type: 'cslytics.signIn' }),
@@ -163,6 +165,8 @@ export const engine = {
   /** What this desktop does with one account when it opens; answers with the settings as stored. */
   writeLaunch: (accountId: string, launch: import('../../shared/api.js').AccountLaunch) =>
     invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.launch', accountId, launch }),
+  writePrompts: (prompts: import('../../shared/api.js').PromptsSettings) =>
+    invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.prompts', prompts }),
   /** The currency section whole: the base code and the account-pages toggle. */
   writeCurrency: (currency: import('../../shared/api.js').CurrencySettings) =>
     invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.currency', currency }),

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { InventoryFilter, InventoryGroupRow, PageEnvelope, SelectionSnapshot, StoragePageRow } from '@cslytics/engine';
 import { PagedRows } from '../../components/PagedRows.js';
-import { Badge, Button, Check, DetailView, Drawer, Empty, Field, IconButton, Notice, Panel, Pill, Select, Segmented, Thumbnail } from '../../components/ui.js';
+import { Badge, Button, Check, DetailView, Drawer, Empty, IconButton, Notice, Panel, Segmented, Thumbnail } from '../../components/ui.js';
 import { PageHeader } from '../../components/PageHeader.js';
 import { GroupBlock, WearRange } from '../../components/GroupBlock.js';
 import { Icon } from '../../components/Icon.js';
@@ -9,7 +9,7 @@ import { Avatar } from '../../components/Avatar.js';
 import { locationLabel, plural } from '../../lib/labels.js';
 import { busyKeysFromWork } from '../work/work-busy.js';
 import { useOpenWork } from '../work/WorkIndicator.js';
-import { addChip, chipsToFilter, type FilterChip } from '../../components/filter-grammar.js';
+import { chipsToFilter } from '../../components/filter-grammar.js';
 import { FilterBar } from '../../components/FilterBar.js';
 import { useScopedChips } from '../../components/scoped-chips.js';
 import { InventoryTiles, type NamedItem } from './InventoryTiles.js';
@@ -100,9 +100,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
   const [view, setView] = useState<'grouped' | 'tiles'>(() => (
     typeof localStorage !== 'undefined' && localStorage.getItem('cslytics.inventory.view') === 'tiles' ? 'tiles' : 'grouped'
   ));
-  const [filtersOpen, setFiltersOpen] = useState(() => (
-    typeof localStorage === 'undefined' || localStorage.getItem('cslytics.inventory.filters') !== 'collapsed'
-  ));
   const [subject, setSubject] = useState<NamedItem | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [detail, setDetail] = useState<{ row: NamedItem; data: unknown; loading: boolean } | null>(null);
@@ -133,9 +130,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
   const nameOf = useCallback((id: string): string => accounts.find((account) => account.id === id)?.name ?? id, [accounts]);
   const photoOf = useCallback((id: string): string | null | undefined => accounts.find((account) => account.id === id)?.avatarRef, [accounts]);
   const resolved = chipsToFilter(chips);
-  // Listed is not a place, but the select offers it beside the places, as a person asks it.
-  const location = resolved.listed ? 'LISTED' : resolved.location ?? '';
-  const tradableOnly = Boolean(resolved.tradableOnly);
   const filter: InventoryFilter & Record<string, unknown> = {
     ...resolved,
     ...(resolved.chips.length ? { chips: resolved.chips } : {})
@@ -324,13 +318,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
   const selectAll = (
     <Button size="sm" icon="list-checks" loading={selecting} onClick={() => void selectFiltered()} title={hasFilter ? 'Selects every item that matches the current search and filters.' : 'Selects every item in view.'}>Select all</Button>
   );
-  const settingsOn = Boolean(location || tradableOnly || (chips.find((chip) => chip.kind === 'item' && categoryIsCatalogue([chip]))));
-
-  function toggleFilters(): void {
-    const next = !filtersOpen;
-    setFiltersOpen(next);
-    localStorage.setItem('cslytics.inventory.filters', next ? 'open' : 'collapsed');
-  }
 
   function openDetail(row: NamedItem): void {
     setDetail({ row, data: null, loading: true });
@@ -375,51 +362,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
     />
   );
 
-  const filterRail = (
-    <aside className="filter-panel" data-collapsed={filtersOpen ? undefined : 'true'} aria-label="Filters">
-      <div className="filter-panel-head">
-        <IconButton
-          icon="filter"
-          size="sm"
-          label={filtersOpen ? 'Hide filters' : 'Show filters'}
-          aria-expanded={filtersOpen}
-          aria-controls={filtersOpen ? 'inventory-filter-settings' : undefined}
-          data-active={settingsOn || undefined}
-          className="filter-panel-toggle"
-          onClick={toggleFilters}
-        />
-        {filtersOpen ? <span className="filter-panel-title">Filters</span> : null}
-      </div>
-      {filtersOpen ? (
-        <div className="filter-panel-body" id="inventory-filter-settings">
-          <Field label="Location">
-            <Select label="Location" value={location} onChange={(next) => setChips((current) => {
-              // A unit chip is a location too, so choosing another location replaces it.
-              const without = current.filter((chip) => chip.kind !== 'where' && chip.kind !== 'unit');
-              if (!next) return without;
-              const text = next === 'MAIN' ? 'inventory' : next === 'CASKET' ? 'storage' : 'listed';
-              return addChip(without, { kind: 'where', text });
-            })}>
-              <option value="">All locations</option>
-              <option value="MAIN">In inventory</option>
-              <option value="CASKET">In storage</option>
-              <option value="LISTED">Listed on the market</option>
-            </Select>
-          </Field>
-          <Field label="Category">
-            <CategoryFilter value={chips.find((chip) => chip.kind === 'item')?.text && categoryIsCatalogue(chips) ? chips.find((chip) => chip.kind === 'item')!.text : ''} onChange={(next) => setChips((current) => {
-              const without = current.filter((chip) => !(chip.kind === 'item' && categoryIsCatalogue([chip])));
-              return next ? addChip(without, { kind: 'item', text: next }) : without;
-            })} revision={catalogueRevision} />
-          </Field>
-          <Pill selected={tradableOnly} icon="unlock" onClick={() => setChips((current) => (
-            tradableOnly ? current.filter((chip) => chip.kind !== 'tradable') : addChip(current, { kind: 'tradable', text: 'tradable' })
-          ))}>Tradable only</Pill>
-        </div>
-      ) : null}
-    </aside>
-  );
-
   return <Panel className="enter">
     <PageHeader
       badge={selection.manifest ? <Badge tone="accent" icon="lock">Frozen selection</Badge> : null}
@@ -440,9 +382,7 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
     ) : null}
     <InspectorSplit
       layout={view}
-      railState={filtersOpen ? 'open' : 'collapsed'}
       inspector={selectionOnly ? null : inspector}
-      rail={filterRail}
     >
       <div className="toolbar page-controls">
         <FilterBar chips={chips} onChange={setChips} accounts={scopeAccounts} units={scopeUnits} holdingsOf={queryScope.split('\0')} />
@@ -556,29 +496,6 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
       ) : null}
     </Drawer>
   </Panel>;
-}
-
-/**
- * The categories the catalogue actually holds.
- *
- * Offering a hard-coded list means offering filters that match nothing, which reads as an empty
- * inventory rather than as a dead option.
- */
-function CategoryFilter({ value, onChange, revision }: { value: string; onChange: (next: string) => void; revision: string | null }): React.JSX.Element {
-  const [options, setOptions] = useState<string[]>([]);
-  useEffect(() => {
-    void window.trading.invoke({ type: 'catalogue.status' })
-      .then((status) => setOptions((status as { categories?: string[] })?.categories ?? []))
-      .catch(() => setOptions([]));
-  }, [revision]);
-  return <Select label="Category" value={value} onChange={onChange}>
-    <option value="">All categories</option>
-    {options.map(c => <option key={c}>{c}</option>)}
-  </Select>;
-}
-
-function categoryIsCatalogue(chips: readonly FilterChip[]): boolean {
-  return chips.some((chip) => chip.kind === 'item' && !/[|]/.test(chip.text));
 }
 
 /**

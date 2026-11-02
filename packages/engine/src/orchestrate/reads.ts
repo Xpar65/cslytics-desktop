@@ -980,21 +980,22 @@ export class ReadBroker implements Reading {
 
   // --- scheduling state ----------------------------------------------------
 
-  /** What the waiting work needs walked, read from the database each time (settling plan D5), less a command's own. */
+  /** What the waiting work needs walked, read from the database each time (settling plan D5), less a running command's moves. */
   protected demand(accountId: AccountId): readonly ProofDemand[] {
     return this.services.demand?.(accountId, this.provedByDispatch()) ?? [];
   }
 
   /**
-   * The commands whose hops the cadence leaves to their own dispatch. A hop of a command whose
-   * dispatch is running is the dispatch's to prove: its round reads once after its last answer
-   * (`CommandService.proveStage`). Demanded here as well, every answer made the inventory due the
-   * moment a walk predated it, so a store of 974 walked a thousand items on every event batch (L-10,
-   * 2026-10-16 evening, 29 walks in 30 s; `BULK-14`). They are left out in the query, not after it:
-   * asked of each hop's owner and then dropped, the demand of a store of 968 cost a few queries per
-   * waiting store at every answer (2026-10-18, D15). A hop a restart left waiting, with no dispatch
-   * running (`N-DEMAND-03`), and a move of nobody's command keep their demand. Isolated so a
-   * saboteur can demand proof for all.
+   * The commands whose moves the cadence leaves to their own dispatch. A store or a retrieve of a
+   * command whose dispatch is running is the dispatch's to prove: its round reads once after its
+   * last answer (`CommandService.proveStage`). Demanded here as well, every answer made the inventory
+   * due the moment a walk predated it, so a store of 974 walked a thousand items on every event batch
+   * (L-10, 2026-10-16 evening, 29 walks in 30 s; `BULK-14`). They are left out in the query, not
+   * after it: asked of each hop's owner and then dropped, the demand of a store of 968 cost a few
+   * queries per waiting store at every answer (2026-10-18, D15). A listing or a cancel keeps its
+   * demand while its command runs (`N-DEMAND-05`), as does a hop a restart left waiting with no
+   * dispatch running (`N-DEMAND-03`) and a move of nobody's command. Isolated so a saboteur can
+   * demand proof for all.
    */
   protected provedByDispatch(): readonly string[] {
     return this.services.dispatching?.() ?? [];

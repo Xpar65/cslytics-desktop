@@ -35,6 +35,8 @@ export type TradeHistoryCoverage = {
   total: number | null;
   reachedEnd: boolean;
   stopped?: string;
+  /** The re-read of trades Steam may still change: when its latest pass began, and where it stopped when the walk's pages ran out first. */
+  reread?: { startedAtSeconds: number; afterTimeSeconds?: number; afterTradeId?: string };
 };
 
 export type TradeLineRow = {
@@ -165,11 +167,14 @@ export class TradeStore {
     const integer = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value);
     if (typeof cursor.afterTradeId !== 'string' || !integer(cursor.afterTimeSeconds)) return undefined;
     if (typeof cursor.boundaryTradeId === 'string' && integer(cursor.boundaryTimeSeconds) && integer(cursor.coveredCount)) {
+      const reread = cursor.reread;
       return {
         afterTimeSeconds: cursor.afterTimeSeconds, afterTradeId: cursor.afterTradeId,
         boundaryTimeSeconds: cursor.boundaryTimeSeconds, boundaryTradeId: cursor.boundaryTradeId,
         coveredCount: cursor.coveredCount, total: integer(cursor.total) ? cursor.total : null,
-        reachedEnd: cursor.reachedEnd === true, ...(typeof cursor.stopped === 'string' ? { stopped: cursor.stopped } : {})
+        reachedEnd: cursor.reachedEnd === true, ...(typeof cursor.stopped === 'string' ? { stopped: cursor.stopped } : {}),
+        ...(reread && integer(reread.startedAtSeconds) ? { reread: { startedAtSeconds: reread.startedAtSeconds,
+          ...(integer(reread.afterTimeSeconds) && typeof reread.afterTradeId === 'string' ? { afterTimeSeconds: reread.afterTimeSeconds, afterTradeId: reread.afterTradeId } : {}) } } : {})
       };
     }
     const oldest = this.db.raw().prepare(`SELECT trade_id, initiated_at FROM executed_trade WHERE account_id=? ORDER BY initiated_at, trade_id LIMIT 1`)

@@ -182,6 +182,19 @@ export function restrictionOf(key: string): string | null {
   return tail?.[1] ?? null;
 }
 
+/**
+ * A fungible group key without its restriction, the last of its six fields: what a unit is, apart
+ * from the lock it is under. A trade puts a new lock on the unit that arrives, so the unit sent and
+ * the unit received are two group keys with one of these; a delivery counts them as one group. An
+ * individual's key carries no lock and is returned as it is.
+ */
+export function unrestrictedKey(key: string): string {
+  if (!key.startsWith('fungible:')) return key;
+  const until = restrictionOf(key);
+  const dated = until ? key.slice(0, key.length - until.length - 1) : key;
+  return dated.replace(/:(?:locked|protected|-|untradable)$/, '');
+}
+
 /** Whether a fungible group key is the `cannot trade` bucket. `restrictionOf` reads dates only. */
 export function isUntradableGroup(key: string): boolean {
   return key.startsWith('fungible:') && key.endsWith(`:${UNTRADABLE_RESTRICTION}`);

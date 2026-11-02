@@ -3,11 +3,13 @@ import type { BookLevel, StoredBook } from '@cslytics/market-data';
 import type { ItemCurve, ItemHistory, ItemPage, ItemVariants } from '../../../shared/market.js';
 import { Tip } from '../../components/Tip.js';
 import { Empty, Notice, Panel, PanelHeader, Pill, Segmented, Skeleton } from '../../components/ui.js';
+import { useCurrency } from '../../lib/currency.js';
 import { engine } from '../../lib/engine.js';
 import { amountParts, conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick } from '../../lib/money.js';
 import { freshness } from '../../lib/portfolio.js';
 import { curveWears } from './curve-math.js';
 import { FloatCurveChart, type CurveLayers, type CurveWear } from './FloatCurveChart.js';
+import { stagedMarks, type StagedUnit } from './staged-marks.js';
 import { ageLabel, bookChanges, liveness, midOf, type BookChanges, type LevelChange, type Move } from './live-book.js';
 import { PriceChart, type ChartSeries } from './PriceChart.js';
 
@@ -305,14 +307,22 @@ const VENUES: ReadonlyArray<{ id: Venue; label: string }> = [{ id: 'steam', labe
 const LAYERS: ReadonlyArray<{ id: keyof CurveLayers; label: string }> = [
   { id: 'fair', label: 'Fair' }, { id: 'ask', label: 'Ask' }, { id: 'bid', label: 'Bid' }, { id: 'listings', label: 'Listings' }
 ];
+const NO_STAGED: readonly StagedUnit[] = [];
 
 /**
  * The published float curves for every wear of the item, from Steam or CSFloat. An item with no
  * float, a case or a sticker, has no curve and no panel. Each wear's curve is its own fetch, which
- * main caches for a day, so switching venue or coming back costs nothing the second time.
+ * main caches for a day, so switching venue or coming back costs nothing the second time. The
+ * units of this name staged in a listing workspace are marked on it at the prices typed for them.
  */
-export function CurvePanel({ name, variants, floats }: { name: string; variants: ItemVariants | null; floats: readonly number[] }): React.JSX.Element | null {
+export function CurvePanel({ name, variants, staged = NO_STAGED }: {
+  name: string;
+  variants: ItemVariants | null;
+  /** Staged in a listing workspace, of any name; the curve marks the ones of its own. */
+  staged?: readonly StagedUnit[] | undefined;
+}): React.JSX.Element | null {
   const [venue, setVenue] = useState<Venue>('steam');
+  const { fx } = useCurrency();
   const [layers, setLayers] = useState<CurveLayers>({ fair: true, ask: false, bid: false, listings: true });
   const [log, setLog] = useState(true);
   const [curves, setCurves] = useState<ReadonlyMap<string, Loaded<ItemCurve>>>(new Map());
@@ -348,6 +358,9 @@ export function CurvePanel({ name, variants, floats }: { name: string; variants:
   const range = docs.find((doc) => doc.floatRange)?.floatRange
     ?? (variants && variants.minFloat !== null && variants.maxFloat !== null ? { min: variants.minFloat, max: variants.maxFloat } : { min: 0, max: 1 });
   const failure = entries.find((entry) => entry.loaded.state === 'failed')?.loaded;
+  // On this document's axis: a figure in its currency as typed, one in another crossed at the
+  // daily rate and marked ≈, because FX is a display grade and never a price (plan D17).
+  const marks = own ? stagedMarks(staged, name, own.currency, fx) : [];
 
   return (
     <Panel className="items-panel items-curve">
@@ -376,7 +389,7 @@ export function CurvePanel({ name, variants, floats }: { name: string; variants:
               testId="item-curve-chart"
               wears={wears}
               range={range}
-              floats={floats}
+              staged={marks}
               layers={layers}
               log={log}
               currency={own.currency}

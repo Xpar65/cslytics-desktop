@@ -763,6 +763,11 @@ a { color: var(--cs-accent-text); }
    money figure carries its code ("A$1,234.56 AUD"), so the cards are wider than a count's, and the
    figure may wrap rather than run out of the card: the one-line metric's `nowrap` is for a count. */
 .metrics.value-cards { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+/* With a float value, the three estimates share the first row and Items and Priced the second, so
+   no card is left alone on a row of its own. The order is ValuePanel's: the estimates come first. */
+.metrics.value-cards.with-float { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.metrics.value-cards.with-float > .value-card { grid-column: span 2; }
+.metrics.value-cards.with-float > .value-card:nth-child(n + 4) { grid-column: span 3; }
 .metric.value-card { display: block; min-width: 0; padding: 14px 16px; border-radius: var(--cs-radius-lg); }
 /* The icon, the title, and the title's tip beside it: what the card counts is one hover away. */
 .value-card .metric-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
@@ -1290,7 +1295,6 @@ a { color: var(--cs-accent-text); }
 .value-card { border-top: 2px solid var(--cs-border); }
 .value-card[data-hue='wallet'] { border-top-color: var(--cs-hold-wallet); }
 .value-card[data-hue='listed'] { border-top-color: var(--cs-hold-listed); }
-.value-card[data-hue='unconfirmed'] { border-top-color: var(--cs-hold-unconfirmed); }
 .value-card[data-hue='inventory'] { border-top-color: var(--cs-hold-inventory); }
 .value-lines { display: flex; flex-direction: column; gap: 3px; margin: 10px 0 0; }
 .value-lines div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
@@ -1348,43 +1352,6 @@ a { color: var(--cs-accent-text); }
 .conn-dot[data-tone='blocked'] { background: var(--cs-accent); }
 .conn-dot[data-tone='offline'] { background: var(--cs-negative); }
 .conn-dot[data-tone='live']::after { content: ''; position: absolute; inset: 0; border-radius: inherit; background: inherit; animation: cs-ping 2.4s ease-out infinite; }
-
-/* ---------- account cards ---------- */
-
-.account-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-.account-card {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px 16px;
-  border: 1px solid var(--cs-border);
-  border-radius: var(--cs-radius-lg);
-  background: var(--cs-surface-inset);
-  transition: border-color var(--cs-dur-fast), transform var(--cs-dur), box-shadow var(--cs-dur);
-  animation: cs-rise var(--cs-dur-slow) var(--cs-ease-out) both;
-}
-.account-card:hover { border-color: var(--cs-border-strong); transform: translateY(-1px); }
-.account-card::before { content: ''; position: absolute; left: 0; top: 14px; bottom: 14px; width: 3px; border-radius: 0 3px 3px 0; background: var(--cs-border); }
-.account-card[data-tone='live']::before { background: var(--cs-positive); }
-.account-card[data-tone='partial']::before { background: var(--cs-text-muted); }
-.account-card[data-tone='blocked']::before { background: var(--cs-accent); }
-.account-card[data-tone='offline']::before { background: var(--cs-negative); }
-.account-card-head { display: flex; align-items: flex-start; gap: 12px; }
-.account-card-id { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
-.account-card-name { font-size: 14px; font-weight: 600; color: var(--cs-text-strong); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-card-steamid { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--cs-text-faint); font-variant-numeric: tabular-nums; }
-.account-card-steamid .btn { opacity: 0; transition: opacity var(--cs-dur-fast); }
-.account-card:hover .account-card-steamid .btn, .account-card-steamid .btn:focus-visible { opacity: 1; }
-.account-card-state { flex: none; }
-.account-card-detail { margin: 0; font-size: 12.5px; line-height: 1.45; color: var(--cs-text-muted); }
-.account-card-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.account-card-stat { padding: 8px 10px; border-radius: var(--cs-radius); background: var(--cs-wash); border: 1px solid var(--cs-border-faint); }
-.account-card-stat-label { font-size: 10.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--cs-text-faint); }
-.account-card-stat-value { font-size: 14px; font-weight: 600; color: var(--cs-text); font-variant-numeric: tabular-nums; margin-top: 2px; }
-.account-card-stat-sub { margin-top: 2px; font-size: 11.5px; color: var(--cs-text-muted); font-variant-numeric: tabular-nums; }
-.account-card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }
-.account-card-actions .toolbar-spacer { flex: 1; }
 
 /* ---------- virtual lists ---------- */
 
@@ -1696,11 +1663,11 @@ a { color: var(--cs-accent-text); }
 
 /* ---------- inventory tiles ---------- */
 
-/* Filter rail | list or tiles | inspector. Collapsed, the rail is only the filter icon.
+/* Rail | list or tiles | inspector, the rail only where a page has one (Trades' list of trades).
    The inspector is as wide as its divider was dragged (`--inspector-width`, per view, set inline
    from inspector-width.ts), but never so wide that the list loses `--main-min`: `100%` less the
-   rail and the two 12px gaps is the room the list and the inspector share, so a narrowed window
-   or an opened rail clamps here without waiting for a drag. */
+   rail and the gaps is the room the list and the inspector share, so a narrowed window clamps here
+   without waiting for a drag. */
 .inventory-split {
   --filter-rail: 220px;
   --split-gaps: 24px;
@@ -1713,10 +1680,10 @@ a { color: var(--cs-accent-text); }
   padding: 12px 16px;
   transition: grid-template-columns var(--cs-dur) var(--cs-ease);
 }
-.inventory-split[data-filters='collapsed'] { --filter-rail: 44px; }
 .inventory-split[data-picker] { grid-template-columns: var(--filter-rail) minmax(0, 1fr); }
-/* Listings filters from its toolbar, so its split is the grid and the inspector and one gap. */
+/* Inventory and Listings filter from their toolbars, so their split is the grid and the inspector and one gap. */
 .inventory-split[data-rail='none'] { --filter-rail: 0px; --split-gaps: 12px; grid-template-columns: minmax(0, 1fr) var(--inspector-track); }
+.inventory-split[data-rail='none'][data-picker] { grid-template-columns: minmax(0, 1fr); }
 /* Trades lists its trades in the rail: a row's pictures, then two lines, a title and its state. It
    takes a little more of a wide page and never less than its rows need. */
 .inventory-split[data-rail-width='wide'] { --filter-rail: clamp(272px, 30%, 304px); }
@@ -1730,40 +1697,6 @@ a { color: var(--cs-accent-text); }
 .inventory-main { min-width: 0; display: flex; flex-direction: column; }
 .inventory-main .page-controls { padding: 0 0 10px; }
 .inventory-main .paged-rows { min-width: 0; }
-
-.filter-panel {
-  position: sticky; top: 0;
-  display: flex; flex-direction: column; gap: 12px;
-  min-width: 0;
-  padding: 10px;
-  border: 1px solid var(--cs-border-faint);
-  border-radius: var(--cs-radius);
-  background: var(--cs-surface);
-  max-height: 640px;
-  overflow: auto;
-}
-.filter-panel[data-collapsed='true'] { padding: 6px; align-items: center; }
-.filter-panel-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.filter-panel-title {
-  font-size: 11px; font-weight: 600; letter-spacing: 0.05em;
-  text-transform: uppercase; color: var(--cs-text-muted);
-}
-.filter-panel-body {
-  display: flex; flex-direction: column; gap: 12px;
-  animation: cs-slide-down var(--cs-dur) var(--cs-ease-out) both;
-}
-.filter-panel-body .select-wrap,
-.filter-panel-body .select,
-.filter-panel-body .pill { width: 100%; }
-.filter-panel-body .pill { justify-content: center; }
-.filter-panel-toggle { position: relative; flex: none; }
-.filter-panel-toggle[data-active]::after {
-  content: '';
-  position: absolute; top: 4px; right: 4px;
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--cs-accent);
-}
-@media (max-width: 1100px) { .filter-panel { position: static; max-height: none; } }
 
 .tile-viewport { height: 560px; padding: 2px; }
 .tile-slot { position: absolute; }
@@ -2252,7 +2185,8 @@ a { color: var(--cs-accent-text); }
 }
 .listing-dock .listing-row > .item-thumbnail { grid-column: 1; grid-row: 1; }
 .listing-dock .listing-row-text { grid-column: 2; grid-row: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.listing-dock .listing-row-drop { grid-column: 3; grid-row: 1; justify-self: end; align-self: start; color: var(--cs-text-faint); }
+.listing-dock .listing-row-tools { grid-column: 3; grid-row: 1; display: flex; gap: 2px; justify-self: end; align-self: start; }
+.listing-dock .listing-row-drop { color: var(--cs-text-faint); }
 .listing-dock .listing-row > .listing-controls, .listing-dock .listing-row > .caption { grid-column: 1 / -1; }
 /* A pressed row leaves for the work panel at once; the only state that comes back is a refusal. */
 .listing-dock .listing-row[data-state='refused'] { border-color: var(--cs-negative-border); }
@@ -2307,6 +2241,10 @@ a { color: var(--cs-accent-text); }
 span.listing-quote { cursor: default; }
 /* The inspector: the book beside the way to the item page, and under an opened roster row. */
 .inspector-book { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+/* The CSFloat float price beside the book: an estimate to read, in the book line's type. */
+.float-price { display: inline-flex; align-items: center; gap: 6px; flex: none; font-size: 11.5px; white-space: nowrap; }
+.float-price[data-state='waiting'] .spin { animation: cs-spin 900ms linear infinite; }
+.float-price .venue-mark { opacity: 0.7; }
 .roster-detail-text .listing-book { align-self: flex-start; }
 
 .listing-dock .listing-row-act { flex: none; justify-self: end; }
@@ -2958,6 +2896,12 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .price-chart-tooltip-label { color: var(--cs-text-muted); }
 .price-chart-tooltip-sub { margin-top: 4px; color: var(--cs-text-faint); }
 .price-chart-swatch { width: 8px; height: 8px; border-radius: 2px; }
+/* A staged unit's tip: its picture beside its name, float and figure. */
+.price-chart-tooltip-item { display: flex; align-items: flex-start; gap: 8px; }
+.price-chart-tooltip-item > .item-thumbnail { flex: none; }
+.price-chart-tooltip-text { min-width: 0; }
+.price-chart-tooltip-staged { display: flex; align-items: center; gap: 5px; }
+.price-chart-tooltip-staged > .icon { color: var(--cs-accent); }
 .price-chart-empty { padding: 24px; text-align: center; color: var(--cs-text-faint); font-size: 12px; }
 
 /* A chart's skeleton: the same height, gridlines and axis, a shimmer where the line will be. */
@@ -2991,9 +2935,165 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .curve-line[data-layer="bid"] { stroke-dasharray: 2 3; }
 .curve-dot { opacity: 0.28; }
 .curve-dot[data-current="true"] { opacity: 0.6; }
-.curve-held line { stroke: var(--cs-accent); stroke-width: 1; stroke-dasharray: 3 3; }
-.curve-held circle { fill: var(--cs-accent); stroke: var(--cs-surface); stroke-width: 2; }
+/* A unit staged in a listing workspace, at the price typed for it: the listing's tag, in the accent, on a disc. */
+.curve-staged line { stroke: var(--cs-accent); stroke-width: 1; stroke-dasharray: 3 3; }
+.curve-staged-mark { color: var(--cs-accent); pointer-events: bounding-box; }
+.curve-staged-mark > circle { fill: var(--cs-surface); stroke: var(--cs-accent); stroke-width: 1.5; }
+.curve-staged[data-priced="false"] .curve-staged-mark { opacity: 0.6; }
+.curve-staged[data-priced="false"] .curve-staged-mark > circle { stroke-dasharray: 2 2; }
 .curve-hover { fill: none; stroke-width: 2; stroke: var(--cs-text-strong); }
 .curve-box { fill: var(--cs-accent-wash); stroke: var(--cs-accent-border); stroke-dasharray: 4 3; }
 .curve-zoom { position: absolute; top: 26px; right: 70px; display: flex; gap: 2px; padding: 2px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius); background: var(--cs-surface); }
 
+
+/* ---------- prices behind the CSlytics sign-in (pricing behind sign-in plan §7.6, §7.7) ---------- */
+
+.nav-lock { display: inline-flex; color: var(--cs-text-faint); margin-left: auto; }
+.nav-lock + .nav-count { margin-left: 4px; }
+
+/* A locked surface: a generic shape, blurred, never the item's own data, under one button. */
+.signin-lock {
+  position: relative;
+  min-height: 160px;
+  border: 1px solid var(--cs-border-faint);
+  border-radius: var(--cs-radius-lg);
+  background: var(--cs-surface);
+  overflow: hidden;
+}
+.signin-lock[data-shape='page'] { min-height: 320px; }
+.signin-lock-placeholder { position: absolute; inset: 0; padding: 20px; filter: blur(6px); opacity: 0.55; pointer-events: none; user-select: none; }
+.signin-lock-svg { width: 100%; height: 100%; }
+.signin-lock-line { fill: none; stroke: var(--cs-accent); stroke-width: 3; }
+.signin-lock-line-faint { stroke: var(--cs-text-faint); }
+.signin-lock-rows { display: flex; flex-direction: column; gap: 10px; }
+.signin-lock-rows span { height: 12px; border-radius: var(--cs-radius-full); background: var(--cs-wash); }
+.signin-lock-page { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; height: 100%; }
+.signin-lock-page .signin-lock-svg { grid-column: 1 / -1; height: 160px; }
+.signin-lock-figure { height: 64px; border-radius: var(--cs-radius); background: var(--cs-wash); }
+.signin-lock-overlay {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  min-height: inherit; padding: 24px; text-align: center;
+}
+.signin-lock-icon { display: inline-flex; padding: 9px; border-radius: var(--cs-radius-full); background: var(--cs-accent-wash); color: var(--cs-accent-text); }
+.signin-lock-title { display: inline-flex; align-items: center; gap: 6px; font-family: var(--cs-font-display); font-size: 15px; color: var(--cs-text-strong); }
+.signin-lock-actions { display: inline-flex; align-items: center; gap: 8px; }
+.signin-lock-note { font-size: 12px; color: var(--cs-text-muted); }
+
+/* The same lock on one line, for a book line or a row of buttons. */
+.signin-lock-inline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; color: var(--cs-text-muted); }
+.signin-lock-inline .btn { margin-left: auto; }
+.signin-lock-inline-title { color: var(--cs-text); }
+
+/* The CSlytics sign-in at a glance, at the very foot of the sidebar. */
+.sidebar-foot .cslytics-indicator {
+  margin-top: 6px;
+  padding-block: 6px;
+  border-color: var(--cs-border-faint);
+  background: var(--cs-surface);
+}
+.cslytics-indicator-badge {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--cs-radius-full);
+  background: var(--cs-wash);
+  color: var(--cs-text-muted);
+}
+.nav-item.cslytics-indicator .cslytics-indicator-badge .icon { color: inherit; }
+.cslytics-indicator-badge .conn-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 9px;
+  height: 9px;
+  box-shadow: 0 0 0 2px var(--cs-surface);
+}
+.cslytics-indicator[data-state='signedIn'] .cslytics-indicator-badge,
+.cslytics-indicator[data-state='unconfirmed'] .cslytics-indicator-badge { background: var(--cs-accent-wash); color: var(--cs-accent-ink); }
+.cslytics-indicator-text { display: flex; flex-direction: column; gap: 1px; line-height: 1.25; }
+.cslytics-indicator-name { overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; font-weight: 600; color: var(--cs-text-strong); }
+.cslytics-indicator-detail { overflow: hidden; text-overflow: ellipsis; font-size: 11px; color: var(--cs-text-faint); }
+.cslytics-indicator[data-state='signedOut'] .cslytics-indicator-detail { color: var(--cs-accent-text); }
+.sidebar[data-collapsed='true'] .sidebar-foot .cslytics-indicator { border-color: transparent; background: transparent; }
+
+/* The CSlytics sign-in card, at each launch with no sign-in stored, over the window and never instead of it. */
+.signin-prompt-backdrop {
+  position: fixed; inset: var(--cs-titlebar) 0 0; z-index: 44;
+  display: flex; align-items: center; justify-content: center; padding: 1rem;
+  background: var(--cs-scrim);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: cs-fade-in var(--cs-dur) both;
+}
+.signin-prompt {
+  width: 100%; max-width: 26rem;
+  display: flex; flex-direction: column; gap: 16px;
+  padding: 28px;
+  border: 1px solid var(--cs-border);
+  border-radius: var(--cs-radius-xl);
+  background: var(--cs-surface);
+  box-shadow: var(--cs-panel-glow);
+  animation: cs-rise var(--cs-dur) both;
+}
+.signin-prompt-head { display: flex; align-items: center; gap: 12px; }
+.signin-prompt-title { margin: 0; font-family: var(--cs-font-display); font-size: 19px; line-height: 1.2; color: var(--cs-text-strong); }
+.signin-prompt-lead { margin: 0; color: var(--cs-text); }
+.signin-prompt-list { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.signin-prompt-list li { display: flex; align-items: center; gap: 12px; font-weight: 500; color: var(--cs-text-strong); }
+.signin-prompt-list-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--cs-radius);
+  background: var(--cs-accent-wash);
+  color: var(--cs-accent-ink);
+}
+.signin-prompt-list-icon .icon { color: inherit; }
+/* What the sign-in does not change, in one box: a check for what works without it, a cross for what
+   it never gives CSlytics. */
+.signin-prompt-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--cs-border-faint);
+  border-radius: var(--cs-radius-lg);
+  background: var(--cs-surface-inset);
+}
+.signin-prompt-core {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--cs-text-muted);
+}
+.signin-prompt-core strong { color: var(--cs-text); font-weight: 600; }
+.signin-prompt-core .icon { flex: none; margin-top: 2px; color: var(--cs-positive); }
+.signin-prompt-core[data-tone="negative"] .icon { color: var(--cs-negative); }
+.signin-prompt-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.signin-prompt-actions > .btn { width: 100%; justify-content: center; }
+.signin-prompt-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.signin-prompt-hide {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  font-size: 12.5px;
+  color: var(--cs-text-muted);
+  cursor: pointer;
+}
+.signin-prompt-hide:hover:not(:disabled) { color: var(--cs-text); }
+.signin-prompt-hide:hover:not(:disabled) .check { border-color: var(--cs-accent); }
+.signin-prompt-hide:disabled { opacity: 0.6; cursor: default; }
+.signin-prompt-wait { display: flex; align-items: center; gap: 10px; margin-top: 4px; font-size: 13px; color: var(--cs-text-muted); }
+.signin-prompt-wait .btn { margin-left: auto; }

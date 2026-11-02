@@ -33,7 +33,7 @@ import { CsfloatStore } from './db/csfloat.js';
 import { HoldingsStore } from './db/holdings.js';
 import { AccountPurgeRefused, AccountPurgeStore, type PurgeResult } from './db/account-purge.js';
 import { RetentionStore, type SweepResult } from './db/retention.js';
-import { TransferService, type TransferServices } from './orchestrate/transfer.js';
+import { TransferService, type Driving, type TransferServices } from './orchestrate/transfer.js';
 import { InGameStoreService, type StorePurchaseRequest } from './surfaces/in-game-store.js';
 import { pageStorePurchases, readStorePurchase, readStoreSheet } from './read/queries/in-game-store.js';
 import type { BuyOrderVenue } from './read/queries/buy-orders.js';
@@ -184,7 +184,9 @@ export class TradingEngine {
     this.inGameStore = overrides.inGameStore?.(this.context) ?? new InGameStoreService(this.context);
     this.accountPurge = overrides.accountPurge?.(database) ?? new AccountPurgeStore(database);
     this.retention = overrides.retention?.(database) ?? new RetentionStore(database);
-    const transferServices = { planner: overrides.transferPlanner?.(this.context) ?? new TransferPlanner(this.context), trades:this.tradeService, inventory:this.inventoryService, storage:this.storageService, settle: settling, reads: reading };
+    // Resolved at call time: the command service is built further down, over the same surfaces.
+    const driving: Driving = { dispatch: (commandId) => this.commands.dispatch(commandId), dispatching: () => this.commands.dispatchingCommands() };
+    const transferServices = { planner: overrides.transferPlanner?.(this.context) ?? new TransferPlanner(this.context), trades:this.tradeService, inventory:this.inventoryService, storage:this.storageService, reads: reading, commands: driving };
     this.transfers = overrides.transfers?.(this.context,transferServices) ?? new TransferService(this.context,transferServices);
     const now = (): string => this.context.now();
     this.views = overrides.views?.(database, now) ?? new EngineViews(database, now);

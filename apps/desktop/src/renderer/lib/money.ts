@@ -3,7 +3,7 @@ import { currencyById, currencyByCode, formatUnits, type Converted, type Figure,
 /**
  * Every money figure the window prints, in one place, and none without its currency.
  *
- * Three grades (portfolio and pricing plan §5.1): *observed*, a figure a venue named in that
+ * Three grades (money and currency page §2): *observed*, a figure a venue named in that
  * account's native currency; *appraised*, an estimate from the order book in the book's own
  * currency, marked `≈`; *converted*, a figure that went through FX, marked `≈` and carrying the
  * native figure, the rate and its date for the hover. The ISO code is printed on every one of
@@ -12,7 +12,9 @@ import { currencyById, currencyByCode, formatUnits, type Converted, type Figure,
  *
  * A figure that is sent is never converted (AGENTS.md rule 9, plan D17). Everything here is for
  * what the window shows: a price is typed or pressed in the account's own currency, from a figure
- * named in it, and nothing on its way to a venue goes through `formatConverted` or a rate.
+ * named in it, and nothing on its way to a venue goes through `formatConverted`. The one figure
+ * that crosses a rate into a price is *Float price*, an estimate in any currency (money and
+ * currency page §1).
  *
  * `formatCents` used to default to AUD, which is wrong for anyone whose wallet is in another
  * currency. It is gone; `formatAmount` takes the currency or prints that it is unknown.

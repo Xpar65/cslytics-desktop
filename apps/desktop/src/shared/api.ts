@@ -28,7 +28,7 @@ export const accountLaunchSchema = z.object({
   cs2: z.boolean()
 }).strict();
 /**
- * Which currency figures are shown in (portfolio and pricing plan §5.2). `base` is the ISO code
+ * Which currency figures are shown in (money and currency page §3). `base` is the ISO code
  * every cross-account figure is converted to; `null` until it is pinned from the first account's
  * wallet or chosen. `baseSource` says which, so the settings page can say where the default came
  * from and a later change of the first account never silently moves it. The toggle converts an
@@ -55,13 +55,22 @@ export const engineConnectionSchema = z.discriminatedUnion('kind', [
 ]);
 export type EngineConnection = z.infer<typeof engineConnectionSchema>;
 export const DEFAULT_ENGINE: EngineConnection = { kind: 'local' };
+/**
+ * Which prompts the person has asked never to see again (pricing behind sign-in plan §7.7). The
+ * CSlytics sign-in card is offered at every launch that finds no sign-in stored, until the person
+ * ticks *Don't show this again* on it, which makes it `hidden`; unticking it shows it again.
+ */
+export const promptsSettingsSchema = z.object({ cslyticsSignIn: z.enum(['show', 'hidden']) }).strict();
+export type PromptsSettings = z.infer<typeof promptsSettingsSchema>;
+export const DEFAULT_PROMPTS: PromptsSettings = { cslyticsSignIn: 'show' };
 export const settingsSchema = z.object({
   version: z.literal(1),
   appearance: appearanceSettingsSchema,
   accounts: z.record(z.string().min(1), accountLaunchSchema),
   currency: currencySettingsSchema,
   csfloat: csfloatSettingsSchema,
-  engine: engineConnectionSchema
+  engine: engineConnectionSchema,
+  prompts: promptsSettingsSchema
 }).strict();
 export type AppearanceSettings = z.infer<typeof appearanceSettingsSchema>;
 export type AccountLaunch = z.infer<typeof accountLaunchSchema>;
@@ -71,7 +80,7 @@ export type DesktopSettings = z.infer<typeof settingsSchema>;
 export const DEFAULT_LAUNCH: AccountLaunch = { signIn: true, cs2: true };
 export const DEFAULT_CURRENCY: CurrencySettings = { base: null, baseSource: 'first-account', showAccountPagesInBase: false };
 export const DEFAULT_CSFLOAT: CsfloatSettings = { protection: true };
-export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT, engine: DEFAULT_ENGINE };
+export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT, engine: DEFAULT_ENGINE, prompts: DEFAULT_PROMPTS };
 
 /** How the connection to an engine host is going, as the window shows it (remote engine host plan D7, D8). */
 export type EngineHostState = 'connecting' | 'connected' | 'unreachable' | 'refused';
@@ -164,12 +173,15 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('release.status') }).strict(),
   z.object({ type: z.literal('release.check') }).strict(),
   z.object({ type: z.literal('release.install') }).strict(),
+  z.object({ type: z.literal('release.notes') }).strict(),
   // This desktop's preferences, answered by main from `settings.json`. A write carries a whole
   // section and gets back what was stored, which is what the window then shows.
   z.object({ type: z.literal('settings.read') }).strict(),
   z.object({ type: z.literal('settings.write'), appearance: appearanceSettingsSchema }).strict(),
   z.object({ type: z.literal('settings.launch'), accountId: z.string().min(1), launch: accountLaunchSchema }).strict(),
-  // The optional CSlytics sign-in, answered by main (CSlytics account sign-in plan §6.4). No command
+  // Whether the sign-in card is offered at launch: *Don't show this again* (pricing behind sign-in plan §7.7).
+  z.object({ type: z.literal('settings.prompts'), prompts: promptsSettingsSchema }).strict(),
+  // The CSlytics sign-in that unlocks prices, answered by main (CSlytics account sign-in plan §6.4). No command
   // carries a token, a code or a URL, in either direction: the window gets `CslyticsStatus` only.
   z.object({ type: z.literal('cslytics.status') }).strict(),
   z.object({ type: z.literal('cslytics.signIn') }).strict(),

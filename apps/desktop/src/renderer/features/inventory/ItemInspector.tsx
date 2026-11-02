@@ -12,7 +12,11 @@ import { submitCommand, type CommandKind } from './commands.js';
 import type { StagedItem } from './list-intent.js';
 import { InspectorHero, InspectorKind, InspectorWear } from '../../components/InspectorParts.js';
 import { OrderBookLine } from '../../components/OrderBookLine.js';
+import { FloatPriceLine } from '../../components/FloatPriceLine.js';
 import { bookKey, useOrderBooks } from '../../lib/order-books.js';
+import { useCslytics } from '../../lib/cslytics.js';
+import { SignInLock } from '../../components/SignInLock.js';
+import { FEATURE_CSFLOAT_CURVES, FEATURE_STEAM_MARKET, lockReason } from '../../../shared/command-access.js';
 import { UnitFill, UnitName } from './UnitParts.js';
 import { ItemMoreDetails } from './ItemMoreDetails.js';
 import { isStorageUnit, itemName, unitOfItem } from './storage-unit.js';
@@ -146,7 +150,13 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   const shownRow = single ?? rows.find((row) => selectionKey(row) === openRow) ?? null;
   const bookAccount = shownRow?.accountId ?? null;
   const bookName = shownRow?.marketHashName ?? null;
-  const bookKeys = useMemo(() => (bookAccount !== null && bookName !== null ? [{ accountId: bookAccount, name: bookName }] : []), [bookAccount, bookName]);
+  // Behind the CSlytics sign-in (pricing behind sign-in plan §7.6): while it is locked, or not yet
+  // known, no book is asked for, so main is never sent the read it would refuse.
+  const cslytics = useCslytics();
+  const bookLocked = cslytics === null || lockReason(cslytics, FEATURE_STEAM_MARKET) !== null;
+  // The CSFloat float price beside the book, for one item with a float, while the grant holds the curves.
+  const csfloatCurveLocked = cslytics === null || lockReason(cslytics, FEATURE_CSFLOAT_CURVES) !== null;
+  const bookKeys = useMemo(() => (!bookLocked && bookAccount !== null && bookName !== null ? [{ accountId: bookAccount, name: bookName }] : []), [bookLocked, bookAccount, bookName]);
   const books = useOrderBooks(bookKeys, true);
 
   // Whether the venue is connected at all, which is a different question from whether this item is
@@ -513,11 +523,22 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
         intersection rule is unchanged: the engine accepts or refuses a batch atomically, so an
         action one item blocks is withheld for all of them. */}
     {/* The market the item is priced against, read live while it is shown: bid, mid and ask in
-        the book's currency, the account's own read when its wallet is in another (plan D17).
-        To read, not to press: a price is typed in the listing workspace, from the book on its row. */}
+        the book's currency, the account's own read when its wallet is in another (plan D17), and,
+        for an item with a float, its float price on CSFloat's curve. To read, not to press: a price
+        is typed in the listing workspace, from the book on its row. */}
     {single && single.marketHashName ? (
       <div className="inspector-book" data-testid="inspector-book">
-        <OrderBookLine quote={books.get(bookKey(single.accountId, single.marketHashName))} />
+        {!bookLocked ? <OrderBookLine quote={books.get(bookKey(single.accountId, single.marketHashName))} /> : cslytics ? (
+          <SignInLock
+            status={cslytics}
+            feature={FEATURE_STEAM_MARKET}
+            shape="inline"
+            title="Order book"
+            tip="The highest buy order, the mid and the lowest listing for this item, read live from Steam."
+            testId="inspector-book-lock"
+          />
+        ) : null}
+        {!csfloatCurveLocked && single.paintWear !== null && single.paintWear !== undefined ? <FloatPriceLine name={single.marketHashName} float={single.paintWear} /> : null}
         {onOpenItem && hasItemPage ? (
           <Button size="sm" variant="ghost" icon="trending-up" data-testid="open-item-page" onClick={() => onOpenItem(single.marketHashName!)}>
             Item page
@@ -663,7 +684,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
                     <InspectorKind rarity={row.rarity} collection={row.collection} />
                     {accountIds.length > 1 ? <div className="inspector-meta quiet">{accountName(row.accountId)}</div> : null}
                     <InspectorWear paintWear={wear} paintSeed={row.paintSeed} range={row} />
-                    {row.marketHashName ? <OrderBookLine quote={books.get(bookKey(row.accountId, row.marketHashName))} /> : null}
+                    {row.marketHashName && !bookLocked ? <OrderBookLine quote={books.get(bookKey(row.accountId, row.marketHashName))} /> : null}
                     {rowLock ? <Caption icon="lock" tone="warn">{lockLabel(rowLock.kind, rowLock.until)}</Caption> : null}
                     {/* What this one allows, which is not always what the batch allows: it is how
                         a person finds the item that is holding an action back. */}

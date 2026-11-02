@@ -2,8 +2,8 @@ import React from 'react';
 import type { ListingPageRow, ListingVenue } from '@cslytics/engine';
 import { Button, Spinner } from '../../components/ui.js';
 import { stopTilePress } from '../../components/ItemTile.js';
-import { formatAmount } from '../../lib/money.js';
-import { CSFLOAT_STATE, LISTING_STATUS, currencyCode, stateLabel, type StateLabel } from '../../lib/labels.js';
+import { currencyCodeOf, formatAmount } from '../../lib/money.js';
+import { CSFLOAT_STATE, LISTING_STATUS, stateLabel, type StateLabel } from '../../lib/labels.js';
 
 /**
  * What the Listings page, its tiles and its inspector all say the same way: whose venue a
@@ -52,7 +52,7 @@ export function listingState(venue: ListingVenue, state: string): StateLabel {
  */
 export function Money({ cents, currency, tone }: { cents: number | null; currency: number | null; tone?: 'quiet' | undefined }): React.JSX.Element {
   if (cents === null) return <span className="quiet">—</span>;
-  const code = currencyCode(currency);
+  const code = currencyCodeOf(currency);
   return (
     <span className="money" data-tone={tone}>
       <span className="num">{formatAmount(cents, currency)}</span>

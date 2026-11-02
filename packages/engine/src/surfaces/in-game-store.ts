@@ -1,4 +1,4 @@
-import type { AccountId, MutationOutcome, StoreApprovalOutcome, StorePurchaseFinalizeRaw, StorePurchaseInitRaw } from '@cslytics/ports';
+import { currencyById, type AccountId, type MutationOutcome, type StoreApprovalOutcome, type StorePriceSheet, type StorePurchaseFinalizeRaw, type StorePurchaseInitRaw } from '@cslytics/ports';
 import type { ActionRow, ObservationRow } from '../db/database.js';
 import {
   InGameStoreStore, STORE_PURCHASE, parseItemIds, storeHopId,
@@ -45,16 +45,15 @@ export const STORE_LANGUAGE = 0;
 export const STORE_AMOUNT_BASIS = 'EVIDENCED';
 
 /**
- * Steam `ECurrencyCode` → the label the sheet keys its prices by. The labels are the ones a live
- * sheet carried (captured 2026-09-13); the codes are Steam's enum, in which 33 is unused, 34 is ARS
- * and 36 is BYN (`../cs2-knowledge/concepts/steam-wallet-currencies.md`).
+ * The label the sheet keys a wallet's prices by: the wallet currency's ISO code, from the one
+ * currency table (`@cslytics/ports`). The sheet decides which labels it carries, not a list kept
+ * here: the live sheet captured 2026-09-13 priced in 37 of the 41 wallet currencies and in none of
+ * TRY, SEK, ARS or BYN, so a wallet in one of those reads no price from it.
  */
-export const STORE_CURRENCY_LABEL: Readonly<Record<number, string>> = {
-  1: 'USD', 2: 'GBP', 3: 'EUR', 4: 'CHF', 5: 'RUB', 6: 'PLN', 7: 'BRL', 8: 'JPY', 9: 'NOK', 10: 'IDR',
-  11: 'MYR', 12: 'PHP', 13: 'SGD', 14: 'THB', 15: 'VND', 16: 'KRW', 17: 'TRY', 18: 'UAH', 19: 'MXN', 20: 'CAD',
-  21: 'AUD', 22: 'NZD', 23: 'CNY', 24: 'INR', 25: 'CLP', 26: 'PEN', 27: 'COP', 28: 'ZAR', 29: 'HKD', 30: 'TWD',
-  31: 'SAR', 32: 'AED', 35: 'ILS', 37: 'KZT', 38: 'KWD', 39: 'QAR', 40: 'CRC', 41: 'UYU'
-};
+function sheetLabel(currency: number, sheet: StorePriceSheet): string | null {
+  const code = currencyById(currency)?.code;
+  return code !== undefined && sheet.entries.some((entry) => typeof entry.prices[code] === 'number') ? code : null;
+}
 
 export type StorePurchaseLineRequest = { entryKey: string; defIndex: number; quantity: number; unitPriceCents: number };
 export type StorePurchaseRequest = { commandId: string; accountId: AccountId; lines: StorePurchaseLineRequest[] };
@@ -86,7 +85,7 @@ export class InGameStoreService {
     const known = this.store.sheet(accountId);
     try {
       const read = await this.context.ports.inGameStore.getPriceSheet(accountId, known?.parse_state === 'PARSED' ? known.version : undefined);
-      const label = STORE_CURRENCY_LABEL[read.currency];
+      const label = read.kind === 'sheet' ? sheetLabel(read.currency, read.sheet) : null;
       const observationId = database.transaction(() => {
         const observationId = database.insertObservation({
           accountId, surface: STORE_SHEET_SURFACE, startedAt, finishedAt: this.context.now(), complete: true,

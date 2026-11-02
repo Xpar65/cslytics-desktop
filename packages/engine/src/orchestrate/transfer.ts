@@ -7,22 +7,31 @@ import {
 } from '../db/transfers.js';
 import { HOP_NOT_REACHED, WorkStore, isSettled, type WorkStepRow } from '../db/work.js';
 import { AssetEvidenceStore } from '../db/asset-evidence.js';
-import { MAIN_INVENTORY_HARD_CAP } from '../surfaces/storage.js';
 import { TransferPlanner, type TransferRequest } from '../policy/transfer-planner.js';
 import type { TradeService } from '../surfaces/trades.js';
 import type { InventoryService } from '../surfaces/inventory.js';
 import type { StorageService } from '../surfaces/storage.js';
-import { locationEvidence } from '../kernel/evidence.js';
+import { unrestrictedKey } from '../kernel/identity.js';
 import { AccountLock } from '../kernel/support.js';
-import type { Settling } from './settle.js';
 import type { Reading } from './reads.js';
+
+/**
+ * The command service, as the one driver of a chain's hops (cross-account transfer plan D-04): a
+ * source's retrieves are its stage, dispatched once and continued by the walks that settle them.
+ */
+export type Driving = {
+  /** Drives the command's open stage through its rounds, as a hand retrieve is driven; resolves when the pass ends. */
+  dispatch(commandId: string): Promise<unknown>;
+  /** The commands a dispatch is running for right now. */
+  dispatching(): readonly string[];
+};
 
 export type TransferServices = {
   planner: TransferPlanner; trades: TradeService; inventory: InventoryService; storage: StorageService;
-  /** Settles on the caller's stack when a decision follows the driver's own read. */
-  settle: Settling;
   /** The read broker: every read here is a need it answers. */
   reads: Reading;
+  /** The one sequencer of casket moves: a crated member's retrieve is its hop, never this service's own loop. */
+  commands: Driving;
 };
 
 /**
@@ -36,15 +45,27 @@ export type TransferServices = {
  * the other account, escrow) is read from the offer. `TransferStore.batches` reads the hops back
  * as one thing, in the words the transfer always had.
  *
- * A source that holds crated items retrieves first: each item's `RETRIEVE_FROM_CASKET` action is
- * sent, the storage reconciler resolves it against a later complete walk, and the send goes only
- * once every hop is proved in main inventory and the Community walk has been read again for the
- * account (that surface is read on demand, never on a cadence). A refused hop fails the whole
- * source — one source is one offer — and leaves whatever was already retrieved in main
- * inventory, exactly as the casket chain does across a crash. Other sources are untouched.
+ * A source that holds crated items retrieves first. Each crated member's retrieve is its own hop
+ * at ordinal 0, with the storage surface's admission and the same action a hand retrieve gets, and
+ * `CommandService` drives them as it drives a listing's retrieves (plan D-04): one pass sends every
+ * hop of the stage, a unit walk that has lapsed is read before anything is sent rather than
+ * refused, the round is proved by its own reads, and a hop proved not applied goes again under its
+ * retry row. This service only asks whether that stage is over: the send goes once every retrieve
+ * hop is `DONE`, which only an observation writes, and the Community walk has been read again for
+ * the account (that surface is read on demand, never on a cadence). A refused hop fails the whole
+ * source — one source is one offer — and leaves whatever was already retrieved in main inventory,
+ * exactly as the casket chain does across a crash. Other sources are untouched.
+ *
+ * Until 2026-10-30 this service ran the retrieves itself, one per wake, and a retrieve whose unit
+ * walk had lapsed threw the read it was owed into a reason on the send hop, which the panel could
+ * not show while a retrieve hop was open: six crated stickers sat "Queued" with nothing asking for
+ * the walk, for ever.
  */
 /** Offer states in which Steam lists the given items as `missing`: they left the sender. Accepted, invalid items, in escrow. */
 const ITEMS_LEFT_STATES: readonly number[] = [3, 8, 11];
+
+/** Where a source's retrieve stage is, as the send hop sees it. */
+type RetrievalStage = { kind: 'proved' } | { kind: 'open' } | { kind: 'failed'; hop: WorkStepRow; reason: string };
 
 export class TransferService {
   private readonly store: TransferStore;
@@ -100,16 +121,19 @@ export class TransferService {
       const baseline = JSON.stringify(this.store.assetBaseline(request.destinationAccountId));
       for (const group of plan.groups) {
         const common = { commandId: request.commandId, accountId: group.accountId, now };
-        // One retrieve hop per crated asset, carrying the same preconditions, slot reservation and
-        // reconciliation as any other casket move. Its action is the hop's (D3), and the hop's
-        // command is what lets it past the command's own pledge (`kernel/context.ts`).
-        const crated = group.assets.filter(asset => asset.pendingRetrieval);
-        crated.forEach((asset, ordinal) => {
-          const hop = this.work.insert({ ...common, id: transferHopId(request.commandId, group.accountId, `retrieve:${asset.localId}`), ordinal, kind: 'RETRIEVE',
+        // One retrieve hop per crated asset, each the first hop of its own member (ordinal 0), with
+        // the storage surface's admission, slot reservation and reconciliation as any other casket
+        // move; the command service drives the stage (D-04). The hop's command is what lets its
+        // action past the command's own pledge (`kernel/context.ts`).
+        for (const asset of group.assets.filter(candidate => candidate.pendingRetrieval)) {
+          const hop = this.work.insert({ ...common, id: transferHopId(request.commandId, group.accountId, `retrieve:${asset.localId}`), ordinal: 0, kind: 'RETRIEVE',
             localId: asset.localId, params: { casketId: asset.casketId, assetId: asset.assetId, destinationAccountId: request.destinationAccountId } });
-          this.work.attachAction(hop.id, this.queueRetrieve(group.accountId, asset, hop).id, now);
-        });
-        const send = this.work.insert({ ...common, id: transferHopId(request.commandId, group.accountId, 'send'), ordinal: crated.length, kind: 'SEND',
+          const action = this.services.storage.queueRetrieveStep(group.accountId, asset.localId, asset.casketId!, hop.id);
+          db.reserveMainSlot(group.accountId, action.id);
+          this.work.attachAction(hop.id, action.id, now);
+        }
+        // The send is about the whole source and names no holding: it follows every retrieve.
+        const send = this.work.insert({ ...common, id: transferHopId(request.commandId, group.accountId, 'send'), ordinal: 1, kind: 'SEND',
           params: { destinationAccountId: request.destinationAccountId } });
         const action = db.enqueueAction({ accountId: group.accountId, stepId: send.id,
           actionKind: 'trade.send', targetId: request.commandId, resourceKey: `transfer:${request.commandId}`,
@@ -126,18 +150,6 @@ export class TransferService {
     return db.command(request.commandId)!;
   }
 
-  /** The retrieve a crated asset starts with: the storage surface's own admission, on the hop's action. */
-  private queueRetrieve(accountId: string, asset: TransferAsset, hop: WorkStepRow): ActionRow {
-    const db = this.context.database;
-    const item = db.itemByLocalId(accountId, asset.localId);
-    if (!item || item.location !== 'CASKET' || !item.asset_id || !asset.casketId) throw new Error('Item is not in the casket');
-    if (db.countMainItems(accountId) >= MAIN_INVENTORY_HARD_CAP) throw new Error('Main inventory hard cap reached');
-    const action = db.enqueueAction({ accountId, stepId: hop.id, actionKind: 'RETRIEVE_FROM_CASKET', targetId: asset.localId,
-      resourceKey: `item:${asset.localId}`, params: { casketId: asset.casketId, assetId: item.asset_id }, now: this.context.now() });
-    db.reserveMainSlot(accountId, action.id);
-    return action;
-  }
-
   /** Signals only schedule work, outside the emitting transaction and call stack. */
   schedule(accountId: string): void {
     if (this.stopped || this.scheduled.has(accountId)) return;
@@ -151,14 +163,24 @@ export class TransferService {
   stop(): void { this.stopped = true; }
 
   async advance(commandId?: string, accountId?: string): Promise<void> {
-    const batches = this.store.batches(commandId).filter(b => !finished(b) && (!accountId || b.account_id === accountId || b.destination_account_id === accountId));
+    const batches = this.store.batches(commandId).filter(b => this.open(b) && (!accountId || b.account_id === accountId || b.destination_account_id === accountId));
     await Promise.all(batches.map(batch => this.batchesLock.run(`${batch.account_id}:${batch.command_id}`, async () => {
       const current = this.store.batch(batch.command_id, batch.account_id)!;
-      if (finished(current)) return;
+      if (!this.open(current)) return;
       try { await this.advanceBatch(current); }
       catch (error) { this.say(current, error instanceof Error ? error.message : 'Transfer needs review'); }
       this.store.progress(batch.command_id);
     })));
+  }
+
+  /**
+   * Whether a source's transfer still has something for this service to do. Its words may already
+   * say `FAILED` while its send hop is open: a retrieve the command service refused fails the source
+   * the moment it is read, and the send, its pledge and the destination's room are still this
+   * service's to let go (`failBeforeSend`).
+   */
+  private open(batch: TransferBatch): boolean {
+    return !finished(batch) || !isSettled(this.sendHop(batch));
   }
 
   /** Why the transfer is not moving, on its send hop. */
@@ -170,7 +192,9 @@ export class TransferService {
     const db = this.context.database;
     const action = db.action(batch.send_action_id)!;
     if (action.state === 'READY') {
-      if (!(await this.advanceRetrievals(batch))) return;
+      const stage = this.retrievals(batch);
+      if (stage.kind === 'failed') { this.failBeforeSend(batch, stage.reason, stage.hop); return; }
+      if (stage.kind === 'open') { this.retrieve(batch); return; }
       if (this.needsEligibility(batch)) {
         await this.services.reads.need(batch.account_id, { ref: { surface: 'steam-trade-inventory', scope: { kind: 'account' } }, startedAfter: this.context.now(), priority: 'work' });
       }
@@ -266,38 +290,28 @@ export class TransferService {
   }
 
   /**
-   * The retrieval stage. True when there is nothing left to prove: every hop's action is `DONE`
-   * and a fresh complete walk, started after that hop's attempt, shows its item in main
-   * inventory. A `READY` hop is sent; anything in flight waits for the storage reconciler, which
-   * is the only thing that resolves a casket move (rule 1). Isolated so a saboteur can skip the
-   * observation gate.
+   * The retrieve stage as the send sees it, from the hops alone: proved when every retrieve hop is
+   * `DONE`, which only an observation writes (the storage reconciler's, on a walk or the item's own
+   * event begun after the attempt); failed on the first hop that failed; open otherwise. A hop still
+   * open is the command service's to move, never this service's. Isolated so a saboteur can take a
+   * request that went out for the item having moved, or salvage the loose half of a failed source.
    */
-  protected async advanceRetrievals(batch: TransferBatch): Promise<boolean> {
-    const db = this.context.database;
-    const hops = this.retrieveHops(batch);
-    if (!hops.length) return true;
-    // A casket move is resolved only by a settle, which follows every walk a turn later; an advance
-    // woken by the walk itself settles now, as the casket chain's transit observation does.
-    if (hops.some(hop => hop.action_id && db.action(hop.action_id)?.state === 'AWAITING_OBSERVATION')) this.services.settle.settleNow(batch.account_id);
-    for (const { id } of hops) {
-      const hop = this.work.reflectAction(this.work.step(id)!, this.context.now());
-      const retrieve = hop.action_id ? db.action(hop.action_id) : undefined;
-      if (!retrieve) { this.failBeforeSend(batch,'Retrieve action is missing; review the transfer', hop); return false; }
-      if (hop.state === 'FAILED' || retrieve.state === 'FAILED') { this.failBeforeSend(batch,`Retrieve refused: ${retrieve.error ?? 'no reason given'}`, hop); return false; }
-      if (retrieve.state === 'READY') {
-        const outcome = await this.context.locks.run(batch.account_id,() => this.services.storage.execute(retrieve.id));
-        if (outcome.kind === 'DEFINITIVELY_REJECTED') { this.failBeforeSend(batch,`Retrieve refused: ${outcome.reason}`, hop); return false; }
-        db.markSlotSubmitted(batch.account_id,retrieve.id);
-        this.work.reflectAction(this.work.step(id)!, this.context.now());
-        return false;
-      }
-      if (retrieve.state !== 'DONE') return false;
-      const evidence = locationEvidence(db,batch.account_id,retrieve.target_id,'MAIN',this.context.ports.clock.now(),retrieve);
-      if (evidence.grade === 'SATISFIED') continue;
-      this.say(batch, evidence.grade === 'UNSATISFIED' ? evidence.reason : 'Waiting for a complete inventory observation of the retrieved item');
-      return false;
-    }
-    return true;
+  protected retrievals(batch: TransferBatch): RetrievalStage {
+    const hops = this.retrieveHops(batch).map(hop => this.work.reflectAction(hop, this.context.now()));
+    const failed = hops.find(hop => hop.state === 'FAILED');
+    if (failed) return { kind: 'failed', hop: failed, reason: `Retrieve refused: ${failed.reason ?? 'no reason given'}` };
+    return hops.every(hop => hop.state === 'DONE') ? { kind: 'proved' } : { kind: 'open' };
+  }
+
+  /**
+   * Hands an open retrieve stage to the command service, once: its dispatch sends every hop of the
+   * stage, asks for the reads the hops are judged on, proves the round and ends; the walks that
+   * settle the hops wake this service through `wakeDrivers`, and so does the end of the dispatch.
+   */
+  private retrieve(batch: TransferBatch): void {
+    if (this.services.commands.dispatching().includes(batch.command_id)) return;
+    const wake = () => this.schedule(batch.account_id);
+    void this.services.commands.dispatch(batch.command_id).then(wake, wake);
   }
 
   /**
@@ -331,7 +345,9 @@ export class TransferService {
       const send = db.action(batch.send_action_id);
       if (send && send.state === 'READY') db.setActionState(send.id,'FAILED',now,reason);
       const sendHop = this.sendHop(batch);
-      this.work.failHop(hop ?? sendHop, reason, now);
+      // The blamed hop may already carry its own failure, written by the service that sent it.
+      if (!hop) this.work.failHop(sendHop, reason, now);
+      else if (hop.state !== 'FAILED') this.work.failHop(hop, reason, now);
       // The send is about the whole source and names no item, so the member-scoped stop above
       // does not reach it; nor the other retrieves never sent.
       if (hop && !isSettled(this.work.step(sendHop.id)!)) this.work.settle(sendHop.id, 'STOPPED', null, now, HOP_NOT_REACHED);
@@ -414,6 +430,18 @@ export class TransferService {
       && expected.some(a => a.assetId === line.asset_id && a.quantity === line.quantity));
   }
 
+  /**
+   * Delivery, proved by both inventories (plan D-09): a complete walk of each account begun after
+   * the acceptance was observed, the given units gone from the source, and each unit found on the
+   * destination. A unit is found by the receipt — the id Steam says it arrived under — for either
+   * kind; a skin with no receipt yet by its fingerprint (holdings plan D5); fungible units with no
+   * receipt yet by count: units of their group, less its lock, that the destination did not hold at
+   * admission and that the same walk shows, at least as many as were sent. Steam withholds the
+   * receipt for the seven days of trade protection (corpus `ieconservice.get-trade-history`, read
+   * 2026-10-02), so a transfer of cases or stickers that waited for it read "Accepted, waiting for
+   * both inventories" for a week, with both inventories walked every thirty seconds meanwhile
+   * (2026-10-30, live).
+   */
   protected reconcileDelivery(batch: TransferBatch, offer: ObservedOffer): void {
     const db = this.context.database;
     const source = this.store.fresh(batch.account_id,'gc-inventory',this.context.now());
@@ -421,13 +449,14 @@ export class TransferService {
     if (!source || !destination || !batch.accepted_at || source.id <= (batch.accepted_obs ?? 0) || destination.id <= (batch.accepted_obs ?? 0)
       || source.started_at <= batch.accepted_at || destination.started_at <= batch.accepted_at) return;
     const baseline = new Set(JSON.parse(batch.destination_baseline_json) as string[]);
+    const given = new Set(assetsOf(batch).map(asset => asset.assetId));
+    // The fungible units no receipt names yet, as how many of each group must have arrived.
+    const counted = new Map<string, number>();
     for (const asset of assetsOf(batch)) {
       const source = db.itemByAssetId(batch.account_id,asset.assetId);
       // A partial send of a stacked SO row leaves the row behind, lighter by what was sent.
       if (source && source.location !== 'MISSING' && (asset.unitKind !== 'fungible' || source.quantity > asset.sourceQuantity - asset.quantity)) return;
-      // The receipt names the id the unit arrived under, for a case exactly as for a skin. A skin
-      // with no receipt yet may still be recognised on the destination by its fingerprint; a case
-      // cannot be, and waits (holdings plan D5).
+      // The receipt names the id the unit arrived under, for a case exactly as for a skin.
       const line = offer.trade_id
         ? db.raw().prepare(`SELECT new_asset_id FROM trade_line WHERE account_id=? AND trade_id=? AND side='GIVE' AND asset_id=? AND new_asset_id IS NOT NULL`)
           .get(batch.account_id,offer.trade_id,asset.assetId) as { new_asset_id: string } | undefined
@@ -440,7 +469,23 @@ export class TransferService {
         const candidates = db.items(batch.destination_account_id).filter(item => item.stable_key === asset.stableKey && item.location === 'MAIN'
           && item.asset_id && item.asset_id !== asset.assetId && !baseline.has(item.asset_id) && item.local_id !== asset.localId);
         if (candidates.length !== 1 || candidates[0]!.last_seen_obs !== destination.id) return;
+      } else if (asset.unitKind === 'fungible' && asset.stableKey) {
+        const group = unrestrictedKey(asset.stableKey);
+        counted.set(group, (counted.get(group) ?? 0) + asset.quantity);
       } else return;
+    }
+    if (counted.size) {
+      // Two cases cannot be told apart, so which holding arrived is not asked; that enough new units
+      // of the group did is, of the same walk, outside the baseline frozen at admission. The lock a
+      // trade puts on an arrival is a different group key, so the groups are compared without it.
+      const arrived = new Map<string, number>();
+      for (const item of db.items(batch.destination_account_id)) {
+        if (item.unit_kind !== 'fungible' || item.location !== 'MAIN' || !item.asset_id || item.last_seen_obs !== destination.id
+          || baseline.has(item.asset_id) || given.has(item.asset_id)) continue;
+        const group = unrestrictedKey(item.group_key);
+        if (counted.has(group)) arrived.set(group, (arrived.get(group) ?? 0) + item.quantity);
+      }
+      for (const [group, quantity] of counted) if ((arrived.get(group) ?? 0) < quantity) return;
     }
     db.transaction(()=>{
       const now = this.context.now();
@@ -529,4 +574,3 @@ export class TransferService {
       outcome.kind === 'DEFINITIVELY_REJECTED' ? 'Cancellation refused; observing the offer' : 'Waiting for cancellation to be observed');
   }
 }
-

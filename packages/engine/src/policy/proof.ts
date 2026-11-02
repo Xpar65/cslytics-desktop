@@ -27,13 +27,14 @@ export type StandingProofOwner = { standingNeeds(accountId: string): ProofDemand
 
 /**
  * Every walk the waiting actions and the standing owners of one account need, read from the database each time.
- * `provedByDispatch` names the commands whose dispatch is running: each proves its own round, so their hops
- * are left out before anyone is asked what they need (bulk storage plan D15).
+ * `provedByDispatch` names the commands whose dispatch is running: each proves its own round of moves, so
+ * those are left out before anyone is asked what they need (bulk storage plan D15). Their listings and
+ * cancels are not: one goes out every two seconds, and each is read for as it waits.
  */
 export function proofDemand(database: EngineDatabase, accountId: string, owners: Readonly<Partial<Record<string, ProofOwner>>>,
   standing: readonly StandingProofOwner[] = [], provedByDispatch: readonly string[] = []): ProofDemand[] {
   const demand: ProofDemand[] = [];
-  for (const action of database.awaitingActionsOutside(accountId, provedByDispatch)) {
+  for (const action of database.awaitingActionsBesideMoves(accountId, provedByDispatch)) {
     const need = owners[action.kind]?.needs(action);
     if (!need || need.kind !== 'walks') continue;
     for (const walk of need.walks) demand.push({ ...walk, since: action.updated_at, actionId: action.id });

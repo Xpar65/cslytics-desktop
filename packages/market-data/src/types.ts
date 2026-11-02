@@ -45,7 +45,7 @@ export type CurveSeries = { vertices: readonly CurveVertex[]; asOf: string | nul
 export type CurveSegments = { segments: ReadonlyArray<readonly CurveVertex[]>; asOf: string | null };
 export type CurveListing = { id: string; float: number | null; price: number };
 
-/** A published float curve, as `api.cslytics.com/free/v1/{venue}/curves/{sha256}.json` serves it. */
+/** A published float curve, as `api.cslytics.com/member/v1/{venue}/curves/{sha256}.json` serves it to a signed-in desktop. */
 export type CurveDoc = {
   venue: 'csfloat' | 'steam';
   marketHashName: string;
@@ -66,6 +66,42 @@ export type FxRates = {
   asOf: string;
   stale: boolean;
   rates: Readonly<Record<string, number>>;
+};
+
+/**
+ * One row of CSlytics's hourly Steam price snapshot (`/member/v1/steam/prices.json`): integer US
+ * cents, buyer prices, as the order book gives them (portfolio prices plan D5). `null` is unknown,
+ * never zero. `asOf` is the time of the complete book the row came from, which differs by item
+ * because the upstream reads each on its own cadence.
+ */
+export type PriceSnapshotRow = {
+  name: string;
+  lowestAskCents: number | null;
+  highestBidCents: number | null;
+  askUnits: number;
+  bidUnits: number;
+  /** Up to five levels, highest first (plan D6). */
+  bids: readonly BookLevel[];
+  asOf: string;
+  /** Steam answered that no such item exists; every price is then null and the units zero. */
+  absent: boolean;
+  median7dCents: number | null;
+  median30dCents: number | null;
+  volume30d: number | null;
+};
+
+/** The whole document: one venue, one currency, one generation, every name the upstream has served. */
+export type PriceSnapshot = {
+  venue: 'steam';
+  currency: 'USD';
+  schema: 1;
+  /** When the API box built the generation. */
+  generatedAt: string;
+  /** When the upstream built the snapshot it came from. */
+  exportedAt: string;
+  /** The FX snapshot every native figure was converted to USD by (plan D8). */
+  fxAsOf: string;
+  rows: readonly PriceSnapshotRow[];
 };
 
 /**

@@ -14,6 +14,8 @@ export type * from './vault.js';
 export type * from './steam/index.js';
 export type * from './csfloat/index.js';
 export { DEFAULT_AVATAR_HASH } from './steam/persona.js';
+export type { SteamCurrency } from './currency.js';
+export { CSFLOAT_CURRENCY, STEAM_CURRENCIES, STEAM_CURRENCY_CODES, currencyByCode, currencyById } from './currency.js';
 export type { FeeLine, MarketplaceFee, MarketplaceFeeSchedule, MarketplaceId, PriceQuote } from './fees.js';
 export { MARKETPLACE_FEES, buyerPaysFor, listPriceOf, quoteFromBuyer, quoteFromReceive, receiveFor } from './fees.js';
 export { KIT_ATTRIBUTES_BY_ITEM, KIT_ATTRIBUTES_BY_QUALITY, attributeValue, commodityMatchKey, kitToken, matchKey } from './item-key.js';

@@ -1,22 +1,26 @@
 import { useSyncExternalStore } from 'react';
 import type { FxRates } from '@cslytics/market-data';
-import { baseCurrencyOf, DEFAULT_CURRENCY, type CurrencySettings, type DesktopSettings } from '../../shared/api.js';
+import { baseCurrencyOf, DEFAULT_SETTINGS, type CurrencySettings, type DesktopSettings } from '../../shared/api.js';
 import { engine } from './engine.js';
 
 /**
- * The currency settings as the window sees them (portfolio and pricing plan §5.2), kept the way
+ * The currency settings as the window sees them (money and currency page §3), kept the way
  * `appearance.ts` keeps the theme: read once at start, replaced by what main stored on each write,
  * and read by components through one store so a change repaints every figure at once.
  *
  * `base` is what cross-account figures are shown in. `accountPagesInBase` is the toggle: off, an
- * account's own pages are native; on, they convert too. A typed price never reads this. `fx` is
- * main's newest rate snapshot, for the read-only hint beside a typed price and nothing else: every
- * figure the window shows converted was converted by main.
+ * account's own pages are native; on, they convert too. A typed price never reads this.
+ *
+ * `fx` is main's newest rate snapshot. Main converts every figure that spans accounts; the window
+ * converts with `fx` in three places of its own, each a figure on the listing workspace or the item
+ * page: the read-only hint beside a typed price, a staged unit placed on the float curve, and
+ * *Float price*, the curve's fair price in the row's currency. The last is the one converted figure
+ * that is ever sent (money and currency page §1).
  */
 
 export type Currency = { settings: CurrencySettings; base: string; fx: FxRates | null };
 
-let snapshot: Currency = { settings: DEFAULT_CURRENCY, base: 'USD', fx: null };
+let snapshot: Currency = { settings: DEFAULT_SETTINGS.currency, base: baseCurrencyOf(DEFAULT_SETTINGS), fx: null };
 const listeners = new Set<() => void>();
 
 function publish(settings: DesktopSettings, fx: FxRates | null = snapshot.fx): void {

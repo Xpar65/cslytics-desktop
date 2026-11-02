@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import type { MarketplaceStatus } from '@cslytics/engine';
 import type { AccountLaunch } from '../../../shared/api.js';
 import { engine } from '../../lib/engine.js';
-import type { AccountCard } from '../accounts/AccountsPanel.js';
+import type { AccountCard } from '../accounts/account-card.js';
 import { Avatar } from '../../components/Avatar.js';
 import { Icon, type IconName } from '../../components/Icon.js';
 import { Empty, Notice, Panel, Switch } from '../../components/ui.js';

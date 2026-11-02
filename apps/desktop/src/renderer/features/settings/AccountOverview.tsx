@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import type { MarketplaceStatus } from '@cslytics/engine';
 import type { AccountLaunch } from '../../../shared/api.js';
-import type { AccountCard } from '../accounts/AccountsPanel.js';
+import type { AccountCard } from '../accounts/account-card.js';
 import { Avatar } from '../../components/Avatar.js';
 import { Icon } from '../../components/Icon.js';
 import { Button, ConfirmDialog, IconButton, Panel, PanelHeader, StatusBadge } from '../../components/ui.js';

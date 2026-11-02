@@ -6,6 +6,7 @@ import { engine } from '../../lib/engine.js';
 import { recentItems, rememberItem, type RecentItem } from '../../lib/recent-items.js';
 import { BookPanel, CurvePanel, HistoryPanel, Quote, useBookChanges, type Loaded } from './ItemPanels.js';
 import { ItemSearch } from './ItemSearch.js';
+import type { StagedUnit } from './staged-marks.js';
 
 /**
  * Items: one market name on a page of its own (portfolio and pricing plan §7).
@@ -30,13 +31,15 @@ const WATCH_FLOOR_MS = 1_000;
 /** How soon the page asks again when a read lands before the page's own first answer has. */
 const PAGE_PENDING_MS = 250;
 
-export function ItemsView({ name, accountIds, onOpen, back }: {
+export function ItemsView({ name, accountIds, onOpen, back, staged }: {
   /** The market name open, or `null` for the search and recent items. */
   name: string | null;
   accountIds: readonly string[];
   onOpen: (name: string) => void;
   /** Where Back goes, when the item was opened from another page. */
   back?: { label: string; onBack: () => void } | null | undefined;
+  /** Every unit staged in a listing workspace; the open item's curve marks the ones of its name. */
+  staged?: readonly StagedUnit[] | undefined;
 }): React.JSX.Element {
   // Escape is Back, as it closes a drawer elsewhere, unless something on the page wants it first.
   useEffect(() => {
@@ -63,7 +66,7 @@ export function ItemsView({ name, accountIds, onOpen, back }: {
       </div>
       {name === null
         ? <ItemsLanding onOpen={onOpen} />
-        : <ItemDetail key={name} name={name} accountIds={accountIds} onOpen={onOpen} />}
+        : <ItemDetail key={name} name={name} accountIds={accountIds} onOpen={onOpen} staged={staged} />}
     </div>
   );
 }
@@ -91,7 +94,9 @@ function ItemsLanding({ onOpen }: { onOpen: (name: string) => void }): React.JSX
   );
 }
 
-function ItemDetail({ name, accountIds, onOpen }: { name: string; accountIds: readonly string[]; onOpen: (name: string) => void }): React.JSX.Element {
+function ItemDetail({ name, accountIds, onOpen, staged }: {
+  name: string; accountIds: readonly string[]; onOpen: (name: string) => void; staged?: readonly StagedUnit[] | undefined;
+}): React.JSX.Element {
   const [variants, setVariants] = useState<ItemVariants | null>(null);
   const [page, setPage] = useState<Loaded<ItemPage>>({ state: 'loading' });
   const [history, setHistory] = useState<Loaded<ItemHistory>>({ state: 'loading' });
@@ -156,7 +161,6 @@ function ItemDetail({ name, accountIds, onOpen }: { name: string; accountIds: re
 
   const answer = page.state === 'ready' ? page.value : null;
   const changes = useBookChanges(answer?.book ?? null);
-  const floats = answer ? answer.holdings.map((row) => row.minWear).filter((wear): wear is number => wear !== null) : [];
   const current = variants?.variants.find((variant) => variant.name === name) ?? null;
 
   return (
@@ -196,7 +200,7 @@ function ItemDetail({ name, accountIds, onOpen }: { name: string; accountIds: re
       <div className="items-grid">
         <HistoryPanel history={history} page={page} />
         <BookPanel page={page} changes={changes} />
-        <CurvePanel name={name} variants={variants} floats={floats} />
+        <CurvePanel name={name} variants={variants} staged={staged} />
       </div>
     </div>
   );

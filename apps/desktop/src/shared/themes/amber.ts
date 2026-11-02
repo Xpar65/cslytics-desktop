@@ -72,7 +72,6 @@ export const amber: Theme = {
     '--cs-hold-csfloat': '#CDB88C',
     '--cs-hold-inventory': '#A9B882',
     '--cs-hold-listed': '#7DB39A',
-    '--cs-hold-unconfirmed': '#B998C6',
     '--cs-hold-hatch': 'rgba(255, 240, 220, 0.45)',
 
     '--cs-series-1': '#8FA6C4',

@@ -134,10 +134,13 @@ export class OrderService {
   /**
    * Takes the endpoint's token for one more page of a walk already admitted. The broker charges a
    * walk one token; a walk of several pages is several requests to the venue, and is paced as such.
-   * Isolated so a saboteur can page for free.
+   * A walk that may stop short waits for it only while nobody wants the lane, and answers `false`
+   * when it handed the lane back instead. Isolated so a saboteur can page for free.
    */
-  protected async admitPage(accountId: string): Promise<void> {
+  protected async admitPage(accountId: string, handBack?: () => boolean): Promise<boolean> {
+    if (handBack) return this.context.governors.admitReadUnless(accountId, 'steam-web', ACCOUNT_HISTORY.surface, handBack);
     await this.context.governors.admitRead(accountId, 'steam-web', ACCOUNT_HISTORY.surface);
+    return true;
   }
 
   /**
@@ -173,8 +176,9 @@ export class OrderService {
     let error: string | undefined;
     let coverage: HistoryCoverage | undefined;
     let rebased = false;
-    const read = async (start: number): Promise<MyHistoryPage> => {
-      if (pages > 0) await this.admitPage(accountId);
+    // A page past the first waits for its token; `null` when the walk handed its lane back instead.
+    const read = async (start: number, handBack?: () => boolean): Promise<MyHistoryPage | null> => {
+      if (pages > 0 && !(await this.admitPage(accountId, handBack))) return null;
       const page = await this.context.ports.market.getMyHistoryPage(accountId, start, pageSize);
       pages += 1;
       if (page.start !== start || !Number.isSafeInteger(page.totalCount) || page.totalCount < 0
@@ -191,7 +195,8 @@ export class OrderService {
       let joined = false;
       let start = 0;
       for (;;) {
-        const page = await read(start);
+        // The top must join the coverage, so it never hands the lane back.
+        const page = (await read(start))!;
         for (const event of page.events) {
           if (seen.has(event.eventId)) continue;
           seen.add(event.eventId);
@@ -213,8 +218,9 @@ export class OrderService {
       }
       // 2. Older pages, each anchored on the boundary, while the walk's pages last and nobody
       // waits for the lane: a page the walk does not read is read next time (history backfill plan D4).
-      while (coverage && coverage.remaining > 0 && !coverage.stopped && pages < this.pagesPerWalk() && !options.yield?.()) {
-        const page = await read(Math.max(0, coverage.coveredCount - 1));
+      while (coverage && coverage.remaining > 0 && !coverage.stopped && pages < this.pagesPerWalk()) {
+        const page = await read(Math.max(0, coverage.coveredCount - 1), options.yield);
+        if (!page) break;
         const at = page.events.findIndex((event) => event.eventId === coverage!.boundaryEventId);
         const older = at === -1 ? [] : page.events.slice(at + 1).filter((event) => !seen.has(event.eventId));
         const reachedEnd = page.start + page.events.length >= total!;

@@ -72,7 +72,6 @@ export const light: Theme = {
     '--cs-hold-csfloat': '#E07B39',
     '--cs-hold-inventory': '#5E9E58',
     '--cs-hold-listed': '#2F9E8C',
-    '--cs-hold-unconfirmed': '#9A6DD6',
     '--cs-hold-hatch': 'rgba(255, 255, 255, 0.55)',
 
     '--cs-series-1': '#4C7FE6',

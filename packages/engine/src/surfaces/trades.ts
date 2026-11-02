@@ -10,6 +10,7 @@ import { errorMessage } from '../kernel/support.js';
 import { COMMITTING_STATUSES, offerStatus, reversesDelivery, settlesDelivery, tradeStatus } from '../policy/trade-status.js';
 import { TradeStore, type TradeHistoryCoverage } from '../db/trades.js';
 import { LedgerStore } from '../db/ledger.js';
+import { FRESHNESS } from '../kernel/evidence.js';
 
 export const TRADE_OFFERS_SURFACE = 'steam-trade-offers';
 export const TRADE_HISTORY_SURFACE = 'steam-trade-history';
@@ -25,6 +26,13 @@ export const HISTORY_OVERLAP_MS = 10 * 60_000;
 
 /** How far back a history walk still re-reads a trade Steam has not settled: escrow is at most 15 days, protection 7. */
 export const UNSETTLED_REREAD_MS = 31 * 86_400_000;
+
+/**
+ * How often a pass of that re-read begins: the history's freshness window, which is how often it is
+ * read when nobody waits on it. A backfill reads it every two minutes and a proof more often, and a
+ * pass on each of those spent the walk's pages on trades read minutes before.
+ */
+export const UNSETTLED_REREAD_EVERY_MS = FRESHNESS['steam-trade-history'].maxAgeMs;
 
 /** Bounds one offers walk. A pathological account cannot make a single walk unbounded. */
 export const MAX_OFFER_PAGES = 100;
@@ -195,12 +203,25 @@ export class TradeService {
   }
 
   /**
+   * Whether a walk re-reads the trades Steam may still change: a pass the last walk's pages did not
+   * finish, or a new one once `UNSETTLED_REREAD_EVERY_MS` has passed since the last began. Isolated so
+   * a saboteur can begin one on every walk.
+   */
+  protected rereadDue(pass: TradeHistoryCoverage['reread'], nowMs: number): boolean {
+    return pass === undefined || pass.afterTradeId !== undefined || nowMs - pass.startedAtSeconds * 1000 >= UNSETTLED_REREAD_EVERY_MS;
+  }
+
+  /**
    * Takes the endpoint's token for one more page of a walk already admitted. The broker charges a
    * walk one token; a walk of several pages is several requests to the venue, and is paced as such.
-   * Isolated so a saboteur can page for free.
+   * The token is fifteen seconds away, so a walk that may stop short waits for it only while nobody
+   * wants the lane, and answers `false` when it handed the lane back instead (`N-READ-18`). Isolated
+   * so a saboteur can page for free.
    */
-  protected async admitPage(accountId: string): Promise<void> {
+  protected async admitPage(accountId: string, handBack?: () => boolean): Promise<boolean> {
+    if (handBack) return this.context.governors.admitReadUnless(accountId, 'steam-web', TRADE_HISTORY_SURFACE, handBack);
     await this.context.governors.admitRead(accountId, 'steam-web', TRADE_HISTORY_SURFACE);
+    return true;
   }
 
   // --- offers --------------------------------------------------------------
@@ -290,33 +311,44 @@ export class TradeService {
   }
 
   /**
-   * How far back a history walk reads: the previous committed boundary, pulled back by the overlap
-   * window — and further, to the oldest trade Steam may still change.
+   * Where the top of the log joins the committed coverage: its newest trade, pulled back by the
+   * overlap window. Only that: a top that had to reach the oldest trade Steam may still change as well
+   * outran its pages on an account that trades often, and threw its coverage away on every walk
+   * (`rereadFloorMs`, `N-TRD-21`).
+   */
+  protected historyBoundaryMs(accountId: AccountId): number {
+    const previous = this.context.database.checkpoint(accountId, TRADE_HISTORY_SURFACE);
+    return previous?.covered_through ? Date.parse(previous.covered_through) - HISTORY_OVERLAP_MS : Number.NEGATIVE_INFINITY;
+  }
+
+  /**
+   * How far below the top a walk re-reads the trades Steam may still change, or `undefined` when
+   * there are none.
    *
    * A trade-protected trade is listed at once, `status` 3, with `time_settlement` at the end of its
    * reversal period and no new asset ids until then; a reversal turns it to 12 inside that period
    * (csgomarketv3 trade-offer-state-endpoints.md, findings 2026-10-02). A walk that stopped at its
    * checkpoint would never read either change for a trade older than the checkpoint, so every trade
    * that no complete walk has seen past its settlement is read again, as is an accepted offer whose
-   * trade the history has not shown yet. Bounded to a month: escrow is at most fifteen days and
-   * protection seven.
+   * trade the history has not shown yet. Bounded to a month, since escrow is at most fifteen days and
+   * protection seven, and to the covered segment: below its boundary the backfill reads every trade
+   * for the first time anyway. An accepted offer older than the segment pulled the re-read a month
+   * down a log the backfill had barely begun.
    */
-  protected historyBoundaryMs(accountId: AccountId): number {
+  protected rereadFloorMs(accountId: AccountId, coverage: TradeHistoryCoverage): number | undefined {
     const { database } = this.context;
-    const previous = database.checkpoint(accountId, TRADE_HISTORY_SURFACE);
-    if (!previous?.covered_through) return Number.NEGATIVE_INFINITY;
-    const checkpoint = Date.parse(previous.covered_through) - HISTORY_OVERLAP_MS;
+    if (coverage.boundaryTradeId === '') return undefined;
     const lastWalk = database.raw().prepare(`SELECT MAX(started_at) AS at FROM observation WHERE account_id=? AND surface=? AND complete=1 AND error IS NULL`)
       .get(accountId, TRADE_HISTORY_SURFACE) as { at: string | null };
-    const floor = new Date(Date.parse(this.context.now()) - UNSETTLED_REREAD_MS).toISOString();
+    const since = new Date(Math.max(Date.parse(this.context.now()) - UNSETTLED_REREAD_MS, coverage.boundaryTimeSeconds * 1000)).toISOString();
     const oldest = database.raw().prepare(`SELECT MIN(at) AS at FROM (
         SELECT initiated_at AS at FROM executed_trade WHERE account_id=? AND initiated_at>=?
           AND (status IN ('PENDING','ESCROW','UNKNOWN') OR (settled_at IS NOT NULL AND settled_at>=?))
         UNION ALL
         SELECT o.updated_at FROM trade_offer o WHERE o.account_id=? AND o.status='ACCEPTED' AND o.trade_id IS NOT NULL AND o.updated_at>=?
           AND NOT EXISTS (SELECT 1 FROM executed_trade t WHERE t.account_id=o.account_id AND t.trade_id=o.trade_id))`)
-      .get(accountId, floor, lastWalk.at ?? '', accountId, floor) as { at: string | null };
-    return oldest.at ? Math.min(checkpoint, Date.parse(oldest.at) - HISTORY_OVERLAP_MS) : checkpoint;
+      .get(accountId, since, lastWalk.at ?? '', accountId, since) as { at: string | null };
+    return oldest.at ? Date.parse(oldest.at) - HISTORY_OVERLAP_MS : undefined;
   }
 
   protected persistOffer(accountId: string, offer: TradeOffer, observationId: number): boolean {
@@ -351,26 +383,28 @@ export class TradeService {
 
   /**
    * One walk of the account's executed trades: the newest pages down to what the record already
-   * holds, then, while the walk's pages last, older pages below its boundary.
+   * holds, then, while the walk's pages last, the trades Steam may still change, then older pages
+   * below its boundary.
    *
    * The log is keyset-paged, newest first: an older page is read after the last row of the one
    * above it, so a boundary is a stable place to resume from, which an offset into the market
    * history is not. The top is read until a page's oldest trade is older than the committed
-   * coverage (`historyBoundaryMs`: its newest trade less the overlap, and further back to the
-   * oldest trade Steam may still change), which joins what was read to the coverage. A first walk
-   * has nothing to join and reads at most its pages from the top; what it read is the coverage,
-   * and the rest of the log is the backfill's, a few pages a walk until the end. A later top that
-   * outran the walk's pages restarts the coverage at what was read, contiguous from the newest
-   * trade, and what lay below is backfilled again (`history-coverage-rebased`), as the market
-   * history does. A page whose rows the walk already holds, or that claims more rows while
-   * carrying none, is a cursor that did not advance: it fails the top, and it stops the backfill
-   * with a reason, since a cursor that lies is not a thing to reason past.
+   * coverage (`historyBoundaryMs`: its newest trade less the overlap), which joins what was read to
+   * the coverage. A first walk has nothing to join and reads at most its pages from the top; what it
+   * read is the coverage, and the rest of the log is the backfill's, a few pages a walk until the
+   * end. A later top that outran the walk's pages restarts the coverage at what was read, contiguous
+   * from the newest trade, and what lay below is backfilled again (`history-coverage-rebased`), as
+   * the market history does. Below a top that joined, the walk re-reads the covered trades Steam may
+   * still change (`rereadFloorMs`) in passes of their own, and only then backfills. A page whose rows
+   * the walk already holds, or that claims more rows while carrying none, is a cursor that did not
+   * advance: it fails the top, and it stops the backfill with a reason, since a cursor that lies is
+   * not a thing to reason past.
    *
    * A failed page of the top commits no coverage (rule 5), though every trade read is a fact worth
-   * keeping (N-TRD-03). A failed page of the backfill keeps the boundary the pages before it
-   * reached: they were read after the boundary in turn, so the segment is still contiguous, and a
-   * refusal costs one page rather than the walk. The walk is incomplete either way, so the broker
-   * holds the scope and answers no need from it.
+   * keeping (N-TRD-03). A failed page below it keeps what the pages before it reached: they were read
+   * after one another in turn, so the segment is still contiguous and a pass resumes where it
+   * stopped, and a refusal costs one page rather than the walk. The walk is incomplete either way, so
+   * the broker holds the scope and answers no need from it.
    */
   protected async walkHistory(accountId: AccountId, pageSize: number, options: HistoryWalkOptions): Promise<TradeSyncResult> {
     const { database } = this.context;
@@ -388,8 +422,9 @@ export class TradeService {
     let rebased = false;
     let yielded = false;
 
-    const read = async (after: HistoryCursor): Promise<TradeHistoryPage> => {
-      if (pagesWalked > 0) await this.admitPage(accountId);
+    // A page past the first waits for its token; `null` when the walk handed its lane back instead.
+    const read = async (after: HistoryCursor, handBack?: () => boolean): Promise<TradeHistoryPage | null> => {
+      if (pagesWalked > 0 && !(await this.admitPage(accountId, handBack))) return null;
       const page = await this.context.ports.trade.getTradeHistoryPage(accountId, { ...after, maxTrades: pageSize });
       pagesWalked += 1;
       if (page.totalTrades !== null) total = page.totalTrades;
@@ -408,15 +443,15 @@ export class TradeService {
     try {
       let cursor: HistoryCursor = { afterTimeSeconds: 0, afterTradeId: '' };
       for (;;) {
-        const page = await read(cursor);
+        // A first walk has nothing to join, so it may stop for a person as the backfill does.
+        const page = await read(cursor, previous ? undefined : options.yield);
+        if (!page) { outran = true; yielded = true; break; }
         trades.push(...page.trades);
         newest ??= page.trades[0];
         oldest = oldestOf(page) ?? oldest;
         if (!page.more) { reachedEnd = true; break; }
         if (oldest && Date.parse(oldest.initiatedAt) < boundaryMs) { crossedBoundary = true; break; }
         if (pagesWalked >= this.pagesPerWalk()) { outran = true; break; }
-        // A first walk has nothing to join, so it may stop for a person as the backfill does.
-        if (!previous && options.yield?.()) { outran = true; yielded = true; break; }
         cursor = cursorOf(oldest!);
       }
     } catch (caught) {
@@ -436,25 +471,60 @@ export class TradeService {
       };
       if (newest) coveredThrough = newest.initiatedAt;
     } else if (joined || (error === undefined && outran)) {
-      // The first segment, or a top that outran the walk's pages: the coverage is what was read.
+      // The first segment, or a top that outran the walk's pages: the coverage is what was read, all of it just now.
       rebased = previous !== undefined;
+      const reread = { startedAtSeconds: seconds(startedAt) };
       coverage = newest && oldest
-        ? { ...cursorOf(newest), boundaryTimeSeconds: seconds(oldest.initiatedAt), boundaryTradeId: oldest.tradeId, coveredCount: trades.length, total, reachedEnd }
-        : { afterTimeSeconds: 0, afterTradeId: '', boundaryTimeSeconds: 0, boundaryTradeId: '', coveredCount: 0, total, reachedEnd };
+        ? { ...cursorOf(newest), boundaryTimeSeconds: seconds(oldest.initiatedAt), boundaryTradeId: oldest.tradeId, coveredCount: trades.length, total, reachedEnd, reread }
+        : { afterTimeSeconds: 0, afterTradeId: '', boundaryTimeSeconds: 0, boundaryTradeId: '', coveredCount: 0, total, reachedEnd, reread };
       coveredThrough = newest?.initiatedAt ?? null;
     }
 
-    // 2. Older pages below the boundary, while the walk's pages last and nobody waits for the lane.
+    // 2. The trades Steam may still change, below the top and inside the coverage (`rereadFloorMs`). A
+    // pass begins at most every `UNSETTLED_REREAD_EVERY_MS`, and one the walk's pages did not finish
+    // resumes where they ran out, so a reversal period longer than a walk's pages is read over two.
+    const pass = previous?.reread;
+    const unfinished = pass?.afterTradeId !== undefined;
+    if (previous && joined && coverage && oldest && this.rereadDue(pass, Date.parse(startedAt))) {
+      // A pass resumes below the top, never over rows this walk has read.
+      const resumes = unfinished && pass.afterTimeSeconds! < seconds(oldest.initiatedAt);
+      let cursor: HistoryCursor = resumes ? { afterTimeSeconds: pass.afterTimeSeconds!, afterTradeId: pass.afterTradeId! } : cursorOf(oldest);
+      const floorMs = this.rereadFloorMs(accountId, previous);
+      let done = floorMs === undefined || (!resumes && Date.parse(oldest.initiatedAt) < floorMs);
+      try {
+        while (!done && pagesWalked < this.pagesPerWalk()) {
+          const page = await read(cursor, options.yield);
+          if (!page) { yielded = true; break; }
+          trades.push(...page.trades);
+          const last = oldestOf(page);
+          // A page that reaches below the boundary has read into the backfill's ground, contiguous with the coverage.
+          const at = page.trades.findIndex((trade) => trade.tradeId === coverage!.boundaryTradeId);
+          const below = at >= 0 ? page.trades.length - at - 1 : page.trades.filter((trade) => seconds(trade.initiatedAt) < coverage!.boundaryTimeSeconds).length;
+          if (below > 0) {
+            coverage = { ...coverage, boundaryTimeSeconds: seconds(last!.initiatedAt), boundaryTradeId: last!.tradeId,
+              coveredCount: coverage.coveredCount + below, total: total ?? coverage.total, reachedEnd: !page.more };
+          }
+          done = below > 0 || !page.more || !last || Date.parse(last.initiatedAt) < floorMs!;
+          if (!done) cursor = cursorOf(last!);
+        }
+      } catch (caught) {
+        if (errorMessage(caught) === 'history-cursor-did-not-advance') { coverage = { ...coverage, stopped: 'history-cursor-did-not-advance' }; done = true; }
+        else error = errorMessage(caught);
+      }
+      coverage = { ...coverage, reread: { startedAtSeconds: unfinished ? pass.startedAtSeconds : seconds(startedAt), ...(done ? {} : cursor) } };
+    }
+
+    // 3. Older pages below the boundary, while the walk's pages last and nobody waits for the lane.
     try {
       while (error === undefined && coverage && !coverage.reachedEnd && !coverage.stopped && coverage.boundaryTradeId !== '' && pagesWalked < this.pagesPerWalk()) {
-        if (options.yield?.()) { yielded = true; break; }
-        let page: TradeHistoryPage;
+        let page: TradeHistoryPage | null;
         try {
-          page = await read({ afterTimeSeconds: coverage.boundaryTimeSeconds, afterTradeId: coverage.boundaryTradeId });
+          page = await read({ afterTimeSeconds: coverage.boundaryTimeSeconds, afterTradeId: coverage.boundaryTradeId }, options.yield);
         } catch (caught) {
           if (errorMessage(caught) === 'history-cursor-did-not-advance') { coverage = { ...coverage, stopped: 'history-cursor-did-not-advance' }; break; }
           throw caught;
         }
+        if (!page) { yielded = true; break; }
         trades.push(...page.trades);
         const last = oldestOf(page);
         coverage = {

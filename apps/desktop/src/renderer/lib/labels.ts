@@ -1,4 +1,5 @@
 import { currencyById } from '@cslytics/market-data';
+import { CSFLOAT_CURRENCY } from '@cslytics/ports';
 import type { IconName } from '../components/Icon.js';
 import { formatAmount } from './money.js';
 
@@ -419,7 +420,7 @@ export function chipLabel(chip: {
     case 'unit': return `Storage unit: ${chip.text}`;
     case 'account': return `Account: ${chip.text}`;
     case 'where': return chip.listed ? LISTED.label : chip.location ? LOCATION[chip.location]?.label ?? chip.text : chip.text;
-    case 'tradable': return 'Tradable only';
+    case 'tradable': return 'Tradable';
     case 'lock': return chip.lock === 'market' ? 'Market-locked' : 'Trade-protected';
     case 'item': return chip.text;
     default: return chip.text;
@@ -540,38 +541,9 @@ export function currencySymbol(currency: number | null | undefined): string {
   return currencyById(currency)?.symbol ?? '';
 }
 
-/**
- * Steam `ECurrencyCode` → its ISO code.
- *
- * A symbol is not enough once two venues are on one screen: `$` is US dollars on a CSFloat row
- * and Australian dollars on a Steam row for an AUD wallet, and a page that shows both without
- * saying which is exactly the screen that makes someone act on the wrong number.
- *
- * The same 37 labels the engine captured from a live price sheet (`STORE_CURRENCY_LABEL` in
- * `surfaces/in-game-store.ts`). Copied rather than imported because the renderer takes only *types* from
- * `@cslytics/engine` — importing a value would pull the engine into the window bundle — and
- * `tests/unit/currency-labels.test.ts` fails the build if the two ever disagree.
- */
-export const CURRENCY_CODE: Readonly<Record<number, string>> = {
-  1: 'USD', 2: 'GBP', 3: 'EUR', 4: 'CHF', 5: 'RUB', 6: 'PLN', 7: 'BRL', 8: 'JPY', 9: 'NOK', 10: 'IDR',
-  11: 'MYR', 12: 'PHP', 13: 'SGD', 14: 'THB', 15: 'VND', 16: 'KRW', 17: 'TRY', 18: 'UAH', 19: 'MXN', 20: 'CAD',
-  21: 'AUD', 22: 'NZD', 23: 'CNY', 24: 'INR', 25: 'CLP', 26: 'PEN', 27: 'COP', 28: 'ZAR', 29: 'HKD', 30: 'TWD',
-  31: 'SAR', 32: 'AED', 35: 'ILS', 37: 'KZT', 38: 'KWD', 39: 'QAR', 40: 'CRC', 41: 'UYU'
-};
-
-/**
- * The ISO code for a currency, or the honest absence of one.
- *
- * `null` is a currency nothing has observed — an account whose wallet has never been read — and
- * it must not fall back to a default, because "A$" on an unobserved wallet is a claim.
- */
-export function currencyCode(currency: number | null | undefined): string {
-  return currency === null || currency === undefined ? '' : CURRENCY_CODE[currency] ?? `code ${currency}`;
-}
-
-/** A CSFloat figure: USD on every account, printed with its code like every other. */
+/** A CSFloat figure: USD on every account (`CSFLOAT_CURRENCY`), printed with its code like every other. */
 export function formatUsd(cents: number | null | undefined): string {
-  return formatAmount(cents, 'USD');
+  return formatAmount(cents, CSFLOAT_CURRENCY);
 }
 
 /** Whole dollars and cents as typed in a money field, to integer cents; `null` when it is not a price. */

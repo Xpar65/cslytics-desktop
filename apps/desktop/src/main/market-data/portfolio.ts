@@ -1,12 +1,13 @@
 import {
-  convert, currencyById, dayOf, unitPrice, valuePositions,
-  type Converted, type FillEntry, type FxRates, type NameStatus, type Position, type StoredBook, type Valuation, type ValuedPosition
+  addSums, convert, currencyById, dayOf, sumInBase, unitPrice, valuePositions,
+  type Converted, type FillEntry, type FxRates, type NameStatus, type Position, type StoredBook, type StoredPrice, type Valuation,
+  type ValuationInput, type ValuedPosition
 } from '@cslytics/market-data';
 import type { AccountHoldings, InventoryPositionRow, PositionsEnvelope } from '@cslytics/engine';
 import { baseCurrencyOf, type DesktopSettings, type EngineCommand } from '../../shared/api.js';
 import type {
-  AccountFigures, BaseSum, BookConverted, ItemBook, ItemCurve, ItemHistory, ItemHolding, ItemPage, ItemVariants, ObservedByCurrency, ObservedFigure, ObservedKey,
-  PortfolioValuation
+  AccountFigures, BaseSum, BookConverted, CurvesSource, ItemBook, ItemCurve, ItemHistory, ItemHolding, ItemPage, ItemVariants, ObservedByCurrency, ObservedFigure,
+  ObservedKey, PortfolioValuation, PricesSource
 } from '../../shared/market.js';
 import type { CatalogueMediator, EnrichedRow } from '../catalogue/mediator.js';
 import type { MarketDataHost } from './host.js';
@@ -50,6 +51,7 @@ export function toPosition(row: InventoryPositionRow & EnrichedRow): Position {
     name: row.marketHashName,
     category: row.category,
     quantity: row.quantity,
+    floats: row.floats,
     main: row.main,
     storage: row.storage,
     listed: row.listed,
@@ -63,13 +65,13 @@ function figure(cents: number, currency: string, base: string, fx: FxRates | nul
 
 type ObservedCents = {
   steam: number; steamPending: number; csfloat: number; csfloatPending: number;
-  reserved: number; listed: number; onHold: number; awaiting: number; buyOrders: number;
+  reserved: number; listed: number; onHold: number; buyOrders: number;
 };
 
-const NO_CENTS: ObservedCents = { steam: 0, steamPending: 0, csfloat: 0, csfloatPending: 0, reserved: 0, listed: 0, onHold: 0, awaiting: 0, buyOrders: 0 };
+const NO_CENTS: ObservedCents = { steam: 0, steamPending: 0, csfloat: 0, csfloatPending: 0, reserved: 0, listed: 0, onHold: 0, buyOrders: 0 };
 
 const OBSERVED_KEYS: readonly ObservedKey[] = [
-  'steam', 'steamPending', 'csfloat', 'csfloatPending', 'wallets', 'reserved', 'listed', 'onHold', 'listings', 'awaitingConfirmation', 'buyOrders'
+  'steam', 'steamPending', 'csfloat', 'csfloatPending', 'wallets', 'reserved', 'listed', 'onHold', 'listings', 'buyOrders'
 ];
 
 /**
@@ -97,7 +99,6 @@ export function observedByCurrency(holdings: readonly AccountHoldings[], base: s
       steam.reserved += row.reservedCents;
       steam.listed += row.listedReceiveCents;
       steam.onHold += row.onHoldReceiveCents;
-      steam.awaiting += row.awaitingConfirmationReceiveCents;
       steam.buyOrders += row.buyOrderOpenCents;
     }
     const csfloat = row.csfloatWallet ? groupOf(row.csfloatWallet.currency, row.accountId) : null;
@@ -122,7 +123,6 @@ export function observedByCurrency(holdings: readonly AccountHoldings[], base: s
       listed: at(cents.listed),
       onHold: at(cents.onHold),
       listings: at(cents.listed + cents.onHold),
-      awaitingConfirmation: at(cents.awaiting),
       buyOrders: at(cents.buyOrders)
     };
   });
@@ -133,20 +133,6 @@ export function observedInBase(observed: readonly ObservedByCurrency[], base: st
   return Object.fromEntries(OBSERVED_KEYS.map((key) => [key, sumInBase(observed.map((group) => group[key]), base)])) as Record<ObservedKey, BaseSum>;
 }
 
-function sumInBase(figures: readonly ObservedFigure[], base: string): BaseSum {
-  let cents = 0;
-  let any = false;
-  const missing: string[] = [];
-  for (const entry of figures) {
-    // Nothing is nothing in every currency: a zero needs no rate, and must not make a total a floor.
-    if (entry.currency === base || entry.cents === 0) { cents += entry.cents; any = true; continue; }
-    if (entry.converted === null) { missing.push(entry.currency); continue; }
-    cents += entry.converted.cents;
-    any = true;
-  }
-  return { cents: any ? cents : null, complete: missing.length === 0, missingCurrencies: missing };
-}
-
 /**
  * Each account's wallets and inventory in the base, and the two added: what the per-account table
  * shows beside the headline. Every subtotal is converted once per currency, as the headline's are.
@@ -155,11 +141,11 @@ export function accountFigures(holdings: readonly AccountHoldings[], valuation: 
   return holdings.map((row) => {
     const wallets = observedInBase(observedByCurrency([row], base, fx), base).wallets;
     const inventory = valuation === null ? null : inventoryInBase(valuation.positions.filter((position) => position.accountId === row.accountId), base, fx);
-    return { accountId: row.accountId, wallets, inventory, total: added(wallets, inventory) };
+    return { accountId: row.accountId, wallets, inventory, total: addSums(wallets, inventory) };
   });
 }
 
-/** Priced positions at the mid price, one subtotal per book currency, each converted once. Nothing priced is nothing. */
+/** Priced positions at their market value, one subtotal per native currency, each converted once. Nothing priced is nothing. */
 function inventoryInBase(positions: readonly ValuedPosition[], base: string, fx: FxRates | null): BaseSum {
   const natives = new Map<string, number>();
   for (const row of positions) {
@@ -168,16 +154,6 @@ function inventoryInBase(positions: readonly ValuedPosition[], base: string, fx:
   }
   if (natives.size === 0) return { cents: 0, complete: true, missingCurrencies: [] };
   return sumInBase([...natives].map(([currency, cents]) => figure(cents, currency, base, fx)), base);
-}
-
-/** Two sums in the base. A part that is missing, or was never computed, leaves the result a floor. */
-function added(left: BaseSum, right: BaseSum | null): BaseSum {
-  const parts = [left.cents, right?.cents ?? null].filter((cents): cents is number => cents !== null);
-  return {
-    cents: parts.length === 0 ? null : parts.reduce((sum, cents) => sum + cents, 0),
-    complete: left.complete && right !== null && right.complete,
-    missingCurrencies: [...new Set([...left.missingCurrencies, ...(right?.missingCurrencies ?? [])])].sort()
-  };
 }
 
 export async function portfolioValuation(deps: PortfolioDeps, accountIds: readonly string[]): Promise<PortfolioValuation> {
@@ -199,15 +175,25 @@ export async function portfolioValuation(deps: PortfolioDeps, accountIds: readon
     return {
       base, settings: settings.currency, valuation: null, needsFilter: { groups: positions.groups, cap: positions.cap }, observed, observedInBase: inBase, wallet,
       total: { cents: null, complete: false, missingCurrencies: wallet.missingCurrencies }, accounts: accountFigures(holdings, null, base, fx),
-      status: deps.host.status(), fill: deps.host.fill(), valued: true, lastSnapshotDay, observedIn: null
+      status: deps.host.status(), fill: deps.host.fill(), valued: true, floatValued: true, lastSnapshotDay, observedIn: null, prices: null, curves: null
     };
   }
 
   const rows = deps.catalogue.enrich(positions.rows).map(toPosition);
   const names = [...new Set(rows.map((row) => row.name).filter((name): name is string => name !== null))];
-  const books = deps.host.store.books(names);
+  // CSlytics's snapshot first, for every name it covers (portfolio prices plan D9); Steam's own
+  // books for the rest, which are the only names the fill is then given.
+  const snapshotHeld = deps.host.usableSnapshot();
+  const covered = snapshotHeld === null ? new Map<string, StoredPrice>() : deps.host.store.prices('steam', names);
+  const snapshot = snapshotHeld === null ? undefined : { rows: covered, generatedAt: snapshotHeld.generatedAt };
+  const books = deps.host.store.books(names.filter((name) => !covered.has(name)));
   const statuses = deps.host.store.statuses(names);
-  const valuation = valuePositions({ positions: rows, books, statuses, fx, base });
+  // CSlytics's Steam float curve for every skin, which the float value prices each unit by (plan D7);
+  // the market value never reads one. Only the copies already held are read here; the curve fill
+  // asks for the rest.
+  const skins = [...new Set(rows.filter((row) => row.name !== null && row.unpriced === null && row.floats.length > 0).map((row) => row.name!))];
+  const curves = deps.host.store.curves('steam', skins);
+  const valuation = valuePositions({ positions: rows, books, statuses, fx, base, curves, ...(snapshot ? { snapshot } : {}) });
 
   // What the scheduler should keep fresh, heaviest first: a stack's value, as far as it is known.
   const weights = new Map<string, number>();
@@ -217,10 +203,12 @@ export async function portfolioValuation(deps: PortfolioDeps, accountIds: readon
     weights.set(row.name, (weights.get(row.name) ?? 0) + cents);
   }
   const held: FillEntry[] = names.map((name) => ({ name, weightCents: weights.get(name) ?? 0 }));
-  deps.host.hold(held);
-  // Read after `hold`, so the progress and the gate describe the fill these figures are part of.
+  deps.host.hold(held, new Set(covered.keys()));
+  deps.host.curves.hold([...skins].sort((a, b) => (weights.get(b) ?? 0) - (weights.get(a) ?? 0)));
+  // Read after `hold`, so the progress and the gates describe the fills these figures are part of.
   const status = deps.host.status();
   const valued = deps.host.valued();
+  const floatValued = deps.host.curves.settled();
 
   const total = totalInBase(wallet, valuation, base);
   const observedIn = newestBookCurrency(valuation);
@@ -228,39 +216,48 @@ export async function portfolioValuation(deps: PortfolioDeps, accountIds: readon
   // The day's snapshot, only over a finished fill and settled walks (plan D12, §8 e): a figure taken
   // mid-fill or over an unfinished walk is a floor, and a floor must not become history.
   if (deps.host.filled() && holdings.every((row) => row.inventory.settled && row.market.settled)) {
-    writeSnapshots(deps, holdings, rows, books, statuses, fx, base);
+    writeSnapshots(deps, holdings, rows, books, statuses, fx, base, snapshot);
   }
+
+  const prices: PricesSource | null = snapshotHeld === null || valuation.snapshot === null ? null : {
+    generatedAt: snapshotHeld.generatedAt, fetchedAt: snapshotHeld.fetchedAt, fxAsOf: snapshotHeld.fxAsOf,
+    coveredKinds: valuation.snapshot.kinds, bookKinds: valuation.snapshot.bookKinds
+  };
+
+  const curvesSource: CurvesSource = { ...valuation.curves, skins: skins.length, fill: deps.host.curves.status() };
 
   return {
     base, settings: settings.currency, valuation, needsFilter: null, observed, observedInBase: inBase, wallet, total,
-    accounts: accountFigures(holdings, valuation, base, fx), status, fill: deps.host.fill(), valued, lastSnapshotDay, observedIn
+    accounts: accountFigures(holdings, valuation, base, fx), status, fill: deps.host.fill(), valued, floatValued, lastSnapshotDay, observedIn, prices, curves: curvesSource
   };
 }
 
+/** The wallets and the market value added; a valuation made in another base is a floor until it is made again. */
 function totalInBase(wallet: PortfolioValuation['wallet'], valuation: Valuation, base: string): PortfolioValuation['total'] {
-  const missing = [...new Set([...wallet.missingCurrencies, ...valuation.marketValue.missingCurrencies])].sort();
-  const parts = [wallet.cents, valuation.marketValue.cents].filter((cents): cents is number => cents !== null);
-  return { cents: parts.length === 0 ? null : parts.reduce((sum, cents) => sum + cents, 0), complete: wallet.complete && valuation.marketValue.complete && valuation.base === base, missingCurrencies: missing };
+  const total = addSums(wallet, valuation.marketValue);
+  return { ...total, complete: total.complete && valuation.base === base };
 }
 
+/** The currency of the newest book read from this connection; a snapshot-priced row says nothing about the connection. */
 function newestBookCurrency(valuation: Valuation): string | null {
   let newest: { at: string; currency: number } | null = null;
   for (const row of valuation.positions) {
-    if (!row.priced) continue;
+    if (!row.priced || row.source !== 'book') continue;
     if (newest === null || row.observedAt > newest.at) newest = { at: row.observedAt, currency: row.bookCurrency };
   }
   return newest === null ? null : currencyById(newest.currency)?.code ?? null;
 }
 
+/** The day's figures per account: the market value at the mid price, and what a sale into the bids would return. */
 function writeSnapshots(
   deps: PortfolioDeps, holdings: readonly AccountHoldings[], rows: readonly Position[], books: ReadonlyMap<string, StoredBook>, statuses: ReadonlyMap<string, NameStatus>,
-  fx: FxRates | null, base: string
+  fx: FxRates | null, base: string, snapshot: ValuationInput['snapshot']
 ): void {
   const day = dayOf((deps.now ?? (() => new Date()))().toISOString());
   for (const account of holdings) {
     const own = rows.filter((row) => row.accountId === account.accountId);
     if (own.length === 0) continue;
-    const valuation = valuePositions({ positions: own, books, statuses, fx, base });
+    const valuation = valuePositions({ positions: own, books, statuses, fx, base, ...(snapshot ? { snapshot } : {}) });
     for (const basis of ['mid', 'liquidation'] as const) {
       const total = basis === 'mid' ? valuation.marketValue : valuation.liquidation;
       for (const subtotal of total.subtotals) {

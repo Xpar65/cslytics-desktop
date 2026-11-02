@@ -3,12 +3,11 @@ import { AccountFile, type StoredAccount } from './account-file.js';
 import type { AccountIssuer, AccountRecord, IssuerAnswer, TokenSet } from './issuer.js';
 import { openLoopbackListener, type CallbackListener, type CallbackOutcome, type OpenListener } from './loopback.js';
 import { codeChallenge, randomToken } from './pkce.js';
+import { landingUrls } from './website.js';
 
 /** The vault key of the refresh token. One desktop profile belongs to one CSlytics person. */
 export const REFRESH_TOKEN_KEY = 'cslytics-refresh-token';
 
-/** How long a stored sign-in keeps its features while the website does not answer. */
-export const OFFLINE_GRACE_MS = 7 * 24 * 60 * 60_000;
 /** How long the browser has to come back before the attempt ends. */
 export const SIGN_IN_TIMEOUT_MS = 10 * 60_000;
 /** An access token this close to expiry is refreshed rather than sent. */
@@ -27,10 +26,13 @@ export type CslyticsStatus = {
   state: CslyticsAccountState;
   account: { userId: string; persona: string | null; steamId64: string | null } | null;
   tier: string | null;
-  /** Empty unless signed in, or unconfirmed inside the offline grace. */
+  /**
+   * The features as last verified, for as long as a sign-in is stored and the website has not
+   * refused it, however long ago that was: being offline never takes one away (pricing behind
+   * sign-in plan D7). Empty otherwise.
+   */
   features: readonly string[];
   verifiedAt: string | null;
-  graceUntil: string | null;
   /** The website refused the stored sign-in, and when. Cleared by the next sign-in or sign-out. */
   ended: { persona: string | null; at: string } | null;
   problem: SignInProblem | null;
@@ -50,13 +52,19 @@ export type CslyticsAccountOptions = {
 };
 
 type Attempt = { listener: CallbackListener; verifier: string; url: string; generation: number };
-type AccessAnswer = { kind: 'ok'; token: string; fresh: boolean } | { kind: 'refused' } | { kind: 'unavailable' } | { kind: 'stale' };
+/**
+ * An access token for the API, or why there is none: `refused` is the issuer refusing the stored
+ * sign-in, `unavailable` the website not answering, `stale` a sign-out or a new sign-in that
+ * overtook the ask. `fresh` says the token was just minted, so a refusal of it is final.
+ */
+export type BearerAnswer = { kind: 'ok'; token: string; fresh: boolean } | { kind: 'refused' } | { kind: 'unavailable' } | { kind: 'stale' };
+type AccessAnswer = BearerAnswer;
 
 /**
  * The CSlytics account on this desktop, held by main and nowhere else.
  *
- * Signing in is optional and changes nothing the app does with Steam: the engine never sees this
- * class, and the window opens the same either way. What it holds is the refresh token in the
+ * Signing in unlocks prices and changes nothing the app does with Steam: the engine never sees
+ * this class. What it holds is the refresh token in the
  * vault, the account as last verified in `cslytics-account.json`, and the access token in memory.
  * Only the website refusing the stored sign-in signs a person out; an outage leaves everything as
  * it was and reports `unconfirmed`.
@@ -113,17 +121,13 @@ export class CslyticsAccount {
   status(): CslyticsStatus {
     const state = this.state();
     const stored = state === 'signedIn' || state === 'unconfirmed' ? this.stored : null;
-    const graceUntil = stored ? Date.parse(stored.verifiedAt) + OFFLINE_GRACE_MS : null;
-    const features = state === 'signedIn' && stored ? stored.features
-      : state === 'unconfirmed' && stored && graceUntil !== null && this.now() < graceUntil ? stored.features
-        : [];
+    const features = stored ? stored.features : [];
     return {
       state,
       account: stored ? { userId: stored.userId, persona: stored.persona, steamId64: stored.steamId64 } : null,
       tier: stored ? stored.tier : null,
       features: [...features],
       verifiedAt: stored ? stored.verifiedAt : null,
-      graceUntil: state === 'unconfirmed' && graceUntil !== null ? new Date(graceUntil).toISOString() : null,
       ended: this.ended,
       problem: this.problem
     };
@@ -145,7 +149,7 @@ export class CslyticsAccount {
     const state = randomToken();
     let listener: CallbackListener;
     try {
-      listener = await this.listen(state, SIGN_IN_TIMEOUT_MS);
+      listener = await this.listen(state, SIGN_IN_TIMEOUT_MS, landingUrls(this.options.issuer.origin));
     } catch {
       this.problem = 'failed';
       this.changed();
@@ -328,6 +332,21 @@ export class CslyticsAccount {
       // A vault or disk fault is not the website's answer: keep the sign-in and say it is unconfirmed.
       if (this.isCurrent(generation)) this.unconfirmed();
     }
+  }
+
+  /**
+   * The access token for a request to the API (portfolio prices plan §7.3), the one way a token
+   * leaves this class: refreshed when it is within a minute of expiry, and on `fresh`, which is
+   * the single retry a 401 earns (sign-in plan §6.5). A refusal means the issuer has disowned the
+   * stored sign-in; the verification this starts is what ends it and tells the window, so a caller
+   * gets no token and sends nothing.
+   */
+  async bearer(options: { fresh?: boolean } = {}): Promise<BearerAnswer> {
+    if (this.refreshToken === null) return { kind: 'refused' };
+    if (options.fresh) this.access = null;
+    const answer = await this.accessToken(this.generation);
+    if (answer.kind === 'refused') void this.verify().catch(() => undefined);
+    return answer;
   }
 
   private async accessToken(generation: number): Promise<AccessAnswer> {

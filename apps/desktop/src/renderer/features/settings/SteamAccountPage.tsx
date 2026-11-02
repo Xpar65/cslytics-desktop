@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { AccountLaunch } from '../../../shared/api.js';
-import type { AccountCard } from '../accounts/AccountsPanel.js';
+import type { AccountCard } from '../accounts/account-card.js';
 import { Icon, type IconName } from '../../components/Icon.js';
 import { Button, IconButton, KeyValue, Metric, Notice, Panel, PanelHeader, ProgressBar, StatusBadge, Switch } from '../../components/ui.js';
 import { Tip } from '../../components/Tip.js';

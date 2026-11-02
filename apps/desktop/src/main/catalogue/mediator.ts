@@ -191,9 +191,10 @@ export class CatalogueMediator {
     const next: Record<string, unknown> = { ...rest };
     if (host.matchKeys !== undefined) next.matchKeys = host.matchKeys;
     if (host.wearBands !== undefined) next.wearBands = host.wearBands;
-    if (excludeDisplayOnly === true) {
+    if (excludeDisplayOnly === true || rest.tradableOnly === true) {
       // What nothing may act on, in the two halves only each side knows: the kinds the catalogue
       // says are never market items, and the units the engine itself sees marked `cannot trade`.
+      // A Tradable filter asks the same of what it shows, so a coin with no lock is not in it.
       const unmarketable = this.catalogue.unmarketableKeys();
       if (unmarketable.length > 0) next.excludeMatchKeys = unmarketable;
       next.excludeCannotTrade = true;

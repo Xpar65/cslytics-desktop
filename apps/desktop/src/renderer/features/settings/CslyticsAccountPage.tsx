@@ -1,17 +1,36 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import type { CslyticsStatus, SignInProblem } from '@cslytics/cslytics-account';
 import { engine } from '../../lib/engine.js';
+import { FEATURE_CSFLOAT_CURVES, FEATURE_PORTFOLIO, FEATURE_STEAM_CURVES, FEATURE_STEAM_MARKET, FEATURE_STEAM_PRICES, lockReason } from '../../../shared/command-access.js';
 import { relativeTime } from '../../lib/format.js';
 import { Badge, Button, KeyValue, Notice, Panel, PanelHeader } from '../../components/ui.js';
 
 /**
- * Settings › This desktop › CSlytics account: the optional sign-in (CSlytics account sign-in plan §6).
+ * Settings › This desktop › CSlytics account: the sign-in that unlocks prices (CSlytics account
+ * sign-in plan §6, pricing behind sign-in plan §4).
  *
  * Everything shown is main's answer to `cslytics.status`, read again on each `cslytics-account`
  * change notice. The page says who is signed in, on which plan, and when the website last confirmed
- * it. It promises no feature: signing in unlocks nothing yet, and when it does, each feature says so
- * where it appears.
+ * it. It names what signing in gives, each with why it is locked when it is (§6.5), and promises
+ * nothing else.
  */
+
+/** What a sign-in gives, as the window names it, keyed by the website's feature key. */
+const FEATURE_ROWS: ReadonlyArray<{ feature: string; label: string }> = [
+  { feature: FEATURE_STEAM_MARKET, label: 'Items page and order books' },
+  { feature: FEATURE_PORTFOLIO, label: 'Portfolio' },
+  { feature: FEATURE_STEAM_PRICES, label: 'Hourly portfolio prices' },
+  { feature: FEATURE_STEAM_CURVES, label: 'Steam float curves' },
+  { feature: FEATURE_CSFLOAT_CURVES, label: 'CSFloat float curves' }
+];
+
+function featureValue(status: CslyticsStatus, feature: string): string {
+  switch (lockReason(status, feature)) {
+    case null: return 'On';
+    case 'signed-out': return 'Sign in';
+    case 'tier': return 'Not in your plan';
+  }
+}
 export function CslyticsAccountPage(): React.JSX.Element {
   const [status, setStatus] = useState<CslyticsStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -57,8 +76,8 @@ export function CslyticsAccountPage(): React.JSX.Element {
         {state === 'signedOut' ? (
           <>
             <p>
-              Sign in with your CSlytics account. It is optional: everything in this app works without it,
-              and your Steam accounts are never shared with CSlytics.
+              Sign in to see prices, float curves and your portfolio. It is free, and your Steam accounts
+              are never shared with CSlytics.
             </p>
             {status?.ended ? (
               <Notice tone="warn" title="Your sign-in ended">
@@ -96,7 +115,8 @@ export function CslyticsAccountPage(): React.JSX.Element {
             <KeyValue rows={[
               { label: 'Signed in as', value: status.account?.persona ?? (status.account ? 'Your CSlytics account' : 'Checking…') },
               { label: 'Plan', value: status.tier ? tierLabel(status.tier) : '…' },
-              { label: 'Last confirmed', value: status.verifiedAt ? relativeTime(status.verifiedAt) : 'Not yet' }
+              { label: 'Last confirmed', value: status.verifiedAt ? relativeTime(status.verifiedAt) : 'Not yet' },
+              ...FEATURE_ROWS.map((row) => ({ label: row.label, value: featureValue(status, row.feature) }))
             ]} />
             {state === 'unconfirmed' && status.verifiedAt ? (
               <Notice tone="warn" role="status">

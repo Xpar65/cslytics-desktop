@@ -1,4 +1,4 @@
-import type { CsfloatBuyOrder, CsfloatListing, CsfloatListingItem, CsfloatTrade } from '@cslytics/ports';
+import { CSFLOAT_CURRENCY, type CsfloatBuyOrder, type CsfloatListing, type CsfloatListingItem, type CsfloatTrade } from '@cslytics/ports';
 import type { EngineDatabase, ObservationRow } from './database.js';
 import { MarketplaceStore } from './marketplace.js';
 import { isSettled, type WorkStepRow } from './work.js';
@@ -6,10 +6,11 @@ import type { OrderConfidence, OrderState } from './alphabets.js';
 import type { VenueOrderRow } from './orders.js';
 
 /**
- * CSFloat prices in US dollars, expressed as Steam's `ECurrencyCode` so one currency vocabulary
- * covers both venues and the host needs one formatter rather than one per venue.
+ * CSFloat prices in US dollars, stored as Steam's `ECurrencyCode` (`CSFLOAT_CURRENCY`, from the one
+ * currency table in `@cslytics/ports`) so one currency vocabulary covers both venues and the host
+ * needs one formatter rather than one per venue.
  */
-export const CSFLOAT_CURRENCY = 1;
+export { CSFLOAT_CURRENCY };
 
 /** The CSFloat words for a listing that is no longer an advertisement, and no longer commits its item. */
 export const CSFLOAT_ENDED_WORDS = ['delisted', 'cancelled', 'refunded'] as const;

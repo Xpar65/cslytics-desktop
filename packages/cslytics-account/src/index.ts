@@ -1,11 +1,12 @@
 /**
- * The CSlytics account on this desktop: an optional browser sign-in to the CSlytics website, the
- * account it reports, and the tokens that keep it. Composed by main; the engine never imports it
+ * The CSlytics account on this desktop: a browser sign-in to the CSlytics website, the account it
+ * reports, and the tokens that keep it. What each feature unlocks is the desktop's
+ * (`apps/desktop/src/shared/command-access.ts`). Composed by main; the engine never imports it
  * (`check:deps`), and the window sees only `CslyticsStatus`, over IPC.
  */
 export {
-  CslyticsAccount, OFFLINE_GRACE_MS, REFRESH_TOKEN_KEY, SIGN_IN_TIMEOUT_MS,
-  type CslyticsAccountOptions, type CslyticsAccountState, type CslyticsStatus, type SignInProblem
+  CslyticsAccount, REFRESH_TOKEN_KEY, SIGN_IN_TIMEOUT_MS,
+  type BearerAnswer, type CslyticsAccountOptions, type CslyticsAccountState, type CslyticsStatus, type SignInProblem
 } from './account.js';
 export { AccountFile, type AccountFileIo, type StoredAccount } from './account-file.js';
 export {
@@ -19,5 +20,6 @@ export {
 export { OracleAccountIssuer, type OracleUser } from './oracle.js';
 export { codeChallenge, randomToken } from './pkce.js';
 export {
-  AUTHORIZE_PATH, CSLYTICS_WEBSITE_ORIGIN, DESKTOP_CLIENT_ID, deviceLabel, isAllowedBrowserUrl, websiteOrigin
+  AUTHORIZE_PATH, CSLYTICS_WEBSITE_ORIGIN, DESKTOP_CLIENT_ID, deviceLabel, isAllowedBrowserUrl, landingUrls, websiteOrigin,
+  type Landing
 } from './website.js';

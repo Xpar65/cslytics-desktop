@@ -88,7 +88,6 @@ export const PALETTE_TOKENS = [
   '--cs-hold-csfloat',
   '--cs-hold-inventory',
   '--cs-hold-listed',
-  '--cs-hold-unconfirmed',
   '--cs-hold-hatch',
 
   // Categorical series, for a chart that needs one hue per slice: eight, distinct at a glance

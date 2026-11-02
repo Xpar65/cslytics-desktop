@@ -15,9 +15,15 @@ import { heldCounts } from './lib/portfolio.js';
 import { refreshCurrency } from './lib/currency.js';
 import { PortfolioPage } from './features/portfolio/PortfolioPage.jsx';
 import { ItemsView } from './features/items/ItemsView.jsx';
+import { SignInPrompt } from './features/onboarding/SignInPrompt.js';
+import { CslyticsIndicator } from './components/CslyticsIndicator.js';
+import { Walled } from './components/SignInLock.js';
+import { useCslytics } from './lib/cslytics.js';
+import { FEATURE_PORTFOLIO, FEATURE_STEAM_MARKET, lockReason, type Feature } from '../shared/command-access.js';
+import { stagedUnits } from './features/items/staged-marks.js';
 import { SignIn } from './features/accounts/SignIn.jsx';
 import { AccountBar } from './features/accounts/AccountBar.jsx';
-import { AccountsPanel, type AccountCard } from './features/accounts/AccountsPanel.jsx';
+import type { AccountCard } from './features/accounts/account-card.js';
 import { InventoryView, emptyInventorySelection, selectionQuantity, type InventorySelection } from './features/inventory/InventoryView.js';
 import { LIST_INTENT, stageItems } from './features/inventory/list-intent.js';
 import { REPRICE_INTENT } from './features/listings/listing-actions.js';
@@ -80,6 +86,9 @@ const RECORD_TAB_ENTRIES: Record<RecordTab, { label: string; icon: IconName }> =
 
 /** Sections kept in code but omitted from the sidebar until they ship again. */
 const HIDDEN_SECTIONS: ReadonlySet<Section> = new Set(['store']);
+
+/** Sections that are one wall behind a CSlytics sign-in (pricing behind sign-in plan §7.3, §7.5); the sidebar marks them while locked. */
+const WALLED_SECTIONS: Partial<Record<Section, Feature>> = { items: FEATURE_STEAM_MARKET, portfolio: FEATURE_PORTFOLIO };
 
 /** Not in a group: it sits at the foot of the sidebar, above the account controls. */
 const SETTINGS: SectionEntry = { id: 'settings', label: 'Settings', icon: 'settings', perAccount: false, group: 'Settings', blurb: 'This window, and the selected account with its marketplaces' };
@@ -156,6 +165,8 @@ export function App(): React.JSX.Element {
    * even once, is the thing those preferences exist to prevent.
    */
   const [settings, setSettings] = useState<DesktopSettings | null>(null);
+  // The CSlytics sign-in, for the walls on Items and Portfolio and the locks in the navigation.
+  const cslytics = useCslytics();
   /**
    * Which engine this window drives (remote engine host plan D5, D6, D12): `null` until main has
    * answered. A host owns its sessions, so with a remote engine the launch sweep does not run and
@@ -214,6 +225,11 @@ export function App(): React.JSX.Element {
       currency: holdings.find((row) => row.accountId === entry.accountId)?.currency ?? null
     })),
     [accounts, holdings]
+  );
+  /** Both workspaces' rows as the Items page marks them on a float curve, priced as what the buyer pays. */
+  const stagedForCurve = useMemo(
+    () => stagedUnits([...listing.state.rows, ...reprice.state.rows], accountNames),
+    [listing.state.rows, reprice.state.rows, accountNames]
   );
   const activeAccount = accounts.find((entry) => entry.accountId === scope) ?? null;
   const key = activeAccount?.accountId ?? '';
@@ -584,7 +600,6 @@ export function App(): React.JSX.Element {
   // so when an account is not refreshing the window says which problem it is.
   const hold = refreshHolds.find((row) => row.accountId === key && row.reason);
   const selectedCount = selectionQuantity(inventorySelection);
-  const scopedAccounts = scope === null ? accounts : accounts.filter((row) => row.accountId === scope);
   // The indicator's scope follows the tab, not the window: a per-account tab shows that account's
   // work and nothing else, which is what every other read in the app does (rule 8).
   const workScope = useMemo(() => (scope ? [scope] : accountIds), [scope, accountIds]);
@@ -605,7 +620,10 @@ export function App(): React.JSX.Element {
     }
   };
 
-  const navItem = (entry: SectionEntry): React.JSX.Element => (
+  const navItem = (entry: SectionEntry): React.JSX.Element => {
+    const feature = WALLED_SECTIONS[entry.id];
+    const locked = feature !== undefined && cslytics !== null && lockReason(cslytics, feature) !== null;
+    return (
     <button
       key={entry.id}
       type="button"
@@ -618,14 +636,21 @@ export function App(): React.JSX.Element {
     >
       <Icon name={entry.icon} size={16} />
       <span className="nav-text">{entry.label}</span>
+      {locked ? <span className="nav-lock" data-testid={`nav-lock-${entry.id}`}><Icon name="lock" size={11} /></span> : null}
       {counts[entry.id] ? <span className="nav-count num">{counts[entry.id].toLocaleString()}</span> : null}
     </button>
-  );
+    );
+  };
 
   /** Opens one market name on the Items page, remembering the page it came from for Back. */
   const openItem = (name: string, from: Section): void => {
     setItemView({ name, from });
     setSection('items');
+  };
+  /** From a listing workspace row, which is over whatever page is open: on Items already, only the name changes. */
+  const openItemFromWorkspace = (name: string): void => {
+    if (section === 'items') setItemView((view) => ({ ...view, name }));
+    else openItem(name, section);
   };
 
   // Back is offered only to an item opened from another page; from the sidebar there is nowhere to
@@ -811,6 +836,8 @@ export function App(): React.JSX.Element {
               <span className="nav-text">Sign out {activeAccount.accountName}</span>
             </button>
           ) : null}
+          {/* The CSlytics sign-in at a glance; main's, whichever engine the window drives. */}
+          <CslyticsIndicator onOpen={() => navigate({ section: 'settings', settings: 'cslytics' })} />
         </div>
       </nav>
       {sidebarCollapsed ? (
@@ -859,8 +886,8 @@ export function App(): React.JSX.Element {
           // the pill outlives the view that filled it.
           aside={<>
             <span className="listing-slot" data-slot="listing-workspace" />
-            <ListingWorkspace workspace={listing} accounts={accountNames} />
-            <ListingWorkspace workspace={reprice} accounts={accountNames} />
+            <ListingWorkspace workspace={listing} accounts={accountNames} onOpenItem={openItemFromWorkspace} />
+            <ListingWorkspace workspace={reprice} accounts={accountNames} onOpenItem={openItemFromWorkspace} />
             <WorkIndicator
               accountIds={workScope}
               accounts={accountNames}
@@ -931,38 +958,39 @@ export function App(): React.JSX.Element {
                 answered, "no accounts yet" is a guess, and it is the one guess that reads as a
                 lost database. */}
             {section === 'items' && accountIds.length > 0 ? (
-              <ItemsView
-                name={itemView.name}
-                accountIds={scope ? [scope] : accountIds}
-                onOpen={(name) => setItemView((view) => ({ ...view, name }))}
-                back={backFromItems}
-              />
+              <Walled
+                feature={FEATURE_STEAM_MARKET}
+                title="Items"
+                tip="Any market item: its order book, its price history and its float curves. Free with a CSlytics account."
+                testId="items-lock"
+              >
+                <ItemsView
+                  name={itemView.name}
+                  accountIds={scope ? [scope] : accountIds}
+                  onOpen={(name) => setItemView((view) => ({ ...view, name }))}
+                  back={backFromItems}
+                  staged={stagedForCurve}
+                />
+              </Walled>
             ) : null}
             {section === 'items' && loaded && accountIds.length === 0 ? (
               <Panel><Empty icon="trending-up" title="No accounts yet" action={addAccount} /></Panel>
             ) : null}
             {section === 'portfolio' && loaded && accounts.length > 0 ? (
-              <PortfolioPage
-                accountIds={scope ? [scope] : accountIds}
-                holdings={scope ? holdings.filter((row) => row.accountId === scope) : holdings}
-                scope={scope}
-                avatars={Object.fromEntries(accounts.map((entry) => [entry.accountId, entry.avatarRef]))}
-                onSelectAccount={(accountId) => { setScope(accountId); setSection('inventory'); }}
-              />
-            ) : null}
-
-            {section === 'portfolio' && loaded && accounts.length > 0 ? (
-              <AccountsPanel
-                accounts={scopedAccounts}
-                holdings={holdings}
-                connections={connections}
-                connecting={connecting}
-                busy={busy}
-                onOpen={(accountId) => { setScope(accountId); setSection('inventory'); }}
-                onManage={(accountId) => { setScope(accountId); setSection('settings'); }}
-                onAddAccount={() => setSigningIn({ kind: 'new' })}
-                canAdd={!remote}
-              />
+              <Walled
+                feature={FEATURE_PORTFOLIO}
+                title="Portfolio"
+                tip="What your accounts are worth, priced from the market, and how that has moved. Free with a CSlytics account."
+                testId="portfolio-lock"
+              >
+                <PortfolioPage
+                  accountIds={scope ? [scope] : accountIds}
+                  holdings={scope ? holdings.filter((row) => row.accountId === scope) : holdings}
+                  scope={scope}
+                  avatars={Object.fromEntries(accounts.map((entry) => [entry.accountId, entry.avatarRef]))}
+                  onSelectAccount={(accountId) => { setScope(accountId); setSection('inventory'); }}
+                />
+              </Walled>
             ) : null}
 
             {section === 'inventory' && activeAccount ? (
@@ -1084,6 +1112,9 @@ export function App(): React.JSX.Element {
             : undefined}
         />
       ) : null}
+      {/* The CSlytics sign-in card, at each launch with no sign-in stored (pricing behind sign-in
+          plan §7.7). Not over a Steam sign-in already on screen; it waits for that to close. */}
+      <SignInPrompt settings={settings} paused={signingIn !== null} onSettings={setSettings} />
     </div>
     </PageHeaderSlotsProvider>
     </NotificationProvider>

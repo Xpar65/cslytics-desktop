@@ -14,12 +14,16 @@ import { parseMoney, plural } from '../lib/labels.js';
 import { useCurrency } from '../lib/currency.js';
 import { engine } from '../lib/engine.js';
 import { bookKey, useOrderBooks } from '../lib/order-books.js';
+import { useCslytics } from '../lib/cslytics.js';
+import { SignInLock } from './SignInLock.js';
+import { FEATURE_STEAM_MARKET, curveFeature, hasFeature, lockReason } from '../../shared/command-access.js';
 import { conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick } from '../lib/money.js';
 import {
   EMPTY,
   bulkVenueOf,
   dollars,
   reduce,
+  venueCurrency,
   type Applied,
   type PriceBasis,
   type StagedEntry,
@@ -203,11 +207,17 @@ export function useListingWorkspace<E extends StagedEntry>(intent: WorkspaceInte
  * What a row has to say beyond its figures is a chip, a word or two with the sentence in its tip:
  * a retrieve before the listing, a phone confirmation, a listing the typed figure does not exist
  * at. The one thing printed in full is a refusal, because those are the engine's words.
+ *
+ * **Every row opens its Items page.** The press folds the panel, because the page is what the
+ * price is decided against, and the page's float curve marks every unit of that name staged here
+ * at the price typed for it (`features/items/staged-marks.ts`); the pill is the way back.
  */
-export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }: {
+export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, onOpenItem }: {
   workspace: Workspace<E>;
   /** Each account with its wallet currency, which every Steam figure here is in; CSFloat figures are USD. */
   accounts: ReadonlyArray<{ id: string; name: string; currency?: number | null | undefined }>;
+  /** Opens a market name's Items page; without it a row offers no way there. */
+  onOpenItem?: ((name: string) => void) | undefined;
 }): React.JSX.Element | null {
   const { intent, state, dispatch } = workspace;
   const { rows, open, bulk } = state;
@@ -226,7 +236,13 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
   // is open and once a minute while it is folded; by account as well as name, because a wallet
   // the anonymous book is not priced for gets the account's own read (plan D17).
   const keys = useMemo(() => shown.flatMap((row) => (typeof row.entry.marketHashName === 'string' && row.entry.marketHashName !== '' ? [{ accountId: row.entry.accountId, name: row.entry.marketHashName }] : [])), [shown]);
-  const books = useOrderBooks(keys, open);
+  // The book and the curves are behind the CSlytics sign-in (pricing behind sign-in plan §7.6):
+  // while it is locked, or not yet known, no book is read and no curve asked for. A typed price,
+  // the venue choice and List are never locked.
+  const cslytics = useCslytics();
+  const marketLocked = cslytics === null || lockReason(cslytics, FEATURE_STEAM_MARKET) !== null;
+  const curveHeld = (venue: Venue): boolean => cslytics !== null && hasFeature(cslytics, curveFeature(venue));
+  const books = useOrderBooks(marketLocked ? [] : keys, open);
   // The float curves asked for, by venue and name. Only an answer is kept: a read that failed is asked again next press.
   const curves = useRef(new Map<string, StoredCurve | null>());
   const [curving, setCurving] = useState(false);
@@ -249,11 +265,8 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
     return () => document.removeEventListener('pointerdown', onPointerDown);
   }, [showing, dispatch]);
 
-  /**
-   * The currency a row's figures are in: USD on CSFloat everywhere, the account's wallet on Steam
-   * (portfolio and pricing plan §5.1). A typed price is in this currency and is sent as typed.
-   */
-  const currencyFor = (venue: Venue, accountId: string): number | null => (venue === 'csfloat' ? 1 : accounts.find((account) => account.id === accountId)?.currency ?? null);
+  /** The currency a row's figures are in (`venueCurrency`). A typed price is in it and is sent as typed. */
+  const currencyFor = (venue: Venue, accountId: string): number | null => venueCurrency(venue, accounts.find((account) => account.id === accountId)?.currency);
   const rowCurrency = (row: StagedRow<StagedEntry>): number | null => currencyFor(row.venue, row.entry.accountId);
   /** One currency for rows on one venue, or none when accounts with different wallets are mixed in. */
   const currencyOfRows = (venue: Venue, rows: ReadonlyArray<StagedRow<StagedEntry>>): number | null => {
@@ -308,16 +321,18 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
   }
 
   /**
-   * The float price for each row: its marketplace's curve at its float, from the free CDN through
-   * main (`item.curve`, which records an absence rather than asking again). The curve is in USD;
+   * The float price for each row: its marketplace's curve at its float, from CSlytics behind the
+   * sign-in, through main (`item.curve`, which records an absence rather than asking again). A row
+   * whose venue's curves the grant does not hold is left alone, and nothing is asked for it. The curve is in USD;
    * a row in another currency takes the figure through the newest rate, or is left alone when
-   * there is none.
+   * there is none. This is the one converted figure that is ever sent (AGENTS.md rule 9): the fair
+   * price is an estimate, and an estimate converted is still one.
    */
   async function floatOutcomes(): Promise<Map<string, Outcome>> {
     const wanted = new Map<string, { venue: Venue; name: string }>();
     for (const row of shown) {
       const name = row.entry.marketHashName;
-      if (name) wanted.set(`${row.venue}:${name}`, { venue: row.venue, name });
+      if (name && curveHeld(row.venue)) wanted.set(`${row.venue}:${name}`, { venue: row.venue, name });
     }
     await Promise.all([...wanted].map(async ([key, { venue, name }]) => {
       if (curves.current.has(key)) return;
@@ -331,6 +346,7 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
     for (const row of shown) {
       const name = row.entry.marketHashName ?? null;
       const doc = name === null ? null : curves.current.get(`${row.venue}:${name}`)?.doc ?? null;
+      if (!curveHeld(row.venue)) { outcomes.set(row.key, { skip: 'without a CSlytics sign-in' }); continue; }
       if (row.entry.paintWear === null) { outcomes.set(row.key, { skip: 'without a float' }); continue; }
       if (!doc) { outcomes.set(row.key, { skip: `without a ${VENUE[row.venue].short} float curve` }); continue; }
       const price = priceAtFloat(doc.fairPrice?.vertices, row.entry.paintWear);
@@ -526,13 +542,23 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
                       icon={entry.icon}
                       title={entry.title}
                       loading={entry.id === 'float' && curving}
-                      disabled={curving}
+                      disabled={curving || (entry.id === 'float' ? !(curveHeld('steam') || curveHeld('csfloat')) : marketLocked)}
                       onClick={() => { void pressStrategy(entry.id); }}
                     >
                       {entry.label}
                     </Button>
                   ))}
                 </div>
+                {marketLocked && cslytics ? (
+                  <SignInLock
+                    status={cslytics}
+                    feature={FEATURE_STEAM_MARKET}
+                    shape="inline"
+                    title="Price from the market"
+                    tip="Sell now, Top bid and Undercut price from the Steam order book, and Float price from the float curve. A price you type works without signing in."
+                    testId="workspace-pricing-lock"
+                  />
+                ) : null}
                 {bulk.applied && strategy ? (
                   <Caption icon={strategy.icon}>
                     {strategy.label}: {bulk.applied.priced} of {bulk.applied.total} priced
@@ -595,7 +621,7 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
                         ) : null}
                         {multiAccount ? <span className="listing-row-account">{accountName(entry.accountId)}</span> : null}
                       </span>
-                      {entry.marketHashName ? (
+                      {entry.marketHashName && !marketLocked ? (
                         <OrderBookLine
                           quote={quote}
                           currency={currency}
@@ -612,15 +638,29 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts }:
                       </span>
                     ) : null}
                   </span>
-                  {/* Taking a row out, and emptying the workspace — pill and all — by taking out
-                      the last one. The row stays selected, so the next staging brings it back. */}
-                  <IconButton
-                    icon="x"
-                    size="sm"
-                    className="listing-row-drop"
-                    label={`Take ${entry.name} off the list`}
-                    onClick={() => dispatch({ type: 'drop', key: row.key })}
-                  />
+                  <span className="listing-row-tools">
+                    {/* The item's page, where this row and every other of its name sit on the
+                        float curve at their prices. The press folds the panel off the page. */}
+                    {onOpenItem && entry.marketHashName ? (
+                      <IconButton
+                        icon="trending-up"
+                        size="sm"
+                        className="listing-row-page"
+                        data-testid="listing-row-item-page"
+                        label={`Item page for ${entry.name}`}
+                        onClick={() => { dispatch({ type: 'fold' }); onOpenItem(entry.marketHashName!); }}
+                      />
+                    ) : null}
+                    {/* Taking a row out, and emptying the workspace — pill and all — by taking out
+                        the last one. The row stays selected, so the next staging brings it back. */}
+                    <IconButton
+                      icon="x"
+                      size="sm"
+                      className="listing-row-drop"
+                      label={`Take ${entry.name} off the list`}
+                      onClick={() => dispatch({ type: 'drop', key: row.key })}
+                    />
+                  </span>
 
                   <div className="listing-controls">
                     <PriceFields

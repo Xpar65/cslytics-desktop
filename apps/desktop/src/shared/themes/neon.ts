@@ -83,7 +83,6 @@ export const neon: Theme = {
     '--cs-hold-csfloat': '#FF9D4D',
     '--cs-hold-inventory': '#7CF57A',
     '--cs-hold-listed': '#2DE0C8',
-    '--cs-hold-unconfirmed': '#E37BFF',
     '--cs-hold-hatch': 'rgba(255, 255, 255, 0.45)',
 
     '--cs-series-1': '#5B8CFF',

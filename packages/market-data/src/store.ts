@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import type { CurveDoc, FxRates, OrderBook, PriceHistory } from './types.js';
+import type { CurveDoc, FxRates, OrderBook, PriceHistory, PriceSnapshot, PriceSnapshotRow } from './types.js';
 
 /**
  * `market.sqlite`: the desktop's cache of what the market said, and its journal of estimates.
@@ -13,7 +13,8 @@ import type { CurveDoc, FxRates, OrderBook, PriceHistory } from './types.js';
  * AUD figure read as USD. Nothing is ever stored converted.
  */
 
-export const MARKET_SCHEMA_VERSION = 1;
+/** 2 added the member price snapshot (portfolio prices plan D12); a file at 1 gains its two tables in place. */
+export const MARKET_SCHEMA_VERSION = 2;
 
 export class MarketSchemaNewerError extends Error {
   constructor(readonly found: number) {
@@ -51,6 +52,25 @@ export type StoredCurve = {
   doc: CurveDoc | null;
 };
 export type StoredFx = FxRates & { fetchedAt: string };
+type CurveRow = { venue: 'csfloat' | 'steam'; name: string; fetched_at: string; etag: string | null; doc_json: string | null };
+
+function toStoredCurve(row: CurveRow): StoredCurve {
+  return { venue: row.venue, name: row.name, fetchedAt: row.fetched_at, etag: row.etag, doc: row.doc_json === null ? null : JSON.parse(row.doc_json) as CurveDoc };
+}
+/** One row of the member snapshot as kept, with the venue it was fetched for. */
+export type StoredPrice = PriceSnapshotRow & { venue: 'steam' };
+/** The snapshot's head as kept: which generation, when it was fetched, and the ETag to revalidate it by. */
+export type StoredPriceSnapshot = {
+  venue: 'steam';
+  schema: number;
+  generatedAt: string;
+  exportedAt: string;
+  fxAsOf: string;
+  count: number;
+  etag: string | null;
+  /** The last time the API answered for it, with a document or a 304. */
+  fetchedAt: string;
+};
 export type ValuationSnapshotRow = {
   accountId: string;
   day: string;
@@ -85,6 +105,14 @@ CREATE TABLE IF NOT EXISTS valuation_snapshot(
   account_id TEXT NOT NULL, day TEXT NOT NULL, basis TEXT NOT NULL, currency TEXT NOT NULL, cents INTEGER NOT NULL,
   names_priced INTEGER NOT NULL, names_unpriced INTEGER NOT NULL, units_unpriced INTEGER NOT NULL, fx_as_of TEXT,
   PRIMARY KEY(account_id, day, basis, currency));
+CREATE TABLE IF NOT EXISTS price_snapshot(
+  venue TEXT NOT NULL, name TEXT NOT NULL, lowest_ask_cents INTEGER, highest_bid_cents INTEGER,
+  ask_units INTEGER NOT NULL, bid_units INTEGER NOT NULL, bids_json TEXT NOT NULL, as_of TEXT NOT NULL, absent INTEGER NOT NULL,
+  median_7d_cents INTEGER, median_30d_cents INTEGER, volume_30d INTEGER,
+  PRIMARY KEY(venue, name));
+CREATE TABLE IF NOT EXISTS price_snapshot_meta(
+  venue TEXT PRIMARY KEY, schema INTEGER NOT NULL, generated_at TEXT NOT NULL, exported_at TEXT NOT NULL, fx_as_of TEXT NOT NULL,
+  count INTEGER NOT NULL, etag TEXT, fetched_at TEXT NOT NULL);
 `;
 
 /** `YYYY-MM-DD` in UTC, the day a daily row and a snapshot are keyed by. */
@@ -96,6 +124,15 @@ type BookRow = {
   name: string; currency: number; observed_at: string; etag: string | null;
   highest_bid_cents: number | null; lowest_ask_cents: number | null; bid_units: number; ask_units: number;
   bids_json: string; asks_json: string;
+};
+
+type PriceRow = {
+  venue: 'steam'; name: string; lowest_ask_cents: number | null; highest_bid_cents: number | null; ask_units: number; bid_units: number;
+  bids_json: string; as_of: string; absent: number; median_7d_cents: number | null; median_30d_cents: number | null; volume_30d: number | null;
+};
+
+type PriceMetaRow = {
+  venue: 'steam'; schema: number; generated_at: string; exported_at: string; fx_as_of: string; count: number; etag: string | null; fetched_at: string;
 };
 
 export class MarketDataStore {
@@ -115,8 +152,11 @@ export class MarketDataStore {
       throw new MarketSchemaNewerError(version);
     }
     db.exec('PRAGMA journal_mode=WAL');
+    // Every statement in the schema is additive, so a file at an older version gains what it
+    // lacks in place and keeps its books and its daily history; only the stamp moves.
     db.exec(SCHEMA);
     if (version === 0) db.prepare('INSERT INTO schema_version(version) VALUES (?)').run(MARKET_SCHEMA_VERSION);
+    else if (version < MARKET_SCHEMA_VERSION) db.prepare('UPDATE schema_version SET version=?').run(MARKET_SCHEMA_VERSION);
     return new MarketDataStore(db);
   }
 
@@ -246,9 +286,24 @@ export class MarketDataStore {
   }
 
   curve(venue: 'csfloat' | 'steam', name: string): StoredCurve | undefined {
-    const row = this.db.prepare('SELECT * FROM curve WHERE venue=? AND name=?').get(venue, name) as { venue: 'csfloat' | 'steam'; name: string; fetched_at: string; etag: string | null; doc_json: string | null } | undefined;
-    if (!row) return undefined;
-    return { venue: row.venue, name: row.name, fetchedAt: row.fetched_at, etag: row.etag, doc: row.doc_json === null ? null : JSON.parse(row.doc_json) as CurveDoc };
+    const row = this.db.prepare('SELECT * FROM curve WHERE venue=? AND name=?').get(venue, name) as CurveRow | undefined;
+    return row ? toStoredCurve(row) : undefined;
+  }
+
+  /** The copies held for many names on one venue, 500 a query; a name with no row is left out. */
+  curves(venue: 'csfloat' | 'steam', names: readonly string[]): Map<string, StoredCurve> {
+    const out = new Map<string, StoredCurve>();
+    for (let start = 0; start < names.length; start += 500) {
+      const chunk = names.slice(start, start + 500);
+      const rows = this.db.prepare(`SELECT * FROM curve WHERE venue=? AND name IN (${chunk.map(() => '?').join(',')})`).all(venue, ...chunk) as CurveRow[];
+      for (const row of rows) out.set(row.name, toStoredCurve(row));
+    }
+    return out;
+  }
+
+  /** A copy the API confirmed unchanged (304): it is as fresh as if it had been fetched now. */
+  touchCurve(venue: 'csfloat' | 'steam', name: string, fetchedAt: string): void {
+    this.db.prepare('UPDATE curve SET fetched_at=? WHERE venue=? AND name=?').run(fetchedAt, venue, name);
   }
 
   // ── fx ─────────────────────────────────────────────────────────────────────────────────────
@@ -268,6 +323,56 @@ export class MarketDataStore {
   fxAt(asOf: string): StoredFx | undefined {
     const row = this.db.prepare('SELECT * FROM fx_snapshot WHERE as_of<=? ORDER BY as_of DESC LIMIT 1').get(asOf) as { as_of: string; fetched_at: string; stale: number; rates_json: string } | undefined;
     return row ? toStoredFx(row) : undefined;
+  }
+
+  // ── the member price snapshot ──────────────────────────────────────────────────────────────
+
+  /**
+   * Replaces the venue's rows and its head in one transaction (portfolio prices plan D12): a
+   * document is one generation, and a reader must never see half of the last hour beside half of
+   * this one. `fetchedAt` is when the API answered; the document's own times are kept beside it.
+   */
+  putPriceSnapshot(snapshot: PriceSnapshot, fetchedAt: string, etag: string | null): void {
+    const insert = this.db.prepare(`INSERT INTO price_snapshot(venue, name, lowest_ask_cents, highest_bid_cents, ask_units, bid_units, bids_json, as_of, absent, median_7d_cents, median_30d_cents, volume_30d)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const meta = this.db.prepare(`INSERT INTO price_snapshot_meta(venue, schema, generated_at, exported_at, fx_as_of, count, etag, fetched_at) VALUES (?,?,?,?,?,?,?,?)
+      ON CONFLICT(venue) DO UPDATE SET schema=excluded.schema, generated_at=excluded.generated_at, exported_at=excluded.exported_at, fx_as_of=excluded.fx_as_of,
+        count=excluded.count, etag=excluded.etag, fetched_at=excluded.fetched_at`);
+    this.db.exec('BEGIN');
+    try {
+      this.db.prepare('DELETE FROM price_snapshot WHERE venue=?').run(snapshot.venue);
+      for (const row of snapshot.rows) {
+        insert.run(snapshot.venue, row.name, row.lowestAskCents, row.highestBidCents, row.askUnits, row.bidUnits,
+          JSON.stringify(row.bids.map((level) => [level.priceCents, level.quantity])), row.asOf, row.absent ? 1 : 0, row.median7dCents, row.median30dCents, row.volume30d);
+      }
+      meta.run(snapshot.venue, snapshot.schema, snapshot.generatedAt, snapshot.exportedAt, snapshot.fxAsOf, snapshot.rows.length, etag, fetchedAt);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** The API answered 304: the copy held is this hour's, and only when it was last confirmed moves. */
+  touchPriceSnapshot(venue: 'steam', fetchedAt: string): void {
+    this.db.prepare('UPDATE price_snapshot_meta SET fetched_at=? WHERE venue=?').run(fetchedAt, venue);
+  }
+
+  priceSnapshot(venue: 'steam'): StoredPriceSnapshot | undefined {
+    const row = this.db.prepare('SELECT * FROM price_snapshot_meta WHERE venue=?').get(venue) as PriceMetaRow | undefined;
+    if (!row) return undefined;
+    return { venue: row.venue, schema: row.schema, generatedAt: row.generated_at, exportedAt: row.exported_at, fxAsOf: row.fx_as_of, count: row.count, etag: row.etag, fetchedAt: row.fetched_at };
+  }
+
+  /** The snapshot's rows for a batch of names, in one query per 500; a name the snapshot lacks is left out. */
+  prices(venue: 'steam', names: readonly string[]): Map<string, StoredPrice> {
+    const out = new Map<string, StoredPrice>();
+    for (let start = 0; start < names.length; start += 500) {
+      const chunk = names.slice(start, start + 500);
+      const rows = this.db.prepare(`SELECT * FROM price_snapshot WHERE venue=? AND name IN (${chunk.map(() => '?').join(',')})`).all(venue, ...chunk) as PriceRow[];
+      for (const row of rows) out.set(row.name, toStoredPrice(row));
+    }
+    return out;
   }
 
   // ── valuation snapshots ────────────────────────────────────────────────────────────────────
@@ -296,10 +401,30 @@ export class MarketDataStore {
   }
 
   /** Row counts per table, for a status line and for tests. */
-  counts(): Record<'book' | 'book_daily' | 'name_status' | 'history' | 'curve' | 'fx_snapshot' | 'valuation_snapshot', number> {
+  counts(): Record<'book' | 'book_daily' | 'name_status' | 'history' | 'curve' | 'fx_snapshot' | 'valuation_snapshot' | 'price_snapshot', number> {
     const count = (table: string): number => (this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
-    return { book: count('book'), book_daily: count('book_daily'), name_status: count('name_status'), history: count('history'), curve: count('curve'), fx_snapshot: count('fx_snapshot'), valuation_snapshot: count('valuation_snapshot') };
+    return {
+      book: count('book'), book_daily: count('book_daily'), name_status: count('name_status'), history: count('history'), curve: count('curve'),
+      fx_snapshot: count('fx_snapshot'), valuation_snapshot: count('valuation_snapshot'), price_snapshot: count('price_snapshot')
+    };
   }
+}
+
+function toStoredPrice(row: PriceRow): StoredPrice {
+  return {
+    venue: row.venue,
+    name: row.name,
+    lowestAskCents: row.lowest_ask_cents,
+    highestBidCents: row.highest_bid_cents,
+    askUnits: row.ask_units,
+    bidUnits: row.bid_units,
+    bids: (JSON.parse(row.bids_json) as Array<[number, number]>).map(([priceCents, quantity]) => ({ priceCents, quantity })),
+    asOf: row.as_of,
+    absent: row.absent === 1,
+    median7dCents: row.median_7d_cents,
+    median30dCents: row.median_30d_cents,
+    volume30d: row.volume_30d
+  };
 }
 
 function toStoredBook(row: BookRow): StoredBook {

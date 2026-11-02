@@ -1,5 +1,5 @@
 import type {
-  Converted, DailyTop, NameStatus, SchedulerStatus, StoredBook, StoredCurve, StoredHistory, Valuation, ValuationSnapshotRow
+  BaseSum, Converted, CurvesPriced, DailyTop, NameStatus, SchedulerStatus, StoredBook, StoredCurve, StoredHistory, Valuation, ValuationSnapshotRow
 } from '@cslytics/market-data';
 import type { CurrencySettings } from './api.js';
 
@@ -38,7 +38,6 @@ export type ObservedByCurrency = {
   onHold: ObservedFigure;
   /** Seller-receives across live and on-hold listings. Never added to a total: the units are valued in inventory. */
   listings: ObservedFigure;
-  awaitingConfirmation: ObservedFigure;
   /** Inside the Steam wallet already: never added to it. */
   buyOrders: ObservedFigure;
 };
@@ -46,7 +45,7 @@ export type ObservedByCurrency = {
 /** The observed quantities a page shows, each one per currency above. */
 export type ObservedKey = Exclude<keyof ObservedByCurrency, 'currency' | 'accounts'>;
 
-/** One account's holdings in the base: its wallets, its inventory at the mid price, and the two added. */
+/** One account's holdings in the base: its wallets, its inventory at market value, and the two added. */
 export type AccountFigures = {
   accountId: string;
   wallets: BaseSum;
@@ -55,18 +54,42 @@ export type AccountFigures = {
   total: BaseSum;
 };
 
-/**
- * Figures in several currencies, each converted once and added in the base. `cents` is `null` when
- * nothing could be converted; `missingCurrencies` names what was left out, which makes the figure a
- * floor rather than a total.
- */
-export type BaseSum = { cents: number | null; complete: boolean; missingCurrencies: string[] };
+/** Figures in several currencies, each converted once and added in the base (`sumInBase` in `@cslytics/market-data`). */
+export type { BaseSum };
 
 /**
  * What the price fill is doing: `slowed` is the latency governor holding the queues for a minute,
  * `paused` the window hidden past its grace, `stopped` a 429 or a run of failures.
  */
 export type FillState = 'idle' | 'filling' | 'complete' | 'stopped' | 'slowed' | 'paused';
+
+/**
+ * CSlytics's hourly price snapshot, when it priced this valuation (portfolio prices plan D13):
+ * which generation, when this desktop last confirmed it, the FX snapshot it was converted by, and
+ * how many held kinds it covered against how many Steam's own book priced.
+ */
+export type PricesSource = { generatedAt: string; fetchedAt: string; fxAsOf: string; coveredKinds: number; bookKinds: number };
+
+/**
+ * How the float value priced the skins (portfolio and pricing plan D7, D18): how many kinds and
+ * units the Steam float curves priced, how many skins stayed at the mid price for want of a curve
+ * and why, how many distinct skin names are held, and what the curve fill is doing.
+ */
+export type CurvesSource = CurvesPriced & { skins: number; fill: CurveFillStatus };
+
+export type CurveFillState = 'idle' | 'filling' | 'complete' | 'deferred' | 'no-feature';
+
+/** What the curve fill is doing (main's `CurveFill`). */
+export type CurveFillStatus = {
+  state: CurveFillState;
+  /** Held skins that have a current copy or were asked this run, of every held skin. */
+  done: number;
+  total: number;
+  /** When a deferred fill asks again. */
+  resumesAt: string | null;
+  /** Why it is deferred: the hourly budget, the server's own wait, or the sign-in. */
+  deferredBy: 'budget' | 'server' | 'sign-in' | null;
+};
 
 export type PortfolioValuation = {
   base: string;
@@ -77,7 +100,7 @@ export type PortfolioValuation = {
   observed: ObservedByCurrency[];
   /**
    * Each observed quantity across every currency, converted to the base and added: what the
-   * portfolio page shows when its accounts hold different wallet currencies (plan §5.2).
+   * portfolio page shows when its accounts hold different wallet currencies (money and currency page §3).
    */
   observedInBase: Record<ObservedKey, BaseSum>;
   /** Every wallet, Steam and CSFloat, spendable and pending, converted to the base and added. */
@@ -91,12 +114,23 @@ export type PortfolioValuation = {
   /**
    * Every held name has been asked this fill, whatever it answered. Until then no total is shown:
    * a figure over half the books is a floor, and a floor shown as a total is the one that moves.
+   * The float curves are not part of it (`floatValued`).
    */
   valued: boolean;
+  /**
+   * Every held skin has a Steam float curve or has been asked for one this run, or the curve fill
+   * cannot ask now (plan D18). Until then the float value is not shown; the market value and the
+   * headline never wait for it.
+   */
+  floatValued: boolean;
   /** The newest day a valuation snapshot was written for any of these accounts. */
   lastSnapshotDay: string | null;
   /** Where the order book's prices were observed from: the currency of the newest book, by code. */
   observedIn: string | null;
+  /** `null` while no snapshot prices anything: signed out, no feature, none fetched, or one too old. */
+  prices: PricesSource | null;
+  /** `null` when the scope was too large to value. */
+  curves: CurvesSource | null;
 };
 
 export type ItemHolding = {

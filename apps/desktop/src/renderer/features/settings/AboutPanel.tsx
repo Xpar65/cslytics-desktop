@@ -4,8 +4,9 @@ import { engine } from '../../lib/engine.js';
 import { Button, KeyValue, Notice, Panel, PanelHeader } from '../../components/ui.js';
 
 /**
- * Settings › General › About: which build this is, whether a newer one is waiting, and whether the
- * stop switch has refused anything in this version and why (desktop release plan §4, §5).
+ * Settings › General › About: which build this is, whether a newer one is waiting, where to read what
+ * changed, and whether the stop switch has refused anything in this version and why (desktop
+ * release plan §4, §5).
  *
  * Everything shown is main's answer to `release.status`, read again on each `release` change
  * notice. The reasons under a retirement or a pause are the release host's own words; the
@@ -48,19 +49,22 @@ export function AboutPanel(): React.JSX.Element {
           { label: 'Version', value: status ? `CSlytics ${status.version}` : '…' },
           { label: 'Updates', value: update ? describeUpdate(update) : '…' }
         ]} />
-        {update?.phase === 'ready' ? (
-          <div className="toolbar">
+        <div className="toolbar">
+          {update?.phase === 'ready' ? (
             <Button variant="primary" icon="download" loading={busy} onClick={() => void act(engine.installUpdate)}>
               Restart to update
             </Button>
-          </div>
-        ) : status?.packaged && update?.phase !== 'disabled' ? (
-          <div className="toolbar">
+          ) : status?.packaged && update?.phase !== 'disabled' ? (
             <Button icon="refresh" loading={busy || update?.phase === 'checking'} onClick={() => void act(engine.checkForUpdate)}>
               Check for updates
             </Button>
-          </div>
-        ) : null}
+          ) : null}
+          {status ? (
+            <Button icon="sparkles" onClick={() => void act(engine.openReleaseNotes)}>
+              {update?.phase === 'ready' || update?.phase === 'downloading' ? `What's new in ${update.version}` : "What's new"}
+            </Button>
+          ) : null}
+        </div>
         {status?.policy.retired ? (
           <Notice tone="error" role="alert" title="This version can no longer trade">
             {status.policy.retired.reason} Update to {status.policy.retired.below} or later to list, delist, transfer or move items again.

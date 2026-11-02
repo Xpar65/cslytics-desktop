@@ -755,15 +755,18 @@ export class EngineDatabase {
   }
 
   /**
-   * The account's actions awaiting observation, oldest first, less the hops of these commands. A
-   * command whose dispatch is running proves its own round, so proof demand leaves its hops out
+   * The account's actions awaiting observation, oldest first, less the moves of these commands. A
+   * command whose dispatch is running proves its own round of moves, so proof demand leaves them out
    * here rather than asking each one's owner what it needs and then dropping it: a store of 968
-   * asked that, a few queries each, of every waiting store on every answer.
+   * asked that, a few queries each, of every waiting store on every answer. Its listings and cancels
+   * stay in: they go out one every two seconds, so the round's one read after its last send came
+   * after the person had confirmed the first on the phone, and the work panel never said what Steam
+   * was waiting for.
    */
-  awaitingActionsOutside(accountId: string, commandIds: readonly string[]): ActionRow[] {
+  awaitingActionsBesideMoves(accountId: string, commandIds: readonly string[]): ActionRow[] {
     if (commandIds.length === 0) return this.actions(accountId, 'AWAITING_OBSERVATION');
     return this.sqlite.prepare(`SELECT a.* FROM action a WHERE a.account_id=? AND a.state='AWAITING_OBSERVATION'
-      AND NOT EXISTS (SELECT 1 FROM work_step s WHERE s.id=a.step_id AND s.command_id IN (SELECT value FROM json_each(?)))
+      AND NOT EXISTS (SELECT 1 FROM work_step s WHERE s.id=a.step_id AND s.kind IN ('STORE','RETRIEVE') AND s.command_id IN (SELECT value FROM json_each(?)))
       ORDER BY a.created_at, a.id`).all(accountId, JSON.stringify(commandIds)) as ActionRow[];
   }
 

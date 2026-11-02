@@ -1,17 +1,21 @@
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
-import { app, BrowserWindow, ipcMain, Menu, nativeTheme, powerMonitor, protocol } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, nativeTheme, powerMonitor, protocol, shell } from 'electron';
 import { RUNTIME_COMMAND_TYPES } from '@cslytics/runtime/api';
 import { CATALOGUE_HOST, HttpCatalogueSource, IMAGE_SCHEME } from '@cslytics/catalogue';
 import { currencyById } from '@cslytics/market-data';
-import { MarketDataHost } from './market-data/host.js';
+import { REFRESH_TOKEN_KEY } from '@cslytics/cslytics-account';
+import { FEATURE_STEAM_CURVES, FEATURE_STEAM_PRICES, accessRefusal, hasFeature, requiredFeature } from '../shared/command-access.js';
+import { holdForGrant } from './market-data/grant.js';
+import { MarketDataHost, SYSTEM_CLOCK } from './market-data/host.js';
 import { AccountBooks } from './market-data/account-books.js';
-import { marketFetch } from './market-data/fetch.js';
+import { marketFetch, memberFetch } from './market-data/fetch.js';
+import { PricesRefresher } from './market-data/prices.js';
 import { itemCurve, itemHistory, itemPage, itemVariants, itemWatch, portfolioValuation } from './market-data/portfolio.js';
 import { ImageCache } from './images/cache.js';
 import { imageFetch } from './images/fetch.js';
 import { ElectronCredentialVault } from './credential-vault.js';
-import { answerCslytics, createCslyticsAccount } from './cslytics-account/index.js';
+import { answerCslytics, createCslyticsAccount, readCslyticsSeed } from './cslytics-account/index.js';
 import { trustInterceptedHostsUnpackaged } from './unpackaged-certificates.js';
 import { createEngineSide, type EngineSide } from './engine/engine-side.js';
 import { LocalRuntimeTransport } from './engine/local-runtime.js';
@@ -31,6 +35,7 @@ import { decide, summarize } from './release/policy.js';
 import { ReleasePolicySource } from './release/policy-source.js';
 import { DesktopUpdater } from './release/updater.js';
 import { DESKTOP_VERSION } from './release/version.js';
+import { changelogEntryUrl } from '../shared/changelog.js';
 import { SettingsStore } from './settings-store.js';
 import { NotificationsStateStore } from './notifications-state-store.js';
 import { resolveTheme, THEMES, windowChrome, type ThemePreference } from '../shared/themes/index.js';
@@ -101,10 +106,20 @@ if (!acquiredLock) {
   app.whenReady().then(() => {
     const userData = app.getPath('userData');
     const vault = new ElectronCredentialVault(join(userData, 'credentials.enc.json'));
-    // The optional CSlytics sign-in (CSlytics account sign-in plan §6). Read and verified beside the
-    // runtime, never ahead of it: nothing about Steam waits on the website.
-    const cslytics = createCslyticsAccount({ userData, vault, onChange: notifyCslyticsChanged });
-    const cslyticsReady = cslytics.start().catch(() => undefined);
+    // The CSlytics sign-in that unlocks prices (CSlytics account sign-in plan §6, pricing behind
+    // sign-in plan §7). Read and verified beside the runtime, never ahead of it: nothing about Steam
+    // waits on the website. A journey's seeded sign-in puts its refresh token in the vault first, so
+    // recovery finds it as a person's would be. A grant without the portfolio stops its fill at once
+    // (plan §7.5): no Steam read is made for a name only the walled page would show.
+    const cslyticsSeed = readCslyticsSeed(userData);
+    const cslyticsChanged = (): void => {
+      notifyCslyticsChanged();
+      if (marketHost) holdForGrant(cslytics.status(), marketHost);
+    };
+    const cslytics = createCslyticsAccount({ userData, vault, onChange: cslyticsChanged, ...(cslyticsSeed ? { issuer: cslyticsSeed.issuer } : {}) });
+    const cslyticsReady = (cslyticsSeed ? vault.set(REFRESH_TOKEN_KEY, cslyticsSeed.refreshToken) : Promise.resolve())
+      .then(() => cslytics.start())
+      .catch(() => undefined);
     void cslyticsReady.then(() => cslytics.verify()).catch(() => undefined);
     setInterval(() => { void cslytics.verify().catch(() => undefined); }, 60 * 60_000);
     // Preferences, read before the window exists so its first frame is already in the chosen theme.
@@ -176,7 +191,20 @@ if (!acquiredLock) {
     // reaches the window as a `market` surface change, coalesced so a 4 rps fill is not 4 repaints.
     const market = new MarketDataHost(userData, {
       fetch: marketFetch,
+      memberFetch,
       userAgent: desktopUserAgent(),
+      // The snapshot prices a name only while the grant holds its feature (portfolio prices plan D9).
+      snapshotGranted: () => hasFeature(cslytics.status(), FEATURE_STEAM_PRICES),
+      // Float curves are behind the sign-in too (pricing behind sign-in plan §7.4): main's gate has
+      // checked the feature before a curve is asked, and the request carries the access token.
+      curveBearer: async (fresh) => {
+        const answer = await cslytics.bearer({ fresh });
+        return answer.kind === 'ok' ? answer.token : null;
+      },
+      onCurveForbidden: () => { void cslytics.verify().catch(() => undefined); },
+      // Every held skin's Steam curve, which prices it at its own float (portfolio and pricing plan D18).
+      curvesGranted: () => hasFeature(cslytics.status(), FEATURE_STEAM_CURVES),
+      onCurvesChanged: notifyMarketChanged,
       log: (message, detail) => console.warn(message, detail ?? ''),
       onEvent: (event) => {
         if (event.kind === 'book' || event.kind === 'absent' || event.kind === 'fill-complete' || event.kind === 'stopped' || event.kind === 'rate') notifyMarketChanged();
@@ -184,6 +212,20 @@ if (!acquiredLock) {
     });
     marketHost = market;
     market.start();
+    // CSlytics's hourly price snapshot, asked for only with the feature in the grant (portfolio
+    // prices plan §7.3). It starts once the stored sign-in has been read, so the first ask sees it.
+    const prices = new PricesRefresher({
+      source: market.source,
+      store: market.store,
+      account: cslytics,
+      clock: SYSTEM_CLOCK,
+      onChange: notifyMarketChanged,
+      log: (message, detail) => console.warn(message, detail ?? '')
+    });
+    pricesRefresher = prices;
+    void cslyticsReady.then(() => prices.start());
+    // The curve fill waits for the stored sign-in too, so its first ask has a token.
+    void cslyticsReady.then(() => market.curves.start());
     // An account's own read of a book, for a wallet the anonymous book is not priced for (plan
     // D17): relayed by the runtime, or a journey's seed when the profile carries one.
     const accountBooks = new AccountBooks({
@@ -282,10 +324,27 @@ if (!acquiredLock) {
         updater.install();
         return releaseStatus();
       }
+      if (command.type === 'release.notes') {
+        // What changed, on the website: the version waiting to install if there is one, else this one.
+        // The URL is built here from a constant and the updater's own version; the window sends nothing.
+        const update = updater.state();
+        const version = update.phase === 'ready' || update.phase === 'downloading' ? update.version : DESKTOP_VERSION;
+        await shell.openExternal(changelogEntryUrl(version));
+        return releaseStatus();
+      }
       // The stop switch, before anything is forwarded: a refused command reaches neither the
       // runtime nor a venue, and its reason is the error every page already knows how to show.
       const refusal = decide(policy.current(), DESKTOP_VERSION, command.type);
       if (refusal.refused) throw new Error(refusal.message);
+      // What a CSlytics sign-in unlocks (pricing behind sign-in plan §7.2): a command that carries a
+      // price waits for the stored sign-in to have been read, and without its feature it is refused
+      // here, before anything is forwarded or fetched. The window never sends one it lacks; this is
+      // the gate, and it covers a remote engine host as well as the local one.
+      if (requiredFeature(command) !== null) {
+        await cslyticsReady;
+        const locked = accessRefusal(command, cslytics.status());
+        if (locked) throw new Error(locked);
+      }
       // Which engine this desktop drives (remote engine host plan): answered here, never forwarded.
       if (command.type === 'engine.status') return engine.status();
       if (command.type === 'engine.connect') {
@@ -330,6 +389,7 @@ if (!acquiredLock) {
         return stored;
       }
       if (command.type === 'settings.launch') return settings.writeLaunch(command.accountId, command.launch);
+      if (command.type === 'settings.prompts') return settings.writePrompts(command.prompts);
       // The CSlytics account: main's, never the runtime's.
       const cslyticsAnswer = answerCslytics(cslytics, cslyticsReady, command);
       if (cslyticsAnswer) return cslyticsAnswer;
@@ -613,6 +673,8 @@ if (!acquiredLock) {
     // cleanly. Nothing waits on it; a read still in flight is dropped, and the store never evicts.
     const market = marketHost;
     marketHost = null;
+    pricesRefresher?.stop();
+    pricesRefresher = null;
     if (market) void market.stop().catch(() => undefined);
     if (shuttingDownRuntime) return;
     const side = engineSide;
@@ -780,8 +842,10 @@ function notifyReleaseChanged(): void {
   }
 }
 
-/** The CSlytics account's status moved: the window re-reads `cslytics.status`. */
+/** The CSlytics account's status moved: the window re-reads `cslytics.status`, and a changed grant is asked for prices at once. */
 function notifyCslyticsChanged(): void {
+  pricesRefresher?.grantChanged();
+  marketHost?.curves.grantChanged();
   for (const open of BrowserWindow.getAllWindows()) {
     if (open.isDestroyed()) continue;
     open.webContents.send(CHANGE_CHANNEL, {
@@ -807,6 +871,8 @@ function notifyCatalogueChanged(): void {
 
 /** The price cache, held at module level so quitting can close it (set once the app is ready). */
 let marketHost: MarketDataHost | null = null;
+/** The hourly ask for CSlytics's snapshot, beside it: stopped on quit, woken by a changed grant. */
+let pricesRefresher: PricesRefresher | null = null;
 let marketNotice: ReturnType<typeof setTimeout> | null = null;
 
 /**

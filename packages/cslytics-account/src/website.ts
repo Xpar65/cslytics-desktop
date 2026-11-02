@@ -9,6 +9,22 @@ export const DESKTOP_CLIENT_ID = 'cslytics-desktop';
 export const AUTHORIZE_PATH = '/desktop/authorize';
 
 /**
+ * Where the browser is sent back to on the website once the listener has the website's answer, so
+ * the tab rests on cslytics.com rather than on a page at 127.0.0.1. Fixed URLs: they carry nothing
+ * from the callback, so the code and the state stay out of the person's history.
+ */
+export type Landing = { approved: string; declined: string };
+
+export function landingUrls(origin: string): Landing {
+  const at = (done: string): string => {
+    const url = new URL(AUTHORIZE_PATH, origin);
+    url.searchParams.set('done', done);
+    return url.toString();
+  };
+  return { approved: at('approved'), declined: at('declined') };
+}
+
+/**
  * The pages the desktop may open in the person's browser, matched exactly. A prefix match would
  * accept `https://cslytics.com.example.net/…` as readily as the real site.
  */

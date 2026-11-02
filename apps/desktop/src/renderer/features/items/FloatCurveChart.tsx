@@ -1,11 +1,15 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { CurveDoc, CurveVertex } from '@cslytics/market-data';
-import { IconButton } from '../../components/ui.js';
+import { IconButton, Thumbnail } from '../../components/ui.js';
+import { Icon } from '../../components/Icon.js';
+import { VenueMark } from '../../components/VenueMark.js';
+import { formatFloat } from '../../lib/format.js';
 import { formatAmount, formatTick } from '../../lib/money.js';
 import {
   WEAR_BANDS, clampView, floatDigits, linearTicks, logTicks, panBy, priceAtFloat, priceExtent, sameView, zoomAbout,
   type Range, type View, type WearCode
 } from './curve-math.js';
+import type { StagedMark } from './staged-marks.js';
 
 /**
  * A skin's float curves, every wear at once across its whole float range, the way the CSlytics
@@ -14,8 +18,11 @@ import {
  * never bridged), and the listings the curves were fitted to as dots. Price runs on a log axis by
  * default, because a skin's cheapest and dearest floats are often two orders of magnitude apart.
  *
- * The wear this page is about is drawn on top and stronger; the person's own floats are marked
- * where they sit on it. Ctrl and the wheel zoom about the pointer (with Shift, the price axis), so
+ * The wear this page is about is drawn on top and stronger, and every unit of the name staged in a
+ * listing workspace is a listing tag in the accent colour at its float and the price typed for it,
+ * the picture and the figure in its tip (`staged-marks.ts`), so a price is decided against the
+ * curve it will be listed into. Ctrl and the wheel zoom about the pointer (with Shift, the price
+ * axis), so
  * a plain wheel still scrolls the page; drag pans, Shift and drag zooms to a box, a double click or
  * 0 resets, and the buttons in the corner do the same. Every price is in the document's currency,
  * which the free CDN publishes in USD and the panel names once.
@@ -35,23 +42,29 @@ export type CurveLayers = { fair: boolean; ask: boolean; bid: boolean; listings:
 type Layer = 'fair' | 'ask' | 'bid';
 type Line = { key: string; code: WearCode; layer: Layer; current: boolean; points: readonly CurveVertex[] };
 type Dot = { code: WearCode; current: boolean; x: number; y: number };
-type Held = { x: number; y: number | null; code: WearCode | null };
-type Tip = { left: number; top: number; title: string; code: WearCode | null; float: number; price: number };
+/** A staged unit on the chart: at its own price, on the fair price while it has none, or at its float alone with no rate to place it. */
+type Staged = { mark: StagedMark; x: number; y: number | null; code: WearCode | null };
+type Tip = { left: number; top: number; title: string; code: WearCode | null; float: number; price: number; staged?: StagedMark | undefined };
 
 const HEIGHT = 340;
 const PAD = { left: 8, right: 64, top: 22, bottom: 24 };
 const LAYER_LABEL: Readonly<Record<Layer | 'listing', string>> = { fair: 'fair', ask: 'lowest ask', bid: 'highest bid', listing: 'listing' };
 /** How near the pointer a point must be, in pixels, for the tooltip to name it. */
 const REACH = 14;
+/** The radius of the disc a staged mark's tag sits on, and the tag's size, in pixels. */
+const MARK = 10;
+const TAG = 13;
+const NO_STAGED: readonly StagedMark[] = [];
 
 const wearVariable = (code: WearCode): string => `--wear-${code.toLowerCase()}`;
+const wearAt = (float: number): WearCode | null => WEAR_BANDS.find((entry) => float >= entry.lo && float < entry.hi)?.code ?? null;
 
-export function FloatCurveChart({ wears, range, floats, layers, log, currency, resetKey, testId }: {
+export function FloatCurveChart({ wears, range, staged = NO_STAGED, layers, log, currency, resetKey, testId }: {
   wears: readonly CurveWear[];
   /** The skin's float range: the x axis, whatever part of it each curve covers. */
   range: { min: number; max: number };
-  /** Floats the scope holds of the page's own name. */
-  floats: readonly number[];
+  /** The units of the page's own name staged in a listing workspace, each at the price typed for it. */
+  staged?: readonly StagedMark[] | undefined;
   layers: CurveLayers;
   log: boolean;
   currency: string;
@@ -107,16 +120,22 @@ export function FloatCurveChart({ wears, range, floats, layers, log, currency, r
         }
       }
     }
-    // A held float sits on the fair line of the wear it falls in, when that wear has one.
-    const held: Held[] = floats.map((float) => {
-      const band = WEAR_BANDS.find((entry) => float >= entry.lo && float < entry.hi) ?? null;
-      const doc = wears.find((wear) => wear.code === band?.code)?.doc ?? null;
+    // The fair price of the wear a float falls in, when that wear has one.
+    const fairAt = (float: number): number | null => {
+      const doc = wears.find((wear) => wear.code === wearAt(float))?.doc ?? null;
       const y = priceAtFloat(doc?.fairPrice?.vertices, float);
-      if (y !== null && (!log || y > 0)) prices.push(y);
-      return { x: float, y: y !== null && (!log || y > 0) ? y : null, code: band?.code ?? null };
+      return y !== null && (!log || y > 0) ? y : null;
+    };
+    // A staged unit sits at its own price; one with no price yet sits on the fair price, so its
+    // float still shows; one priced in a currency with no rate to the chart's has no height.
+    const marks: Staged[] = staged.map((mark) => {
+      const own = mark.price !== null && (!log || mark.price > 0) ? mark.price : null;
+      const y = own ?? (mark.figure === null ? fairAt(mark.float) : null);
+      if (y !== null) prices.push(y);
+      return { mark, x: mark.float, y, code: wearAt(mark.float) };
     });
-    return { lines, dots, held, prices };
-  }, [wears, floats, layers, log]);
+    return { lines, dots, marks, prices };
+  }, [wears, staged, layers, log]);
 
   const full = useMemo<View>(() => {
     const span = Math.max(1e-6, range.max - range.min);
@@ -172,16 +191,17 @@ export function FloatCurveChart({ wears, range, floats, layers, log, currency, r
   const nearest = (at: { x: number; y: number }): Tip | null => {
     let best: Tip | null = null;
     let bestDistance = REACH;
-    const consider = (x: number, y: number, title: string, code: WearCode | null): void => {
+    const consider = (x: number, y: number, title: string, code: WearCode | null, unit?: StagedMark): void => {
       const px = sx(x);
       const py = sy(y);
       const distance = Math.hypot(px - at.x, py - at.y);
       if (distance < bestDistance) {
         bestDistance = distance;
-        best = { left: px, top: py, title, code, float: x, price: y };
+        best = { left: px, top: py, title, code, float: x, price: y, staged: unit };
       }
     };
-    for (const mark of drawn.held) if (mark.y !== null) consider(mark.x, mark.y, 'Your float', mark.code);
+    // A staged unit first: it is the one point on the chart the person put there.
+    for (const entry of drawn.marks) if (entry.y !== null) consider(entry.x, entry.y, entry.mark.title, entry.code, entry.mark);
     for (const line of drawn.lines) for (const [x, y] of line.points) consider(x, y, `${line.code} ${LAYER_LABEL[line.layer]}`, line.code);
     for (const dot of drawn.dots) consider(dot.x, dot.y, `${dot.code} ${LAYER_LABEL.listing}`, dot.code);
     return best;
@@ -293,10 +313,25 @@ export function FloatCurveChart({ wears, range, floats, layers, log, currency, r
           {drawn.lines.map((line) => (
             <path key={line.key} className="curve-line" data-layer={line.layer} data-current={line.current} d={path(line.points)} style={{ stroke: `var(${wearVariable(line.code)})` }} />
           ))}
-          {drawn.held.map((mark, index) => (
-            <g key={`h${index}`} className="curve-held">
-              <line x1={sx(mark.x)} x2={sx(mark.x)} y1={PAD.top} y2={PAD.top + plotHeight} />
-              {mark.y !== null ? <circle cx={sx(mark.x)} cy={sy(mark.y)} r={4.5} /> : null}
+          {drawn.marks.map((entry) => (
+            <g
+              key={`s${entry.mark.key}`}
+              className="curve-staged"
+              data-testid={testId ? `${testId}-staged` : undefined}
+              data-key={entry.mark.key}
+              data-float={entry.mark.float}
+              data-priced={entry.mark.figure !== null}
+              data-figure={entry.mark.figure ?? undefined}
+              data-price={entry.y ?? undefined}
+            >
+              <line x1={sx(entry.x)} x2={sx(entry.x)} y1={PAD.top} y2={PAD.top + plotHeight} />
+              {/* The listing's tag on a disc, so it reads as a listing and not as a point of the curve. */}
+              {entry.y !== null ? (
+                <g className="curve-staged-mark" transform={`translate(${sx(entry.x).toFixed(1)} ${sy(entry.y).toFixed(1)})`}>
+                  <circle r={MARK} />
+                  <g transform={`translate(${-TAG / 2} ${-TAG / 2})`}><Icon name="tag" size={TAG} /></g>
+                </g>
+              ) : null}
             </g>
           ))}
           {tip ? <circle className="curve-hover" cx={tip.left} cy={tip.top} r={5} style={tip.code ? { stroke: `var(${wearVariable(tip.code)})` } : undefined} /> : null}
@@ -314,14 +349,40 @@ export function FloatCurveChart({ wears, range, floats, layers, log, currency, r
         <div
           className="price-chart-tooltip"
           data-testid={testId ? `${testId}-tooltip` : undefined}
+          data-staged={tip.staged ? tip.staged.key : undefined}
           style={{ top: Math.max(4, tip.top - 44), left: flip ? undefined : tip.left + 12, right: flip ? width - tip.left + 12 : undefined }}
         >
-          <div className="price-chart-tooltip-x">{tip.title}</div>
-          <div className="price-chart-tooltip-row">
-            <span className="price-chart-swatch" style={tip.code ? { background: `var(${wearVariable(tip.code)})` } : undefined} />
-            <span className="price-chart-tooltip-label num">{tip.float.toFixed(4)}</span>
-            <span className="num">{formatAmount(Math.round(tip.price * 100), currency)}</span>
-          </div>
+          {tip.staged ? (
+            // The staged unit: its picture, its name, its float and the figure typed for it, in the
+            // currency it was typed in; what placed it on this axis when that is another currency.
+            <div className="price-chart-tooltip-item">
+              <Thumbnail url={tip.staged.imageUrl} name={tip.staged.title} size={40} />
+              <div className="price-chart-tooltip-text">
+                <div className="price-chart-tooltip-x">{tip.staged.title}</div>
+                <div className="price-chart-tooltip-row">
+                  <span className="price-chart-swatch" style={tip.code ? { background: `var(${wearVariable(tip.code)})` } : undefined} />
+                  <span className="price-chart-tooltip-label num">{formatFloat(tip.float)}</span>
+                  <span className="num">{tip.staged.figure ?? 'No price yet'}</span>
+                </div>
+                {/* The tag and the venue's mark say what it is; the ≈ figure, when there is one, is where it sits on this axis. */}
+                <div className="price-chart-tooltip-sub price-chart-tooltip-staged">
+                  <Icon name="tag" size={11} />
+                  <span>Staged</span>
+                  <VenueMark venue={tip.staged.venue} size={11} />
+                  {tip.staged.placed ? <span className="num">{tip.staged.placed}</span> : null}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="price-chart-tooltip-x">{tip.title}</div>
+              <div className="price-chart-tooltip-row">
+                <span className="price-chart-swatch" style={tip.code ? { background: `var(${wearVariable(tip.code)})` } : undefined} />
+                <span className="price-chart-tooltip-label num">{tip.float.toFixed(4)}</span>
+                <span className="num">{formatAmount(Math.round(tip.price * 100), currency)}</span>
+              </div>
+            </>
+          )}
         </div>
       ) : null}
     </div>

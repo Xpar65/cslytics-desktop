@@ -244,6 +244,11 @@ export type InventoryPositionRow = {
   wearBand: number | null;
   /** The least worn float under this band, so the host can spell the market name the way it spells a row's. */
   minWear: number | null;
+  /**
+   * Every unit's float under this band, one per individual item, in no order; empty for a kind with
+   * no float. What a valuation prices each skin at its own float by (portfolio and pricing plan D7).
+   */
+  floats: number[];
   quantity: number; main: number; storage: number;
   /** Of `main`, how many an open Steam listing names. */
   listed: number;
@@ -261,7 +266,9 @@ export type PositionsEnvelope =
  * A market name is a catalogue key plus a wear tier, and the group summary carries no tier, so a
  * portfolio valuation could not be built on it without paging every unit. This read is bounded by
  * names rather than units — at most five rows per group — which is what keeps a 200,000-unit
- * account affordable. The band is identity arithmetic over the float (`wearBandSql`, the same
+ * account affordable. The one per-unit field is `floats`: a skin is priced at its own float, and an
+ * individual item is the only unit that has one, so a 200,000-case account still answers few rows
+ * and short lists. The band is identity arithmetic over the float (`wearBandSql`, the same
  * thresholds the catalogue spells names with); no name enters the engine.
  *
  * Unpaged on purpose: a valuation needs the whole set or none of it, and a partial set that reads
@@ -274,6 +281,7 @@ export function pageInventoryPositions(database: EngineDatabase, request: Invent
   const grouped = `SELECT accountId, matchKey,
       MAX(defIndex) AS defIndex, MAX(paintIndex) AS paintIndex, MAX(quality) AS quality,
       ${wearBandSql('paintWear')} AS wearBand, MIN(paintWear) AS minWear,
+      json_group_array(paintWear) FILTER (WHERE paintWear IS NOT NULL) AS floatsJson,
       COALESCE(SUM(quantity),0) AS quantity,
       COALESCE(SUM(CASE WHEN location='MAIN' THEN quantity ELSE 0 END),0) AS main,
       COALESCE(SUM(CASE WHEN location='CASKET' THEN quantity ELSE 0 END),0) AS storage,
@@ -282,7 +290,8 @@ export function pageInventoryPositions(database: EngineDatabase, request: Invent
     FROM (${query.sql}) GROUP BY accountId, matchKey, wearBand`;
   const groups = (database.raw().prepare(`SELECT COUNT(*) AS n FROM (SELECT DISTINCT accountId, matchKey FROM (${query.sql}))`).get(...query.params) as { n: number }).n;
   if (groups > GROUP_SUMMARY_CAP) return { kind: 'needs-filter', groups, cap: GROUP_SUMMARY_CAP };
-  const rows = database.raw().prepare(`SELECT * FROM (${grouped}) ORDER BY accountId, matchKey, wearBand`).all(...query.params) as InventoryPositionRow[];
+  const rows = (database.raw().prepare(`SELECT * FROM (${grouped}) ORDER BY accountId, matchKey, wearBand`).all(...query.params) as Array<Omit<InventoryPositionRow, 'floats'> & { floatsJson: string }>)
+    .map(({ floatsJson, ...row }) => ({ ...row, floats: JSON.parse(floatsJson) as number[] }));
   const quantity = rows.reduce((sum, row) => sum + row.quantity, 0);
   return { kind: 'positions', revision: readRevision(database, accounts), rows, total: { quantity, positions: rows.length, groups } };
 }

@@ -17,6 +17,7 @@ import { OrderStore, type SteamListingRow } from '../db/orders.js';
 import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { priceChangeRefusal } from '../kernel/price-cadence.js';
 import { OPEN_STEP_STATES_SQL, WorkStore, isSettled, type WorkStepRow } from '../db/work.js';
+import { ACCOUNT_TRANSFER } from '../db/transfers.js';
 import { sqlList, type CommandAuthority, type WorkStepKind } from '../db/alphabets.js';
 import { claimForPerson, strategyRefusal } from '../policy/authority.js';
 import { attemptsMade } from '../kernel/not-applied.js';
@@ -31,14 +32,23 @@ export type CommandKind = 'STORE' | 'RETRIEVE' | 'LIST' | 'TRANSFER' | 'REPRICE'
 
 /** The commands this service drives: one Steam account's holdings, moved, listed or delisted. */
 export const COMMAND_KINDS: readonly CommandKind[] = ['STORE', 'RETRIEVE', 'LIST', 'TRANSFER', 'REPRICE', 'DELIST_TO_STORE'];
-const COMMAND_KINDS_SQL = `(${sqlList(COMMAND_KINDS)})`;
+
+/**
+ * The commands whose open stage this service drives after a settle or a restart: its own, and a
+ * transfer between owned accounts, whose crated members' retrieves are a stage of this service
+ * (cross-account transfer plan D-04). The transfer's send, accept and cancel hops name no holding
+ * and are `TransferService`'s: `DRIVEN_HOP_SQL` keeps this service to the retrieves.
+ */
+const DRIVEN_KINDS_SQL = `(${sqlList([...COMMAND_KINDS, ACCOUNT_TRANSFER])})`;
+const DRIVEN_HOP_SQL = `(c.kind<>'${ACCOUNT_TRANSFER}' OR s.kind='RETRIEVE')`;
 
 /**
  * The commands whose hops this service keeps in step with their actions after a settle: its own
- * chains, and the work of one hop asked for by hand (`WorkStore.lone`), whose actions the market
- * and buy-order reconcilers settle and whose hops nothing else would otherwise read back.
+ * chains, a transfer's retrieves, and the work of one hop asked for by hand (`WorkStore.lone`),
+ * whose actions the market and buy-order reconcilers settle and whose hops nothing else would
+ * otherwise read back.
  */
-const MIRRORED_KINDS_SQL = `(${sqlList([...COMMAND_KINDS, 'DELIST', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL'])})`;
+const MIRRORED_KINDS_SQL = `(${sqlList([...COMMAND_KINDS, ACCOUNT_TRANSFER, 'DELIST', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL'])})`;
 
 /** The chains whose first hop is cancelling an open listing. */
 const DELIST_FIRST: readonly CommandKind[] = ['REPRICE', 'DELIST_TO_STORE'];
@@ -225,7 +235,7 @@ export class CommandService {
   /** Preparation and dispatch in flight, per command, so `settled` has something to await. */
   private readonly inflight = new Map<string, Promise<void>>();
 
-  /** The commands whose dispatch is running: each proves its own rounds, so the cadence leaves their hops to it. */
+  /** The commands whose dispatch is running: each proves its own rounds of moves, so the cadence leaves those to it. */
   dispatchingCommands(): string[] {
     return [...this.inflight.keys()];
   }
@@ -310,9 +320,9 @@ export class CommandService {
     const { database } = this.context;
     const rows = database.raw().prepare(`
       SELECT c.id AS id FROM command c
-      WHERE c.kind IN ${COMMAND_KINDS_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL') AND c.preparing=0
+      WHERE c.kind IN ${DRIVEN_KINDS_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL') AND c.preparing=0
         AND (EXISTS (SELECT 1 FROM command_member m WHERE m.command_id=c.id AND m.account_id=? AND m.state='PREPARED')
-          OR EXISTS (SELECT 1 FROM work_step s WHERE s.command_id=c.id AND s.account_id=? AND s.state='QUEUED'))
+          OR EXISTS (SELECT 1 FROM work_step s WHERE s.command_id=c.id AND s.account_id=? AND s.state='QUEUED' AND ${DRIVEN_HOP_SQL}))
       ORDER BY c.created_at LIMIT 50
     `).all(accountId, accountId) as Array<{ id: string }>;
     const resumed: string[] = [];
@@ -1228,7 +1238,7 @@ export class CommandService {
     // so a hop proved not applied after that belongs to a complete command and is still owed its
     // resend. Only a command with an open hop is read, so a settled one costs nothing here.
     const rows = database.raw().prepare(`SELECT DISTINCT c.id AS id, c.created_at AS created_at FROM command c JOIN work_step s ON s.command_id=c.id
-      WHERE s.account_id=? AND s.state IN ${OPEN_STEP_STATES_SQL} AND c.kind IN ${COMMAND_KINDS_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL','COMPLETE') AND c.preparing=0
+      WHERE s.account_id=? AND s.state IN ${OPEN_STEP_STATES_SQL} AND c.kind IN ${DRIVEN_KINDS_SQL} AND ${DRIVEN_HOP_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL','COMPLETE') AND c.preparing=0
       ORDER BY c.created_at`).all(accountId) as Array<{ id: string }>;
     for (const row of rows) {
       // A pass of this command is still running: a wake pass yields between pages, and a walk that
@@ -1682,7 +1692,7 @@ export class CommandService {
   protected reflectOpen(accountId: AccountId): void {
     const now = this.context.now();
     const rows = this.context.database.raw().prepare(`SELECT s.* FROM work_step s JOIN command c ON c.id=s.command_id JOIN action x ON x.id=s.action_id
-      WHERE s.account_id=? AND c.kind IN ${MIRRORED_KINDS_SQL} AND s.state IN ${OPEN_STEP_STATES_SQL} AND (
+      WHERE s.account_id=? AND c.kind IN ${MIRRORED_KINDS_SQL} AND ${DRIVEN_HOP_SQL} AND s.state IN ${OPEN_STEP_STATES_SQL} AND (
         (x.state='DONE' AND s.state<>'DONE') OR (x.state='FAILED' AND s.state<>'FAILED') OR (x.state='RUNNING' AND s.state<>'SENT')
         OR (x.state='AWAITING_OBSERVATION' AND s.state<>'AWAITING_OBSERVATION')
         OR (x.state='READY' AND x.resolution='OBSERVED_NOT_APPLIED' AND (s.state<>'RETRYING' OR c.state='STOPPED')))
@@ -1841,6 +1851,9 @@ export class CommandService {
     const { database } = this.context;
     const command = database.command(commandId);
     if (!command || command.state === 'STOPPED' || command.state === 'REJECTED') return;
+    // A transfer's state is its sources' transfers' (`TransferStore.progress`): the retrieves this
+    // service drove are one stage of it, and their going out says nothing about the offer to come.
+    if (command.kind === ACCOUNT_TRANSFER) return;
     let rejected = false;
     let unsent = false;
     for (const member of database.commandMembers(commandId)) {

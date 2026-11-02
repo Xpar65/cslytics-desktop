@@ -1,4 +1,4 @@
-import type { CurveDoc, CurveSegments, CurveSeries, CurveVertex, FxRates, OrderBook, Parsed, PriceHistory } from './types.js';
+import type { CurveDoc, CurveSegments, CurveSeries, CurveVertex, FxRates, OrderBook, Parsed, PriceHistory, PriceSnapshot, PriceSnapshotRow } from './types.js';
 
 /**
  * What a body means, decided in one place.
@@ -126,7 +126,7 @@ export function parsePriceHistory(status: number, body: unknown): Parsed<PriceHi
 }
 
 /**
- * A published curve, the free `<venue>/curves/<hash>.json` (`curveUrl`). A 404 is the normal
+ * A published curve, the member `<venue>/curves/<hash>.json` (`curveUrl`). A 404 is the normal
  * answer for a name without a curve. Vertices are raw float against whole currency units and are
  * kept as the document gives them: the chart interpolates, nothing here does.
  */
@@ -225,4 +225,76 @@ export function parseFxRates(status: number, body: unknown): Parsed<FxRates> {
   }
   if (rates.USD !== 1) return unknown('USD is not 1');
   return { kind: 'ok', value: { base: 'USD', asOf: body.as_of, stale: body.stale === true, rates } };
+}
+
+/** The document's `schema`; a document at another is refused whole rather than read by guesswork. */
+export const PRICE_SNAPSHOT_SCHEMA = 1;
+/** The most bid levels a row may carry (portfolio prices plan D6); more is a document this build does not know. */
+const PRICE_SNAPSHOT_MAX_BIDS = 5;
+
+/**
+ * The member prices document (`/member/v1/steam/prices.json`, portfolio prices plan §4). Integer
+ * cents and nothing else: a dollar figure here would be the free contract's shape, and the money
+ * type holds no float. One bad row refuses the whole document, because a document is one
+ * generation and a half-read generation would price some names from this hour and the rest from
+ * the last. A 404 is `absent`, which the route never gives; the caller reports it rather than
+ * treating it as a snapshot of nothing.
+ */
+export function parsePriceSnapshot(status: number, body: unknown): Parsed<PriceSnapshot> {
+  if (status === 404) return { kind: 'absent' };
+  if (status !== 200) return unknown(`HTTP ${status}`);
+  if (!isRecord(body)) return unknown('not an object');
+  if (body.venue !== 'steam') return unknown('venue is not steam');
+  if (body.currency !== 'USD') return unknown('currency is not USD');
+  if (body.schema !== PRICE_SNAPSHOT_SCHEMA) return unknown(`schema ${String(body.schema)} is not ${PRICE_SNAPSHOT_SCHEMA}`);
+  if (typeof body.generated_at !== 'string' || typeof body.exported_at !== 'string' || typeof body.fx_as_of !== 'string') return unknown('a timestamp is missing');
+  if (!Array.isArray(body.items)) return unknown('items missing');
+  if (body.count !== undefined && body.count !== body.items.length) return unknown(`count ${String(body.count)} does not match ${body.items.length} items`);
+  const rows: PriceSnapshotRow[] = [];
+  const seen = new Set<string>();
+  for (const raw of body.items) {
+    const row = priceRow(raw);
+    if (row === null) return unknown(`item ${rows.length} did not parse`);
+    if (seen.has(row.name)) return unknown(`${row.name} appears twice`);
+    seen.add(row.name);
+    rows.push(row);
+  }
+  return {
+    kind: 'ok',
+    value: { venue: 'steam', currency: 'USD', schema: PRICE_SNAPSHOT_SCHEMA, generatedAt: body.generated_at, exportedAt: body.exported_at, fxAsOf: body.fx_as_of, rows }
+  };
+}
+
+function nullableNonNegativeInteger(value: unknown): number | null | false {
+  if (value === null) return null;
+  const number = nonNegativeInteger(value);
+  return number === null ? false : number;
+}
+
+function priceRow(raw: unknown): PriceSnapshotRow | null {
+  if (!isRecord(raw)) return null;
+  if (typeof raw.name !== 'string' || raw.name.length === 0) return null;
+  if (typeof raw.absent !== 'boolean' || typeof raw.as_of !== 'string') return null;
+  const lowestAskCents = nullableNonNegativeInteger(raw.lowest_ask);
+  const highestBidCents = nullableNonNegativeInteger(raw.highest_bid);
+  const median7dCents = nullableNonNegativeInteger(raw.median_7d);
+  const median30dCents = nullableNonNegativeInteger(raw.median_30d);
+  const volume30d = nullableNonNegativeInteger(raw.volume_30d);
+  const askUnits = nonNegativeInteger(raw.ask_units);
+  const bidUnits = nonNegativeInteger(raw.bid_units);
+  if (lowestAskCents === false || highestBidCents === false || median7dCents === false || median30dCents === false || volume30d === false) return null;
+  if (askUnits === null || bidUnits === null || !Array.isArray(raw.bids) || raw.bids.length > PRICE_SNAPSHOT_MAX_BIDS) return null;
+  const bids: Array<{ priceCents: number; quantity: number }> = [];
+  for (const level of raw.bids) {
+    if (!Array.isArray(level) || level.length !== 2) return null;
+    const priceCents = nonNegativeInteger(level[0]);
+    const quantity = nonNegativeInteger(level[1]);
+    if (priceCents === null || quantity === null) return null;
+    const previous = bids[bids.length - 1];
+    if (previous !== undefined && priceCents > previous.priceCents) return null;
+    bids.push({ priceCents, quantity });
+  }
+  if (raw.absent && (lowestAskCents !== null || highestBidCents !== null || bids.length > 0)) return null;
+  if (bids.length > 0 && highestBidCents !== bids[0]!.priceCents) return null;
+  return { name: raw.name, lowestAskCents, highestBidCents, askUnits, bidUnits, bids, asOf: raw.as_of, absent: raw.absent, median7dCents, median30dCents, volume30d };
 }

@@ -5,8 +5,8 @@ import { Caption, Notice, Panel, PanelHeader, Select, Switch } from '../../compo
 import { chooseBaseCurrency, setAccountPagesInBase, useCurrency } from '../../lib/currency.js';
 
 /**
- * Settings › General › Currency: the base currency and the account-pages toggle (portfolio and
- * pricing plan §5.2), each with an info icon that opens the explanation beside it (§5.3).
+ * Settings › General › Currency: the base currency and the account-pages toggle (money and
+ * currency page §3), each with an info icon that opens the explanation beside it.
  *
  * What a choice here never does: change a price someone types. The listing composer and the
  * buy-order form take the account's own currency whatever this says, and the explanations say so.

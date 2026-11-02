@@ -4,6 +4,7 @@ import {
   DEFAULT_CSFLOAT, DEFAULT_CURRENCY,
   DEFAULT_ENGINE,
   DEFAULT_LAUNCH,
+  DEFAULT_PROMPTS,
   DEFAULT_SETTINGS,
   engineConnectionSchema,
   settingsSchema,
@@ -11,7 +12,8 @@ import {
   type AppearanceSettings,
   type CurrencySettings,
   type DesktopSettings,
-  type EngineConnection
+  type EngineConnection,
+  type PromptsSettings
 } from '../shared/api.js';
 import { THEME_PREFERENCES } from '../shared/themes/index.js';
 
@@ -89,6 +91,11 @@ export class SettingsStore {
     return this.write({ ...this.settings, engine });
   }
 
+  /** Which prompts are offered at launch, the same way (pricing behind sign-in plan §7.7). */
+  writePrompts(prompts: PromptsSettings): DesktopSettings {
+    return this.write({ ...this.settings, prompts });
+  }
+
   /**
    * Pins the base currency from the first account's wallet, once. A base already pinned or
    * chosen is left alone, so adding or removing accounts later never moves the figures.
@@ -160,6 +167,11 @@ const storedCsfloat = z.object({
   protection: z.boolean().catch(DEFAULT_CSFLOAT.protection)
 }).catch(DEFAULT_CSFLOAT);
 
+/** A value this build cannot read, such as the `true` an earlier build wrote once the card was answered, is shown. */
+const storedPrompts = z.object({
+  cslyticsSignIn: z.enum(['show', 'hidden']).catch(DEFAULT_PROMPTS.cslyticsSignIn)
+}).catch(DEFAULT_PROMPTS);
+
 /** A connection this build cannot read is the local engine: the one every desktop always drove. */
 const storedEngine = engineConnectionSchema.catch(DEFAULT_ENGINE);
 
@@ -174,6 +186,7 @@ export function settingsFrom(raw: unknown): DesktopSettings | null {
     accounts: storedAccounts(file.accounts),
     currency: storedCurrency.parse(file.currency ?? {}),
     csfloat: storedCsfloat.parse(file.csfloat ?? {}),
-    engine: storedEngine.parse(file.engine ?? {})
+    engine: storedEngine.parse(file.engine ?? {}),
+    prompts: storedPrompts.parse(file.prompts ?? {})
   };
 }

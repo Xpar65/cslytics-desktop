@@ -57,6 +57,25 @@ export class OracleAccountIssuer implements AccountIssuer {
     for (const session of this.sessions.values()) session.revoked = true;
   }
 
+  /**
+   * A session already established for `userId`, whose refresh token is `refreshToken`: what a
+   * profile seeded signed in holds in its vault, so a journey starts signed in without a browser
+   * (portfolio prices plan §7.6).
+   */
+  seedSession(userId: string, refreshToken: string, deviceLabel = 'CSlytics Desktop'): void {
+    const session: Session = {
+      id: `session-${this.sessions.size + 1}`,
+      userId,
+      deviceLabel,
+      createdAt: this.now(),
+      current: refreshToken,
+      previous: null,
+      rotatedAt: this.now(),
+      revoked: false
+    };
+    this.sessions.set(session.id, session);
+  }
+
   /** The next refresh is carried out, and its answer lost on the way back. */
   loseNextRefreshResponse(): void {
     this.loseNext = true;

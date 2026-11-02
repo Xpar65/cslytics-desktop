@@ -318,9 +318,8 @@ function wearChip(tier: (typeof WEAR_TIERS)[number]): FilterChip {
 /**
  * Add a chip, replacing rather than conflicting where the kind is exclusive.
  *
- * A draft may be just a kind and a text — which is how the Location select and the "Tradable
- * only" pill add chips. They go through the same grammar as typing does, so there is one filter
- * model rather than two that can disagree.
+ * A draft may be just a kind and a text, and goes through the same grammar as typing does, so
+ * there is one filter model rather than two that can disagree.
  */
 export function addChip(chips: readonly FilterChip[], draft: FilterChip | { kind: ChipKind; text: string }): FilterChip[] {
   const chip = 'minWear' in draft || 'op' in draft || 'quality' in draft || 'location' in draft || 'lock' in draft || 'rarityId' in draft
@@ -628,7 +627,7 @@ export function chipsToFilter(chips: readonly FilterChip[]): {
         break;
       case 'unit':
         // A unit is in storage by definition, and the engine already filters by `casketId`. Saying
-        // the location too is what lets the Location select show where the bar is looking.
+        // the location too keeps the filter one answer to "where", whichever chip asked it.
         if (chip.casketId) { location = 'CASKET'; casketId = chip.casketId; }
         break;
       case 'lock':

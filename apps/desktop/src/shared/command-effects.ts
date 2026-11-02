@@ -145,9 +145,11 @@ export const COMMAND_EFFECTS = {
   'release.status': 'always',
   'release.check': 'always',
   'release.install': 'always',
+  'release.notes': 'always',
   'settings.read': 'local',
   'settings.write': 'local',
   'settings.launch': 'local',
+  'settings.prompts': 'local',
   // Signing in to CSlytics changes nothing at a venue, and a retired version keeps it.
   'cslytics.status': 'local',
   'cslytics.signIn': 'local',

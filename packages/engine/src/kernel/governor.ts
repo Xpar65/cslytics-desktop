@@ -188,6 +188,9 @@ export const TRADE_HISTORY_PAGE_BUDGET: BucketSpec = { capacity: 1, refillPerSec
  */
 export const MARKET_HISTORY_SHARED_BUDGET: BucketSpec = { capacity: 4, refillPerSecond: 0.2 };
 
+/** How often a read waiting for its token asks whether to hand its lane back: the longest a person then waits behind it. */
+export const HAND_BACK_POLL_MS = 500;
+
 /**
  * The read budgets, by transport.
  *
@@ -261,6 +264,21 @@ export class AccountEndpointGovernors {
   async admitRead(accountId: string, transport: Transport, scope: string): Promise<CircuitBreaker> {
     for (const bucket of this.readBuckets(accountId, transport, scope)) await bucket.take();
     return this.breakerFor(accountId, scope);
+  }
+
+  /**
+   * Takes the transport's tokens as `admitRead` does, unless `handBack` turns true while it waits:
+   * then it takes none and answers `false`. For the next page of a history walk, whose token can be
+   * fifteen seconds away (history backfill plan D4): asleep on it, the walk held its lane, and a
+   * person or a command queued on that lane waited the token out too.
+   */
+  async admitReadUnless(accountId: string, transport: Transport, scope: string, handBack: () => boolean): Promise<boolean> {
+    for (;;) {
+      if (handBack()) return false;
+      const waitMs = this.readAdmittedAtMs(accountId, transport, scope) - this.clock.now().getTime();
+      if (waitMs <= 0 && this.tryAdmitRead(accountId, transport, scope)) return true;
+      await this.clock.sleep(Math.min(Math.max(waitMs, 1), HAND_BACK_POLL_MS));
+    }
   }
 
   /** Charges a read learned after the call: a unit read the adapter reports went to the wire. */

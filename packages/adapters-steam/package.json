@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./econ-attributes": "./src/econ-attributes.ts",
     "./market": "./src/market.ts",
     "./trade": "./src/trade.ts"
   },

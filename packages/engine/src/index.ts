@@ -95,7 +95,7 @@ export type { ConnectionRow, ConnectionStatus, CsfloatRestriction, CsfloatStall,
 export { MARKETPLACE_CONSENTS } from './kernel/marketplace-commitments.js';
 export type { MarketplaceConsent } from './kernel/marketplace-commitments.js';
 export { COMMITTING_STATUSES, offerStatus, reversesDelivery, settlesDelivery, tradeStatus } from './policy/trade-status.js';
-export { UNSETTLED_REREAD_MS } from './surfaces/trades.js';
+export { UNSETTLED_REREAD_EVERY_MS, UNSETTLED_REREAD_MS } from './surfaces/trades.js';
 export type { OfferStatus, TradeStatus } from './policy/trade-status.js';
 export { EngineViews } from './read/views.js';
 export type { AccountHoldings, MarketView, PlannedAction, SurfaceEvidence, VenueWallet } from './read/views.js';
@@ -168,7 +168,7 @@ export type { VenueProfile, OrderClassification, HistoryCoverage } from './surfa
 export { TransferPlanner, MAX_TRADE_OFFER_ITEMS } from './policy/transfer-planner.js';
 export type { TransferPlan, TransferPreview, TransferRequest } from './policy/transfer-planner.js';
 export { TransferService } from './orchestrate/transfer.js';
-export type { TransferServices } from './orchestrate/transfer.js';
+export type { Driving, TransferServices } from './orchestrate/transfer.js';
 export { TransferStore, assetsOf, transferHopId, ACCOUNT_TRANSFER, ENDED_OFFER_STATES } from './db/transfers.js';
 export type { TransferAsset, TransferBatch, TransferMember, ObservedOffer } from './db/transfers.js';
 export { AssetEvidenceStore } from './db/asset-evidence.js';
@@ -179,7 +179,7 @@ export type { CsfloatCheck, TradeCsfloatLink, TradeEntry, TradeEntryRequest, Tra
 export { surfaceCoverage, historyCoverage, HISTORY_SURFACES } from './read/queries/coverage.js';
 export type { SurfaceCoverage, HistoryCoverageRow, HistorySurface } from './read/queries/coverage.js';
 export type { TransferPageRow } from './read/queries/records.js';
-export { InGameStoreService, STORE_SHEET_SURFACE, STORE_APPROVAL_TIMEOUT_MS, STORE_AMOUNT_BASIS, STORE_CURRENCY_LABEL, STORE_LINES_MAX, STORE_LINE_QUANTITY_MAX } from './surfaces/in-game-store.js';
+export { InGameStoreService, STORE_SHEET_SURFACE, STORE_APPROVAL_TIMEOUT_MS, STORE_AMOUNT_BASIS, STORE_LINES_MAX, STORE_LINE_QUANTITY_MAX } from './surfaces/in-game-store.js';
 export type { StorePurchaseRequest, StorePurchaseLineRequest } from './surfaces/in-game-store.js';
 export { InGameStoreStore, STORE_PURCHASE_OPEN_STATES, STORE_PURCHASE, STORE_HOPS, storeHopId, parseItemIds } from './db/in-game-store.js';
 export type { StorePurchaseRow, StorePurchaseLineRow, StorePurchaseState, StoreSheetRow, StoreEntryRow, StoreHop, StorePurchaseParams } from './db/in-game-store.js';

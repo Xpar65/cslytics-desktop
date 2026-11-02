@@ -8,8 +8,8 @@ import { VenueMark } from '../../components/VenueMark.js';
 import { VenueFilter, useOfferedVenue } from '../../components/VenueFilter.js';
 import { VENUE_ID, VENUE_LABEL, VENUE_ORDER, byVenue, venueOffer, type VenueId } from '../../lib/marketplaces.js';
 import { useWorkRefresh } from '../work/WorkIndicator.js';
-import { formatAmount } from '../../lib/money.js';
-import { currencyCode, formatDateTime, formatRelative, plural } from '../../lib/labels.js';
+import { currencyCodeOf, formatAmount } from '../../lib/money.js';
+import { formatDateTime, formatRelative, plural } from '../../lib/labels.js';
 import { SortControl, type SortDirection, type SortOption } from '../../components/SortControl.js';
 import { FilterBar } from '../../components/FilterBar.js';
 import { BUY_ORDER_CHIP_KINDS, chipsToListingFilter } from '../../components/filter-grammar.js';
@@ -252,7 +252,7 @@ export function BuyOrdersView({ accountIds, accounts = [], setUp, onAddVenue }: 
           {money.map((bucket) => (
             <Metric
               key={`${bucket.venue}:${bucket.currency ?? 'unknown'}`}
-              label={money.length > 1 ? `Committed · ${VENUE_LABEL[bucket.venue]} · ${currencyCode(bucket.currency) || 'unknown currency'}` : 'Committed'}
+              label={money.length > 1 ? `Committed · ${VENUE_LABEL[bucket.venue]} · ${currencyCodeOf(bucket.currency) || 'unknown currency'}` : 'Committed'}
               icon="wallet"
               value={<Money cents={bucket.openCents} currency={bucket.currency} />}
             />

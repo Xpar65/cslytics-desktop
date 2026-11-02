@@ -1,3 +1,4 @@
+import { quoteFromBuyer, quoteFromReceive } from '@cslytics/ports';
 import type { IconName } from './Icon.js';
 import { parseMoney } from '../lib/labels.js';
 
@@ -273,4 +274,23 @@ export function reduce<E extends StagedEntry>(state: WorkspaceState<E>, action: 
 /** Cents as a money field holds them: no currency mark, always two places. */
 export function dollars(cents: number): string {
   return `${cents < 0 ? '-' : ''}${(Math.abs(cents) / 100).toFixed(2)}`;
+}
+
+/**
+ * What the buyer would pay for a row as typed, read through its venue's fees, or `null` when the
+ * figure is not a price. A buyer price is what a listing shows, so it is the figure a row is
+ * compared with on a float curve.
+ */
+export function buyerCentsOf(venue: Venue, price: string, basis: PriceBasis): number | null {
+  const typed = parseMoney(price);
+  if (typed === null) return null;
+  return (basis === 'receive' ? quoteFromReceive(venue, typed) : quoteFromBuyer(venue, typed)).buyerCents;
+}
+
+/**
+ * The currency a row's figures are in: USD on CSFloat everywhere, the account's wallet on Steam
+ * (money and currency page §2). A typed price is in this currency and is sent as typed.
+ */
+export function venueCurrency(venue: Venue, wallet: number | null | undefined): number | null {
+  return venue === 'csfloat' ? 1 : wallet ?? null;
 }

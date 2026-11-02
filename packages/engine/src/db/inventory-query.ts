@@ -138,12 +138,16 @@ export function inventoryQuery(
       }
       if (filter.excludeCannotTrade) where += ` AND NOT (${cannotTradeSql('inventory')})`;
       if (filter.tradableOnly) {
-        // Per unit, for either kind: the Community read names each asset, and every row carries
-        // its own two locks.
-        where += ` AND location='MAIN' AND EXISTS (SELECT 1 FROM asset_evidence t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community' AND t.tradable=1
-          AND t.last_seen_obs=(SELECT MAX(o.id) FROM observation o WHERE o.account_id=t.account_id AND o.surface='steam-trade-inventory')
-          AND EXISTS (SELECT 1 FROM observation o WHERE o.id=t.last_seen_obs AND o.complete=1 AND o.error IS NULL))`;
-        where += ` AND ${lockFree}`;
+        // Per unit, for either kind and in any place: free of both locks and of `cannot trade`.
+        // The Community read is walked only for a transfer or a sale, so it can take an item out
+        // but is never required to let one in: requiring it showed nothing on an account that had
+        // never been read (2026-10-30). It takes one out only when no lock explains its no — a
+        // lock running when it was read ends on its own clock, and a coin's no never does. The
+        // transfer planner still demands a current yes before it sends anything.
+        where += ` AND ${lockFree} AND NOT (${cannotTradeSql('inventory')})
+          AND NOT EXISTS (SELECT 1 FROM asset_evidence t JOIN observation o ON o.id=t.last_seen_obs
+            WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community' AND t.tradable=0
+            AND IFNULL(inventory.tradable_after,'')<=o.started_at AND IFNULL(inventory.trade_protected_until,'')<=o.started_at)`;
         params.push(now, now);
       }
       // Wear, seed and normalised-float bands are questions about an individual item. A case

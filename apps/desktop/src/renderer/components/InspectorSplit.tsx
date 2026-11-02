@@ -9,18 +9,17 @@ const LAYOUTS: readonly InspectorLayout[] = ['grouped', 'tiles', 'listings', 'tr
  *
  * Inventory and Listings are the same page twice — something tiled on the left, the thing just
  * clicked on the right — so the join is one component and the two pages differ only in what they
- * put either side of it. Inventory has a filter rail as well; Listings filters from its toolbar
- * and passes none.
+ * put either side of it. Both filter from their toolbars and pass no rail; Trades passes its list
+ * of trades as one.
  *
  * The width is per layout and remembered per window, like the view itself. Mid-drag it goes
  * straight onto the grid as a custom property, and React hears about it once, on release, so
  * moving the pointer never re-renders a page of rows or tiles.
  */
-export function InspectorSplit({ layout, rail, railState = 'open', railWidth, inspector, children }: {
+export function InspectorSplit({ layout, rail, railWidth, inspector, children }: {
   layout: InspectorLayout;
-  /** The filter rail, for a page that has one. */
+  /** A column before the list, for a page that has one: Trades' list of trades. */
   rail?: React.ReactNode;
-  railState?: 'open' | 'collapsed' | undefined;
   /** A rail that lists things rather than filters them — Trades' list of trades — needs more room. */
   railWidth?: 'wide' | undefined;
   /** `null` is the page used as a picker: the list alone, with nothing to act on it. */
@@ -52,7 +51,6 @@ export function InspectorSplit({ layout, rail, railState = 'open', railWidth, in
       ref={split}
       className="inventory-split"
       data-rail={rail ? undefined : 'none'}
-      data-filters={railState}
       data-rail-width={railWidth}
       data-picker={inspector === null || undefined}
       data-resizing={resizing || undefined}

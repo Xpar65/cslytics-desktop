@@ -10,8 +10,8 @@
  * it beside one trade's items, with the list of trades in a wide rail on the other side.
  *
  * These are the only copies of the numbers. `InspectorSplit` hands them to the grid as custom
- * properties, and the CSS track clamps with the same bounds, so a narrowed window or an opened
- * filter rail cannot squeeze the list below its minimum between drags.
+ * properties, and the CSS track clamps with the same bounds, so a narrowed window or a rail
+ * cannot squeeze the list below its minimum between drags.
  */
 
 export type InspectorLayout = 'grouped' | 'tiles' | 'listings' | 'trades';

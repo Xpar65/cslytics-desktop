@@ -15,25 +15,27 @@ import { plural } from '../../lib/labels.js';
 import { Icon, type IconName } from '../../components/Icon.js';
 import { Tip } from '../../components/Tip.js';
 import { Empty, Notice, Panel, Skeleton, Spinner } from '../../components/ui.js';
-import { fillLabel, pricingProgress } from './fill-label.js';
+import { fillLabel, pricingProgress, shortFill } from './fill-label.js';
 import { MoneyFigures, type Figure } from './money-figures.js';
 import type { ValuationState } from './use-valuation.js';
 
 /**
  * The first thing on the portfolio page: one "Total holdings" figure and the bar under it. The bar
  * is every wallet, each venue in its own hue with its pending part hatched, and the inventory at
- * the Steam mid price. Neither listings nor buy orders are segments: a listed item stays a holding
+ * its market value, the Steam mid price (portfolio and pricing plan D7); the float value is the
+ * Value panel's, beside the market value, never here. Neither listings nor buy orders are segments: a listed item stays a holding
  * until it sells and is inside the appraisal already (N-SELL-06), and a buy order is inside the
  * Steam wallet; either would count the same cents twice. Both keep their cards below.
  *
- * Every figure is main's, in the base (plan §5.2); a currency with no rate is left out, named, and
- * makes the figure a floor rather than a smaller total (plan §5.4). When nothing converts and
+ * Every figure is main's, in the base (money and currency page §3); a currency with no rate is left out, named, and
+ * makes the figure a floor rather than a smaller total (money and currency page §5). When nothing converts and
  * nothing is in the base, the wallets are printed side by side and no bar is drawn, because its
  * parts have no common width.
  *
  * No total is shown until every held kind has been asked for a price (`valued`). A figure over
  * half the books is a floor, and a floor that keeps moving as books arrive reads as a total that
- * cannot make up its mind. Until then the figure's place says what the fill has left to do.
+ * cannot make up its mind. Until then the figure's place says what the fill has left to do. It
+ * never waits for the float curves, which price nothing in it.
  *
  * What a figure means is in a tip on it, not in a sentence under it. What changes how far a figure
  * can be trusted — an unfinished walk, a missing rate, a paused fill — is a chip under the figure,
@@ -119,6 +121,7 @@ export function HoldingsPanel({
                 <>
                   Every wallet, spendable and pending, plus every item at the midpoint of Steam&apos;s lowest ask and highest bid.
                   A listed item is counted once, as an item; buy orders are inside the Steam wallet already.
+                  The float value, each skin at its own float, is under Inventory value and is not in this figure.
                   {base ? ` Shown in ${base}; other currencies are converted at CSlytics's daily rate, and Steam converts at its own.` : ''}
                 </>
               } />
@@ -165,6 +168,7 @@ export function HoldingsPanel({
                 {answer.fill === 'stopped' ? (
                   <Chip tone="warn" icon="pause" tip="Steam asked this machine to slow down. The figures are the last prices read.">Prices paused until {stoppedAt}</Chip>
                 ) : null}
+
                 {unpriced > 0 ? (
                   <Chip icon="info" tip="An item with no price is left out, never counted as zero. The Priced card below says why each is unpriced.">
                     {plural(unpriced, 'item')} unpriced
@@ -180,10 +184,10 @@ export function HoldingsPanel({
           </div>
 
           <dl className="holdings-evidence">
-            <Evidence icon="activity" label="Prices" testId="portfolio-fill" state={answer?.fill ?? 'idle'} valued={valued}
-              value={answer === null ? (loading ? 'reading' : 'none yet') : answer.fill === 'complete' && oldest ? oldest.label : shortFill(answer.fill, answer.status)}
+            <Evidence icon="activity" label="Prices" testId="portfolio-fill" state={answer?.fill ?? 'idle'} valued={valued} source={answer?.prices ? 'cslytics' : 'steam'}
+              value={answer === null ? (loading ? 'reading' : 'none yet') : answer.fill === 'complete' && oldest && !answer.prices ? oldest.label : shortFill(answer)}
               tone={oldest?.tone ?? 'none'}
-              tip={answer === null ? 'No prices read yet.' : `${fillLabel(answer)}.${oldest ? ` The oldest price was read ${oldest.label}.` : ''}`} />
+              tip={answer === null ? 'No prices read yet.' : `${fillLabel(answer)}.${oldest ? ` The oldest price was observed ${oldest.label}.` : ''}`} />
             <Evidence icon="store" label="Market" age={freshness(totals.market.observedAt, now)} partial={!totals.market.settled}
               tip="The last walk of the Steam market: wallet, listings and buy orders." />
             <Evidence icon="package" label="Inventory" age={freshness(totals.inventory.observedAt, now)} partial={!totals.inventory.settled}
@@ -221,19 +225,7 @@ export function HoldingsPanel({
   );
 }
 
-/** What the fill is doing, in the few characters a chip has. The tip says it in full. */
-function shortFill(fill: string, status: { fillDone: number; fillTotal: number }): string {
-  switch (fill) {
-    case 'filling': return status.fillTotal > 0 ? `${status.fillDone.toLocaleString()} / ${status.fillTotal.toLocaleString()}` : 'reading';
-    case 'stopped': return 'paused by Steam';
-    case 'slowed': return 'slowed';
-    case 'paused': return 'paused';
-    case 'complete': return 'read';
-    default: return 'idle';
-  }
-}
-
-function Evidence({ icon, label, tip, age, partial, value, tone, testId, state, valued }: {
+function Evidence({ icon, label, tip, age, partial, value, tone, testId, state, valued, source }: {
   icon: IconName;
   label: string;
   tip: string;
@@ -244,11 +236,13 @@ function Evidence({ icon, label, tip, age, partial, value, tone, testId, state, 
   testId?: string | undefined;
   state?: string | undefined;
   valued?: boolean | undefined;
+  /** Where the prices came from, for the Prices line: CSlytics's snapshot or Steam's book. */
+  source?: 'cslytics' | 'steam' | undefined;
 }): React.JSX.Element {
   return (
     <div>
       <dt><Icon name={icon} size={12} /> {label}</dt>
-      <dd data-tone={age?.tone ?? tone ?? 'none'} data-testid={testId} data-state={state} data-valued={valued}>
+      <dd data-tone={age?.tone ?? tone ?? 'none'} data-testid={testId} data-state={state} data-valued={valued} data-source={source}>
         <Tip content={tip}>{value ?? `${age?.label ?? '—'}${partial ? ' · partial' : ''}`}</Tip>
       </dd>
     </div>

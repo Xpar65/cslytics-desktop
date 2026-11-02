@@ -69,7 +69,6 @@ export const dark: Theme = {
     '--cs-hold-csfloat': '#E08D5B',
     '--cs-hold-inventory': '#8FB889',
     '--cs-hold-listed': '#4FB6A5',
-    '--cs-hold-unconfirmed': '#B48CE0',
     '--cs-hold-hatch': 'rgba(255, 255, 255, 0.5)',
 
     '--cs-series-1': '#6E9BF0',

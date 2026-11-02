@@ -9,7 +9,9 @@ does with Steam depends on it.
 - The browser sign-in: an authorization code with PKCE (RFC 7636), received on a one-shot listener
   on `127.0.0.1` as RFC 8252 describes for native apps (`src/loopback.ts`, `src/pkce.ts`). The
   decision about each request to that listener is `CallbackGate`, so it can be proved without a
-  socket.
+  socket. The website's answer, a code or a decline, is met with a redirect back to the website's own
+  page for it (`landingUrls` in `src/website.ts`), a fixed URL that carries nothing from the callback,
+  so the browser ends on cslytics.com and not on a page served from this computer.
 - The website's four calls, and the one rule about their answers that matters most: only the
   website *refusing* a grant signs a person out. A timeout, a 5xx, a 429 or a body that does not
   parse is `unavailable`, and leaves everything as it was (`src/issuer.ts`).
