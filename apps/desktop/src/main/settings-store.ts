@@ -1,19 +1,24 @@
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
+  DEFAULT_APPLIED_VALUE,
   DEFAULT_CSFLOAT, DEFAULT_CURRENCY,
   DEFAULT_ENGINE,
   DEFAULT_LAUNCH,
   DEFAULT_PROMPTS,
   DEFAULT_SETTINGS,
+  DEFAULT_TIME,
   engineConnectionSchema,
   settingsSchema,
+  timeSettingsSchema,
   type AccountLaunch,
   type AppearanceSettings,
+  type AppliedValueSettings,
   type CurrencySettings,
   type DesktopSettings,
   type EngineConnection,
-  type PromptsSettings
+  type PromptsSettings,
+  type TimeSettings
 } from '../shared/api.js';
 import { THEME_PREFERENCES } from '../shared/themes/index.js';
 
@@ -96,6 +101,16 @@ export class SettingsStore {
     return this.write({ ...this.settings, prompts });
   }
 
+  /** Which time zone dates are printed in, the same way. */
+  writeTime(time: TimeSettings): DesktopSettings {
+    return this.write({ ...this.settings, time });
+  }
+
+  /** The three shares the applied-value estimate is made from, the same way. */
+  writeAppliedValue(appliedValue: AppliedValueSettings): DesktopSettings {
+    return this.write({ ...this.settings, appliedValue });
+  }
+
   /**
    * Pins the base currency from the first account's wallet, once. A base already pinned or
    * chosen is left alone, so adding or removing accounts later never moves the figures.
@@ -175,6 +190,17 @@ const storedPrompts = z.object({
 /** A connection this build cannot read is the local engine: the one every desktop always drove. */
 const storedEngine = engineConnectionSchema.catch(DEFAULT_ENGINE);
 
+/** A zone this build's `Intl` does not know follows Windows, as every desktop did before the section existed. */
+const storedTime = timeSettingsSchema.catch(DEFAULT_TIME);
+
+/** Each share on its own: one that is not a percentage costs that share its default, not the other two. */
+const storedShare = (fallback: number): z.ZodCatch<z.ZodNumber> => z.number().min(0).max(100).catch(fallback);
+const storedAppliedValue = z.object({
+  sameStickerPercent: storedShare(DEFAULT_APPLIED_VALUE.sameStickerPercent),
+  mixedStickerPercent: storedShare(DEFAULT_APPLIED_VALUE.mixedStickerPercent),
+  charmPercent: storedShare(DEFAULT_APPLIED_VALUE.charmPercent)
+}).catch(DEFAULT_APPLIED_VALUE);
+
 /** A parsed file as settings, or null when it is not a settings file at all. */
 export function settingsFrom(raw: unknown): DesktopSettings | null {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -187,6 +213,8 @@ export function settingsFrom(raw: unknown): DesktopSettings | null {
     currency: storedCurrency.parse(file.currency ?? {}),
     csfloat: storedCsfloat.parse(file.csfloat ?? {}),
     engine: storedEngine.parse(file.engine ?? {}),
-    prompts: storedPrompts.parse(file.prompts ?? {})
+    prompts: storedPrompts.parse(file.prompts ?? {}),
+    time: storedTime.parse(file.time ?? {}),
+    appliedValue: storedAppliedValue.parse(file.appliedValue ?? {})
   };
 }

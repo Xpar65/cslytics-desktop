@@ -1,11 +1,11 @@
-import type { MutationOutcome } from '@cslytics/ports';
+import { csfloatListingInEffect, type CsfloatStatedListing, type MutationOutcome } from '@cslytics/ports';
 import type { EngineContext } from '../kernel/context.js';
 import { executeMutation } from '../kernel/context.js';
-import { CsfloatStore, type CsfloatContract } from '../db/csfloat.js';
+import { CSFLOAT_LISTING_SURFACE, CsfloatStore, isAnswerObservation, type CsfloatContract } from '../db/csfloat.js';
 import { AssetEvidenceStore } from '../db/asset-evidence.js';
 import { MarketplaceStore } from '../db/marketplace.js';
 import type { ActionRow, ObservationRow } from '../db/database.js';
-import { WorkStore, type WorkStepRow } from '../db/work.js';
+import { WorkStore, isSettled, type WorkStepRow } from '../db/work.js';
 import { attemptReturned, attemptWatermark, locationEvidence, postAttempt, type ProofNeed, type Surface, type SurfaceRef } from '../kernel/evidence.js';
 
 /** The listing id a create's answer named, as CSFloat writes one (a digit string); null when the answer named none. */
@@ -20,7 +20,8 @@ import { STEAM_LISTED_SQL } from '../db/commitment.js';
 import type { CommandAuthority } from '../db/alphabets.js';
 import { claimForPerson, strategyRefusal, type AuthorityMember } from '../policy/authority.js';
 import {
-  CREATE_CLOCK_TOLERANCE_MS, CSFLOAT_LIST_EVIDENCE, CSFLOAT_LIST_LIMIT, CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, VISIBILITY_DEADLINE_MS, VISIBILITY_READ_OFFSETS_MS,
+  CREATE_CLOCK_TOLERANCE_MS, CSFLOAT_INVENTORY_WAIT_REASON, CSFLOAT_LIST_EVIDENCE, CSFLOAT_LIST_LIMIT, CSFLOAT_PERSON_LIST_EVIDENCE, EDIT_EVIDENCE_MARGIN_MS,
+  CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, INVENTORY_WAIT, isInventoryLag, type InventoryWait,
   type CsfloatSellGroupMember, type CsfloatSellMember, type CsfloatSellRequest
 } from '../policy/csfloat-selling.js';
 import type { CsfloatListingService } from '../surfaces/csfloat-listings.js';
@@ -41,7 +42,18 @@ export type CsfloatSellingServices = { listings: CsfloatListingService; inventor
   /** Settles on the caller's stack when a decision follows the driver's own read. */
   settle: Settling;
   /** The read broker: every read here is a need it answers. */
-  reads: Reading };
+  reads: Reading;
+  /**
+   * Tells whoever watches the record that a surface changed with no walk of the broker's behind it:
+   * a reprice settled on its answer, which no read follows. Absent, nobody is told.
+   */
+  announce?: (accountId: string, surfaces: readonly string[]) => void;
+  /**
+   * Has the read loop look again, now, at what this account's waiting work needs read: for a
+   * reprice that came out of its send unsettled after the loop had already looked. Absent, the
+   * loop finds it on its next turn.
+   */
+  reconsider?: (accountId: string) => void };
 
 /**
  * The three kinds of CSFloat listing work. Each is a command kind, the kind of the step that
@@ -89,8 +101,11 @@ export class CsfloatSellingService {
   private readonly advancing = new AccountLock();
   private readonly scheduled = new Set<string>();
   private readonly running = new Map<string, Promise<void>>();
-  /** At most one wait for CSFloat per account, however many listings are waiting. */
-  private readonly waits = new Map<string, Promise<void>>();
+  /** Each account's one timer for its wait on CSFloat: when it fires, and which arming set it. */
+  private readonly waits = new Map<string, { at: number; generation: number }>();
+  private waitGeneration = 0;
+  /** The reprices whose answer this run is still judging: nothing reads for one meanwhile (`needs`). */
+  private readonly judging = new Set<string>();
   private stopped = false;
   constructor(protected readonly context: EngineContext, protected readonly services: CsfloatSellingServices) {
     this.store = new CsfloatStore(context.database);
@@ -138,8 +153,13 @@ export class CsfloatSellingService {
   async submit(request: CsfloatSellRequest): Promise<WorkStepRow[]> {
     const admitted = this.work.steps(request.commandId).length > 0;
     if (!admitted) {
+      // A person's list reads past the holds, as their Refresh does, and reads CSFloat's own copy of
+      // the inventory too when the last complete read is older than its window, so an item CSFloat
+      // stopped holding is refused while they look (CSF-23). A strategy's waits the holds out like
+      // any other work and never reads that copy, whose reads are 120 a day (CSF-58).
+      const strategy = request.authority === 'STRATEGY';
       for (const accountId of new Set(request.members.map(member => member.accountId))) {
-        await this.services.reads.ensureFresh(accountId, CSFLOAT_LIST_EVIDENCE, 'person');
+        await this.services.reads.ensureFresh(accountId, strategy ? CSFLOAT_LIST_EVIDENCE : CSFLOAT_PERSON_LIST_EVIDENCE, strategy ? 'work' : 'person');
       }
     }
     const steps = this.queue(request);
@@ -148,15 +168,35 @@ export class CsfloatSellingService {
   }
 
   /**
-   * A reprice or a cancel, the same way: the listing is read again first, because `validateEdit`
-   * judges the contract's own observation and refuses one older than its window, then it is
-   * queued and sent behind the reply.
+   * A reprice or a cancel, the same way: `validateEdit` judges the contract's own observation and
+   * refuses one older than its window, so the listing is read again first unless the record already
+   * holds a read young enough for the send too (`editEvidenceFresh`, CSF-57); then it is queued and
+   * sent behind the reply.
    */
   async submitEdit(accountId: string, commandId: string, listingId: string, priceCents?: number, force = false, authority: CommandAuthority = 'HUMAN'): Promise<WorkStepRow> {
-    if (!this.work.step(commandId)) await this.listing(accountId, listingId, 'person');
+    if (!this.work.step(commandId) && !this.editEvidenceFresh(accountId, listingId)) await this.listing(accountId, listingId, 'person');
     const step = this.queueEdit(accountId,commandId,listingId,priceCents,force,authority);
     this.schedule(accountId);
     return step;
+  }
+
+  /**
+   * Whether the record already holds what admission and the send judge a reprice or delist on: the
+   * listing up at a fixed price, in a contract a complete read of the current connection wrote,
+   * begun no more than `EDIT_EVIDENCE_MARGIN_MS` ago. A stall walk writes every listing's contract
+   * under its own observation, so an edit decided on a fresh walk needs no read of its own before
+   * it is admitted. Before CSF-57 every edit read its listing first: a pass of many reprices
+   * each waited for one, a CSFloat listing read every five seconds, minutes ahead of every
+   * delivery's reads (measured 2026-11-02). Isolated so a saboteur can read every time.
+   */
+  protected editEvidenceFresh(accountId: string, listingId: string): boolean {
+    const listing = this.store.contract(accountId, listingId);
+    const observation = listing && this.context.database.observation(accountId, listing.observation_id);
+    const connection = new MarketplaceStore(this.context.database).connection(accountId, 'csfloat');
+    if (!listing || listing.type !== 'buy_now' || listing.state !== 'listed' || !observation?.complete || observation.error
+      || connection?.status !== 'CONNECTED' || observation.generation !== connection.generation) return false;
+    const age = Date.parse(this.context.now()) - Date.parse(observation.started_at);
+    return age >= 0 && age <= EDIT_EVIDENCE_MARGIN_MS;
   }
 
   /**
@@ -194,14 +234,16 @@ export class CsfloatSellingService {
    * for the next pass.
    *
    * A member admitted from a storage unit gets here twice more first: `advanceRetrievals` sends
-   * and settles its retrieve, and `awaitVisibility` holds it until CSFloat's own read shows the
-   * item, at which point its listing hop is an ordinary queued create.
+   * and settles its retrieve, and `awaitVisibility` makes its listing hop an ordinary queued create
+   * once the item is loose. A listing CSFloat refused because its copy of the inventory lags waits
+   * as `RETRYING`, and `resumeVenueWaits` gives it a fresh action when its moment comes; it is sent
+   * here like any queued one.
    */
   async advance(accountId: string): Promise<void> {
     const work = this.advancing.run(accountId,async () => {
       const db = this.context.database;
       if (!new MarketplaceStore(db).connection(accountId,'csfloat')?.credential_ref || !this.context.ports.csfloat) return;
-      for (const stage of [() => this.advanceRetrievals(accountId), () => this.awaitVisibility(accountId)]) {
+      for (const stage of [() => this.advanceRetrievals(accountId), () => this.awaitVisibility(accountId), () => this.resumeVenueWaits(accountId)]) {
         if (this.stopped) return;
         try { await stage(); } catch (error) {
           if (this.stopped) return;
@@ -209,7 +251,7 @@ export class CsfloatSellingService {
         }
       }
       const queued = this.work.openOf(accountId, CSFLOAT_LISTING_KINDS, CSFLOAT_LISTING_KINDS)
-        .filter(step => step.state === 'QUEUED' && step.action_id !== null && db.action(step.action_id)?.state === 'READY');
+        .filter(step => (step.state === 'QUEUED' || step.state === 'RETRYING') && step.action_id !== null && db.action(step.action_id)?.state === 'READY');
       for (const { id } of queued) {
         if (this.stopped) return;
         try {
@@ -226,17 +268,27 @@ export class CsfloatSellingService {
         // delisted; for a create, the listing the answer named. This is the first such read, not
         // the only one: until one settles an edit the refresh loop keeps reading (`needs`), and a
         // create is also proved by the stall walk `mutation-settled` asks for, which its cadence repeats.
+        // A reprice its answer settled is read for by nothing: the answer was the observation.
         const step = this.work.step(id);
-        if (step?.target_id) await this.listing(accountId, step.target_id, 'work');
+        if (step?.target_id && !this.settledOnAnswer(step)) await this.listing(accountId, step.target_id, 'work');
       }
     });
     this.running.set(accountId,work);
     try { await work; } finally { if (this.running.get(accountId) === work) this.running.delete(accountId); }
   }
 
-  /** One listing's own read, begun now: the proof a delist or reprice needs (CSF-45). */
+  /** One listing's own read, begun now: the proof a delist needs, and a reprice whose answer settled nothing (CSF-45, CSF-72). */
   private async listing(accountId: string, listingId: string, priority: 'person' | 'work'): Promise<void> {
-    await this.services.reads.need(accountId, { ref: { surface: 'csfloat-listing', scope: { kind: 'item', id: listingId } }, startedAfter: this.context.now(), priority });
+    await this.services.reads.need(accountId, { ref: { surface: CSFLOAT_LISTING_SURFACE, scope: { kind: 'item', id: listingId } }, startedAfter: this.context.now(), priority });
+  }
+
+  /**
+   * Whether a hop was settled on its send's own answer: the observation it carries is one no read
+   * made (`isAnswerObservation`). Such a hop is read for by nothing. Isolated so a saboteur can
+   * read the listing after every reprice all the same, as the send did before CSF-70.
+   */
+  protected settledOnAnswer(step: WorkStepRow): boolean {
+    return isSettled(step) && isAnswerObservation(this.context.database.observation(step.account_id, step.observation_id));
   }
 
   /**
@@ -398,7 +450,7 @@ export class CsfloatSellingService {
     if (!this.store.inStall(accountId,listingId)) throw new Error('Listing is no longer in the authenticated own book');
     if (priceCents !== undefined && (!Number.isSafeInteger(priceCents) || priceCents < 3)) throw new Error('CSFloat listing price must be at least 3 USD cents');
     // The price-change cadence (`kernel/price-cadence.ts`): the last change is the last reprice of
-    // this listing that a read proved, and a listing never repriced may change now.
+    // this listing that ended done, and a listing never repriced may change now.
     if (priceCents !== undefined) {
       const cadence = priceChangeRefusal({ venue: 'csfloat', lastChangedAt: this.store.lastPriceChangeAt(accountId,listingId), currentCents: listing.price_cents,
         requestedCents: priceCents, now: this.context.now(), force });
@@ -447,7 +499,8 @@ export class CsfloatSellingService {
     if (!initial) throw new Error('Unknown CSFloat operation');
     return this.context.locks.run(initial.account_id,async () => {
       const step = this.work.step(id)!, db = this.context.database, action = step.action_id ? db.action(step.action_id) : undefined;
-      if (!action || action.state !== 'READY' || step.state !== 'QUEUED' || !(CSFLOAT_LISTING_KINDS as readonly string[]).includes(step.kind)) return null;
+      // `RETRYING` with a `READY` action is a listing waiting on CSFloat whose moment came (`resumeVenueWaits`).
+      if (!action || action.state !== 'READY' || !['QUEUED','RETRYING'].includes(step.state) || !(CSFLOAT_LISTING_KINDS as readonly string[]).includes(step.kind)) return null;
       const params = this.paramsOf(step);
       const connection = new MarketplaceStore(db).connection(step.account_id,'csfloat'), ports = this.context.ports.csfloat;
       if (!connection?.credential_ref || !ports) throw new Error('Connect CSFloat first');
@@ -462,11 +515,15 @@ export class CsfloatSellingService {
       const admission = { rejected: null as Error | null };
       const admit = () => { try { validate(); } catch (error) { admission.rejected = error instanceof Error ? error : new Error(String(error)); throw admission.rejected; } };
       let outcome: MutationOutcome;
+      // From the moment a reprice's answer is recorded until it is judged below, its action awaits
+      // observation in the record. Nothing may read the listing for it in between (`needs`).
+      if (step.kind === CSFLOAT_REPRICE) this.judging.add(action.id);
       try {
-        outcome = await executeMutation(this.context,action, () => step.kind === CSFLOAT_CREATE
-          ? ports.listings.create(step.account_id,connection.credential_ref!,params.assetId!,params.priceCents!)
+        outcome = await executeMutation(this.context,action, async () => step.kind === CSFLOAT_CREATE
+          ? this.inventoryWait(step, await ports.listings.create(step.account_id,connection.credential_ref!,params.assetId!,params.priceCents!))
           : step.kind === CSFLOAT_REPRICE ? ports.listings.reprice(step.account_id,connection.credential_ref!,step.target_id!,params.priceCents!)
             : ports.listings.cancel(step.account_id,connection.credential_ref!,step.target_id!),admit);
+        if (step.kind === CSFLOAT_REPRICE) this.settleOnAnswer(step, action, outcome);
       } catch (error) {
         // Admission refused before any call: the command is over, durably (XLIST-11). Nothing
         // re-queues it when the setting, the connection or the network changes.
@@ -476,11 +533,192 @@ export class CsfloatSellingService {
           this.work.settle(step.id,'FAILED',null,this.context.now(),rejected.message);
         });
         throw error;
+      } finally {
+        this.judging.delete(action.id);
+        if (step.kind === CSFLOAT_REPRICE) this.lookAgain(step.account_id, action.id);
       }
-      this.work.setState(step.id,outcome.kind === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION',this.context.now(),outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : null);
+      // A read can prove the hop while the send's answer is still on its way back here: the refresh
+      // loop reads for a hop the moment its action awaits observation, and `reconcile` settles both
+      // together. The answer never takes back what a read already settled; before this a reprice
+      // proved in the same second as its send was set waiting again for good, its action already
+      // done (CSF-47, once an edit no longer read its listing before admission, CSF-57). A reprice
+      // its own answer settled a few lines up is settled the same way: nothing below touches it.
+      const settledMeanwhile = ['DONE','FAILED','STOPPED'].includes(this.work.step(step.id)?.state ?? '');
+      if (!settledMeanwhile) {
+        const now = this.context.now();
+        const waits = step.kind === CSFLOAT_CREATE && outcome.kind === 'DEFINITIVELY_REJECTED' && outcome.retryAfterMs !== undefined;
+        if (waits && isInventoryLag(outcome)) {
+          // CSFloat's copy has not caught up. The hop waits, with the moment of the next send on the
+          // attempt, and its deadline set once, at the first refusal (CSF-58).
+          this.work.update(step.id,{ state: 'RETRYING', reason: CSFLOAT_INVENTORY_WAIT_REASON,
+            deadline_at: step.deadline_at ?? new Date(Date.parse(now)+this.waitOf(step).deadlineMs).toISOString() },now);
+          this.armVisibility(step.account_id);
+        } else if (waits) {
+          // A 429: nothing was processed, and the venue named when the same request may go again.
+          this.work.update(step.id,{ state: 'RETRYING', reason: outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : null },now);
+          this.armVisibility(step.account_id);
+        } else if (step.kind === CSFLOAT_CREATE && isInventoryLag(outcome)) {
+          // The last send the schedule allows, refused like the rest.
+          this.timeOut(this.work.step(step.id)!);
+        } else {
+          this.work.setState(step.id,outcome.kind === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION',now,outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : null);
+        }
+      }
       if (step.kind === CSFLOAT_CREATE && outcome.kind === 'SUBMITTED') this.noteNamedListing(step,action);
       return outcome;
     });
+  }
+
+  /**
+   * A reprice CSFloat answered with the listing as it now is, settled on that answer (CSF-70).
+   *
+   * An answer that returns the object as it now is, is an observation of it (rule 1). So the
+   * listing's price and state as the answer stated them are recorded as the listing's own read is,
+   * under an observation whose source is the answer (`CsfloatStore.recordAnswer`), and the hop is
+   * judged on it at once by the very rules a read is judged by (`judge`): listed at the price sent,
+   * it is done; sold in the same call, it ends as a listing read as sold ends it. Both writes and
+   * the verdict are one transaction, and no read of the listing is asked for.
+   *
+   * Every other answer settles nothing here, and the listing's own read decides as it always did:
+   * no answer, a bare acknowledgement, another listing, another price, a state that is neither
+   * `listed` nor `sold`, a connection that changed while the call was out. So does a run that died
+   * before this line: the action it left recovers awaiting observation (rule 6), and its read is
+   * the proof.
+   */
+  private settleOnAnswer(step: WorkStepRow, action: ActionRow, outcome: MutationOutcome): void {
+    const db = this.context.database, accountId = step.account_id;
+    const stated = this.answered(step, outcome);
+    const attempt = db.latestAttempt(action.id);
+    const generation = this.paramsOf(step).generation;
+    if (!stated || !attempt?.finished_at || new MarketplaceStore(db).connection(accountId,'csfloat')?.generation !== generation) return;
+    const observationId = db.transaction(() => {
+      const current = this.work.step(step.id);
+      // A read may have settled it while the answer was on its way back; then the read stands.
+      if (!current || isSettled(current)) return null;
+      const id = this.store.recordAnswer(accountId, stated, generation, attempt.started_at, attempt.finished_at!);
+      if (id !== null) this.judge(current);
+      return id;
+    });
+    if (observationId === null) return;
+    // After the commit, as every observation is announced: the settler owes the account a settle,
+    // and whoever watches the record learns the listing changed, though no walk will say so.
+    this.context.signals.emit({ kind: 'observed', accountId, surface: CSFLOAT_LISTING_SURFACE, scopeId: stated.listingId, complete: true, observationId });
+    this.services.announce?.(accountId, [CSFLOAT_LISTING_SURFACE]);
+  }
+
+  /**
+   * A reprice that came out of its send still awaiting observation is owed its listing's read, and
+   * the loop that would raise it was woken by the answer while the reprice was being judged, when
+   * it asked for nothing (`needs`). So the loop is asked to look again here, once the judging is
+   * over: after an answer that settled nothing, and after a settle that threw. Otherwise the read
+   * would wait for the loop's next idle turn, up to half a minute.
+   */
+  private lookAgain(accountId: string, actionId: string): void {
+    try {
+      if (this.context.database.action(actionId)?.state === 'AWAITING_OBSERVATION') this.services.reconsider?.(accountId);
+    } catch { /* the record closed under a send that was still out */ }
+  }
+
+  /**
+   * The listing a reprice's answer stated, when that answer may settle the hop: the venue answered
+   * with the listing's id, price and state (`csfloatListingInEffect`), it is the hop's own listing
+   * at the very price the hop sent, and its state is one a reprice can leave it in, `listed` or
+   * `sold`. The port already promises the id and the price; they are compared here again because
+   * the hop is settled on them. Isolated so a saboteur can take whatever listing an answer named.
+   */
+  protected answered(step: WorkStepRow, outcome: MutationOutcome): CsfloatStatedListing | null {
+    const stated = csfloatListingInEffect(outcome);
+    if (!stated || stated.listingId !== step.target_id || stated.priceCents !== this.paramsOf(step).priceCents) return null;
+    return ['listed','sold'].includes(stated.state) ? stated : null;
+  }
+
+  /**
+   * A create CSFloat refused because its copy of the inventory does not hold the item yet, given
+   * the wait until its next send: the next of its wait's `retryAtMs` (`INVENTORY_WAIT`, by whose
+   * listing it is) after the first refusal that has not passed. Written onto the attempt as the venue's wait (`venueRetryAt`), so the
+   * work panel counts down to the same instant the resend waits for and a restart keeps it. None
+   * left, the answer goes through as it came, and `execute` fails the hop. Isolated so a saboteur can fail
+   * a lagging copy at once, as every listing did before CSF-58.
+   */
+  protected inventoryWait(step: WorkStepRow, outcome: MutationOutcome): MutationOutcome {
+    if (!isInventoryLag(outcome) || outcome.kind !== 'DEFINITIVELY_REJECTED' || outcome.retryAfterMs !== undefined) return outcome;
+    const nowMs = Date.parse(this.context.now()), wait = this.waitOf(step);
+    const firstRefusal = this.waitingSince(step) ?? nowMs;
+    const next = wait.retryAtMs.map(offset => firstRefusal+offset).find(at => at > nowMs);
+    return next === undefined ? outcome : { ...outcome, retryAfterMs: next-nowMs };
+  }
+
+  /**
+   * How this listing waits for CSFloat's copy of the inventory: a person's fast, a strategy's lean
+   * (`INVENTORY_WAIT`, CSF-33, CSF-62). Whose it is is the command's authority. Isolated so a
+   * saboteur can give one the other's wait.
+   */
+  protected waitOf(step: WorkStepRow): InventoryWait {
+    return INVENTORY_WAIT[this.context.database.command(step.command_id)?.authority ?? 'HUMAN'];
+  }
+
+  /** When the listing's wait began, its first refusal: its deadline less its wait's length, so nothing more is stored. */
+  private waitingSince(step: WorkStepRow): number | null {
+    return step.deadline_at ? Date.parse(step.deadline_at)-this.waitOf(step).deadlineMs : null;
+  }
+
+  /**
+   * Every listing hop of this account that waits on CSFloat (`RETRYING`, its last action refused
+   * with a wait) and whose moment has come gets a fresh action for the same terms, which `advance`
+   * then sends. Its moment is the wait the attempt carries, or, for one waiting for CSFloat's copy
+   * of the inventory, a complete read of that copy begun after the refusal that shows the item. A
+   * listing that waited for CSFloat past its deadline fails, and the item stays in main inventory.
+   *
+   * A refusal is definitive: nothing was created, so a new send is a new attempt, not a retry of an
+   * ambiguous one (rule 1). The send's own admission judges everything again first, so what it
+   * refuses on age is read again before any resend, as `submit` does: a listing that waited eight
+   * minutes was otherwise refused for a five-minute-old Steam inventory.
+   */
+  protected async resumeVenueWaits(accountId: string): Promise<void> {
+    const db = this.context.database, now = this.context.now();
+    let waiting = false;
+    const due: WorkStepRow[] = [];
+    for (const { id } of this.work.openOf(accountId, [CSFLOAT_CREATE], [CSFLOAT_CREATE])) {
+      if (this.stopped) return;
+      const step = this.work.step(id)!;
+      if (step.state !== 'RETRYING') continue;
+      const prior = step.action_id ? db.action(step.action_id) : undefined;
+      // A resend already admitted or out: `advance` sends it, `reconcile` proves it.
+      if (prior?.state !== 'FAILED') continue;
+      const lag = step.reason === CSFLOAT_INVENTORY_WAIT_REASON;
+      // Past the deadline only: the last retry falls on it, and is sent before the wait gives up.
+      if (lag && step.deadline_at && now > step.deadline_at) { this.timeOut(step); continue; }
+      const retryAt = db.latestAttempt(prior.id)?.retry_after ?? null;
+      if (!(retryAt !== null && retryAt <= now) && !(lag && this.venueShows(step, prior))) { waiting = true; continue; }
+      due.push(step);
+    }
+    if (due.length) {
+      await this.services.reads.ensureFresh(accountId, CSFLOAT_LIST_EVIDENCE);
+      const at = this.context.now();
+      for (const step of due) db.transaction(() => {
+        const current = this.work.step(step.id);
+        if (current?.state !== 'RETRYING' || current.action_id !== step.action_id) return;
+        const action = db.enqueueAction({ accountId, stepId: step.id, actionKind: CSFLOAT_CREATE,
+          targetId: step.local_id!, resourceKey: `item:${step.local_id}`, params: this.paramsOf(step), now: at });
+        this.work.attachAction(step.id,action.id,at);
+      });
+    }
+    if (waiting) this.armVisibility(accountId);
+  }
+
+  /**
+   * Whether CSFloat's latest complete read of its copy of the inventory, begun after the refusal
+   * and under the same connection, shows this exact item tradable. Isolated so a saboteur can
+   * trust a read from before the refusal.
+   */
+  protected venueShows(step: WorkStepRow, refused: ActionRow): boolean {
+    const db = this.context.database, params = this.paramsOf(step);
+    const read = db.latestCompleteObservation(step.account_id,'csfloat-inventory');
+    const answered = db.latestAttempt(refused.id)?.finished_at ?? null;
+    // Strictly after: a read begun the same instant the refusal came back may have been answered from the same copy.
+    if (!read || !answered || read.generation !== params.generation || read.started_at <= answered || !params.assetId) return false;
+    const row = new AssetEvidenceStore(db).csfloat(step.account_id,params.assetId);
+    return row?.last_seen_obs === read.id && row.eligible === 1 && this.store.associate(step.account_id,row.item) === step.local_id;
   }
 
   /**
@@ -558,16 +796,16 @@ export class CsfloatSellingService {
   }
 
   /**
-   * The retrieve was proved: the item is loose, and the ten minutes start from that proof. The
-   * wait hop goes from queued to waiting on CSFloat's read, with its deadline on the row so a
-   * restart judges the same instant.
+   * The retrieve was proved: the item is loose. The wait hop goes from queued to waiting, with a
+   * deadline on the row so a restart judges the same instant; `awaitVisibility` hands it on to the
+   * listing at once, and CSFloat's own answer to the send says whether its copy has caught up (CSF-58).
    */
   protected startWaiting(retrieve: WorkStepRow, loose: ObservationRow): void {
     const db = this.context.database, now = this.context.now();
     const waiting = this.awaitHop(retrieve);
     if (!waiting || waiting.state !== 'QUEUED') return;
     const params = this.paramsOf(retrieve);
-    const deadline = new Date(Date.parse(loose.started_at)+VISIBILITY_DEADLINE_MS).toISOString();
+    const deadline = new Date(Date.parse(loose.started_at)+this.waitOf(retrieve).deadlineMs).toISOString();
     db.transaction(() => {
       this.work.update(waiting.id, { state: 'AWAITING_OBSERVATION', deadline_at: deadline, reason: 'Waiting for CSFloat to see the retrieved item' }, now);
       db.addEvent(retrieve.account_id,'csfloat-visibility-wait',{ operationId: params.operationId, localId: retrieve.local_id, assetId: params.assetId, looseAt: loose.started_at, deadline },now);
@@ -575,17 +813,15 @@ export class CsfloatSellingService {
   }
 
   /**
-   * Every wait hop of this account: a unit that is loose and not yet seen by CSFloat.
+   * Every wait hop of this account: a unit that is loose and not yet listed.
    *
-   * The deadline is judged first, from the stored column, so a restart judges the same instant
-   * and a wait that ran out while the app was closed fails without a read. Then the latest
-   * CSFloat read: only one that started after the item was proved loose can say anything about it
-   * (`venueSees`). Seen, the listing hop gets its action and joins the ordinary path; not yet, the
-   * account's one wait loop is armed.
+   * The deadline is judged first, from the stored column, so a wait from before CSF-58 that ran
+   * out while the app was closed fails without a send. Otherwise the listing hop gets its action
+   * at once and joins the ordinary path: no read of CSFloat's copy first, because the send itself
+   * says whether the copy has caught up, and one that has not waits (`resumeVenueWaits`).
    */
   protected async awaitVisibility(accountId: string): Promise<void> {
     const db = this.context.database;
-    let waiting = false;
     for (const { id } of this.work.openOf(accountId, [CSFLOAT_CREATE], ['CSFLOAT_AWAIT_VENUE'])) {
       if (this.stopped) return;
       const step = this.work.step(id)!;
@@ -594,32 +830,19 @@ export class CsfloatSellingService {
       const params = this.paramsOf(step);
       const loose = this.looseOf(step);
       if (!loose || !step.deadline_at) { this.failHop(step,'The retrieve\'s observation is missing; review the listing'); continue; }
-      if (this.context.now() >= step.deadline_at) { this.timeOut(step,loose); continue; }
+      if (this.context.now() >= step.deadline_at) { this.timeOut(step); continue; }
       if (db.itemByLocalId(accountId,step.local_id!)?.asset_id !== params.assetId) { this.failHop(step,'Item asset changed; submit a new selection'); continue; }
-      if (!this.venueSees(step,loose)) { waiting = true; continue; }
       await this.attachCreate(step,loose);
     }
-    if (waiting) this.armVisibility(accountId);
-  }
-
-  /** CSFloat's latest complete read, taken after the item was proved loose, shows this exact item tradable. */
-  protected venueSees(step: WorkStepRow, loose: ObservationRow): boolean {
-    const db = this.context.database, params = this.paramsOf(step);
-    const latest = db.latestObservation(step.account_id,'csfloat-inventory');
-    if (!latest?.complete || latest.error || latest.generation !== params.generation || latest.id <= loose.id || latest.started_at < loose.started_at) return false;
-    const row = params.assetId ? new AssetEvidenceStore(db).csfloat(step.account_id,params.assetId) : undefined;
-    if (!row || row.last_seen_obs !== latest.id) return false;
-    return row.eligible === 1 && this.store.associate(step.account_id,row.item) === step.local_id;
   }
 
   /**
-   * CSFloat has seen it: the wait hop is settled on that read, and the listing hop gets its
-   * action and is an ordinary queued create.
+   * The item is loose: the wait hop is settled on the walk that proved it, and the listing hop gets
+   * its action and is an ordinary queued create.
    *
-   * Everything `validate` judges is read again first where it may have lapsed during the wait —
-   * otherwise the send's admission turns a ten-minute-old read into a permanent refusal — and
-   * Steam's trade inventory is read again if the walk on record predates the retrieve, because
-   * that walk could not see the item at all.
+   * Everything `validate` refuses on age is read again first where it may have lapsed during the
+   * retrieve, and Steam's trade inventory is read again if the walk on record predates the
+   * retrieve, because that walk could not see the item at all.
    */
   private async attachCreate(step: WorkStepRow, loose: ObservationRow): Promise<void> {
     const db = this.context.database, accountId = step.account_id, params = this.paramsOf(step);
@@ -633,26 +856,29 @@ export class CsfloatSellingService {
         const listing = this.work.step(params.operationId);
         if (!listing || listing.state !== 'QUEUED' || listing.action_id) throw new Error('The listing hop was replaced; review the listing');
         const now = this.context.now();
-        const read = db.latestObservation(accountId,'csfloat-inventory')!;
         const action = db.enqueueAction({ accountId, stepId: listing.id, actionKind: CSFLOAT_CREATE,
           targetId: step.local_id!, resourceKey: `item:${step.local_id}`, params: this.paramsOf(listing), now });
         this.work.attachAction(listing.id,action.id,now);
-        this.work.settle(step.id,'DONE',read.id,now);
+        this.work.settle(step.id,'DONE',loose.id,now);
       });
     } catch (error) {
       this.failHop(step,errorMessage(error));
     }
   }
 
-  /** Ten minutes and CSFloat never showed it. The item stays loose: nothing is stored back. */
-  private timeOut(step: WorkStepRow, loose: ObservationRow): void {
+  /**
+   * CSFloat never showed the item by the deadline: the listing fails, and the item stays loose,
+   * nothing stored back. The event counts the reads of CSFloat's copy made while it waited.
+   */
+  private timeOut(step: WorkStepRow): void {
     const db = this.context.database, params = this.paramsOf(step);
-    const reads = (db.raw().prepare("SELECT COUNT(*) AS n FROM observation WHERE account_id=? AND surface='csfloat-inventory' AND id>?")
-      .get(step.account_id,loose.id) as { n: number }).n;
+    const began = this.waitingSince(step);
+    const since = began === null ? this.context.now() : new Date(began).toISOString();
+    const reads = db.observationsSince(step.account_id,'csfloat-inventory',since).count;
     db.transaction(() => {
       this.failHop(step,CSFLOAT_VISIBILITY_TIMEOUT_REASON);
       db.addEvent(step.account_id,'csfloat-visibility-timeout',{ operationId: params.operationId, localId: step.local_id, assetId: params.assetId,
-        looseAt: loose.started_at, deadline: step.deadline_at, readsMade: reads },this.context.now());
+        waitingSince: since, deadline: step.deadline_at, readsMade: reads },this.context.now());
     });
   }
 
@@ -699,57 +925,81 @@ export class CsfloatSellingService {
     return this.context.database.observation(step.account_id, observationId ?? null);
   }
 
-  /** Starts this account's wait for CSFloat, unless one is already running. */
+  /**
+   * Sets this account's one timer for its wait on CSFloat at the soonest resend, deadline or read,
+   * unless one is already set no later. One timer per account, however many listings wait: they
+   * share its reads, each one of about 120 a day. Every refusal and every pass of `advance` that
+   * leaves a listing waiting asks again, so a moment sooner than the one being slept to moves the
+   * timer forward rather than being slept past; a timer that a later one replaced does nothing
+   * when it fires.
+   */
   protected armVisibility(accountId: string): void {
-    if (this.stopped || this.waits.has(accountId)) return;
-    const wait: Promise<void> = this.visibilityLoop(accountId).catch(() => undefined)
-      .finally(() => { if (this.waits.get(accountId) === wait) this.waits.delete(accountId); });
-    this.waits.set(accountId,wait);
-  }
-
-  /**
-   * Sleeps to the next read or the next deadline, whichever is sooner, reads if a read is due,
-   * and hands the verdict to `advance`. One loop per account: a batch retrieved by one walk shares
-   * one anchor and at most five reads, and one that joins later takes the reads still ahead.
-   */
-  private async visibilityLoop(accountId: string): Promise<void> {
+    if (this.stopped) return;
     const clock = this.context.ports.clock;
-    while (!this.stopped) {
-      const turn = this.visibilityTurn(accountId);
-      // Deleted here, not after: a wait armed between this check and the loop's end must start.
-      if (!turn) { this.waits.delete(accountId); return; }
-      const wakeAt = Math.min(turn.readAt ?? Infinity,turn.deadline);
-      await clock.sleep(Math.max(MIN_TURN_MS,wakeAt-clock.now().getTime()));
-      if (this.stopped) return;
+    const turn = this.visibilityTurn(accountId);
+    if (!turn) return;
+    const nowMs = clock.now().getTime();
+    const at = Math.max(turn.wakeAt, nowMs + MIN_TURN_MS);
+    const current = this.waits.get(accountId);
+    if (current && current.at <= at) return;
+    const generation = ++this.waitGeneration;
+    this.waits.set(accountId,{ at, generation });
+    void clock.sleep(at-nowMs).then(async () => {
+      if (this.stopped || this.waits.get(accountId)?.generation !== generation) return;
+      this.waits.delete(accountId);
       const due = this.visibilityTurn(accountId);
-      if (due?.readAt !== undefined && due.readAt !== null && due.readAt <= clock.now().getTime()) {
-        await this.readVenue(accountId).catch(() => undefined);
+      if (due?.readAt !== null && due?.readAt !== undefined && due.readAt <= clock.now().getTime()) {
+        await this.readVenue(accountId, due.readFor).catch(() => undefined);
       }
+      // `advance` sends what came due, and arms the next moment for what still waits.
       this.schedule(accountId);
-    }
-  }
-
-  /** One read of CSFloat's copy of this account's inventory, begun now, for everything waiting on it. */
-  protected async readVenue(accountId: string): Promise<void> {
-    await this.services.reads.need(accountId, { ref: { surface: 'csfloat-inventory', scope: { kind: 'account' } }, startedAfter: this.context.now(), priority: 'work' });
+    }).catch(() => undefined);
   }
 
   /**
-   * When this account next reads CSFloat and next hits a deadline. Offsets count from the earliest
-   * waiting member's loose observation, and the next one is the first strictly after the latest
-   * CSFloat read of any kind — a failed read still spent the budget, and a read someone else asked
-   * for counts too.
+   * One read of CSFloat's copy of this account's inventory, begun now, for everything waiting on it:
+   * a person's need when a person's listing is the one due a read, so it is not held to the spacing
+   * the day's budget keeps between reads nobody asked for (`kernel/read-budget.ts`); never past the cap.
    */
-  private visibilityTurn(accountId: string): { readAt: number | null; deadline: number } | null {
+  protected async readVenue(accountId: string, priority: 'person' | 'work' = 'work'): Promise<void> {
+    await this.services.reads.need(accountId, { ref: { surface: 'csfloat-inventory', scope: { kind: 'account' } }, startedAfter: this.context.now(), priority });
+  }
+
+  /**
+   * When this account's wait next has something to do: the soonest resend a refusal named, the
+   * soonest deadline, and the next read of CSFloat's copy of the inventory, and for whom.
+   *
+   * Each listing waiting for that copy asks for reads its own wait's way (`INVENTORY_WAIT`): a
+   * person's at its offsets from its first refusal, each the first after the account's latest read
+   * of any kind (a failed read still spent the budget, and a read someone else asked for counts
+   * too); a strategy's every `readEveryMs` after both its first refusal and the latest read, so a
+   * listing CSFloat catches up with in two minutes, as most do, costs no read at all. No read is
+   * asked for at or past a listing's deadline: its last send falls there. The soonest asked-for
+   * read wins, as a person's when a person's listing asked for it. Isolated so a saboteur can read
+   * for every listing.
+   */
+  protected visibilityTurn(accountId: string): { wakeAt: number; readAt: number | null; readFor: 'person' | 'work' } | null {
     const db = this.context.database;
-    const waiting = this.work.openOf(accountId, [CSFLOAT_CREATE], ['CSFLOAT_AWAIT_VENUE'])
-      .filter(step => step.state === 'AWAITING_OBSERVATION' && step.deadline_at !== null);
-    if (!waiting.length) return null;
-    const anchor = Math.min(...waiting.map(step => Date.parse(this.looseOf(step)?.started_at ?? step.deadline_at!)));
+    const steps = this.work.openOf(accountId, [CSFLOAT_CREATE], [CSFLOAT_CREATE]).filter(step => step.state === 'RETRYING');
     const last = db.latestObservation(accountId,'csfloat-inventory');
     const lastRead = last ? Date.parse(last.started_at) : -Infinity;
-    const readAt = VISIBILITY_READ_OFFSETS_MS.map(offset => anchor+offset).find(at => at > lastRead) ?? null;
-    return { readAt, deadline: Math.min(...waiting.map(step => Date.parse(step.deadline_at!))) };
+    const moments: number[] = [];
+    let read: { at: number; readFor: 'person' | 'work' } | null = null;
+    for (const step of steps) {
+      const action = step.action_id ? db.action(step.action_id) : undefined;
+      const retryAt = action?.state === 'FAILED' ? db.latestAttempt(action.id)?.retry_after ?? null : null;
+      if (retryAt !== null) moments.push(Date.parse(retryAt));
+      const began = this.waitingSince(step);
+      if (step.reason !== CSFLOAT_INVENTORY_WAIT_REASON || began === null) continue;
+      const deadline = Date.parse(step.deadline_at!), wait = this.waitOf(step);
+      moments.push(deadline);
+      const at = wait.readAtMs ? wait.readAtMs.map(offset => began+offset).find(moment => moment > lastRead)
+        : wait.readEveryMs !== undefined ? Math.max(began, lastRead) + wait.readEveryMs : undefined;
+      if (at === undefined || at >= deadline) continue;
+      if (!read || at < read.at) read = { at, readFor: wait.readAtMs ? 'person' : 'work' };
+    }
+    if (!moments.length) return null;
+    return { wakeAt: Math.min(...moments, read?.at ?? Infinity), readAt: read?.at ?? null, readFor: read?.readFor ?? 'work' };
   }
 
   /**
@@ -763,47 +1013,54 @@ export class CsfloatSellingService {
    * has had (delivery retries plan D6).
    */
   reconcile(accountId: string): void {
-    const db = this.context.database;
-    for (const step of this.work.openOf(accountId, CSFLOAT_LISTING_KINDS, CSFLOAT_LISTING_KINDS)) {
-      if (!['QUEUED','AWAITING_OBSERVATION'].includes(step.state) || !step.action_id) continue;
-      const action = db.action(step.action_id);
-      if (!action || !['RUNNING','AWAITING_OBSERVATION'].includes(action.state)) continue;
-      if (step.state !== 'AWAITING_OBSERVATION') this.work.setState(step.id,'AWAITING_OBSERVATION',this.context.now());
-      const params = this.paramsOf(step);
-      const named = step.target_id ?? (step.kind === CSFLOAT_CREATE ? this.namedListing(action) : null);
-      if (named && !step.target_id) this.work.update(step.id,{ target_id: named },this.context.now());
-      const attempt = db.latestAttempt(action.id);
-      const candidates = named ? [this.store.contract(accountId,named)].filter((row): row is CsfloatContract => row !== undefined)
-        : this.store.contractsFor(accountId,step.local_id,params.assetId,attempt ? {
-          createdAfter: new Date(Date.parse(attempt.started_at) - CREATE_CLOCK_TOLERANCE_MS).toISOString(), knownBefore: attemptWatermark(attempt) } : undefined);
-      const listing = candidates.length === 1 ? candidates[0] : undefined;
-      if (!listing) continue;
-      // A listing the answer named that is not about the hop's asset is not this create's, whatever the venue said.
-      if (step.kind === CSFLOAT_CREATE && listing.asset_id !== params.assetId) continue;
-      const obs = db.observation(accountId,listing.observation_id);
-      if (!obs?.complete || obs.error || obs.generation !== params.generation || !postAttempt(db,action,obs,false)) continue;
-      const applied = step.kind === CSFLOAT_CANCEL ? ['delisted','cancelled'].includes(listing.state)
-        : step.kind === CSFLOAT_CREATE ? ['listed','sold'].includes(listing.state) && listing.price_cents === params.priceCents
-          : listing.state === 'listed' && listing.price_cents === params.priceCents;
-      if (applied) {
-        db.transaction(() => {
-          db.resolveAction(action,obs.id,true,this.context.now());
-          this.work.update(step.id, { state: 'DONE', target_id: listing.listing_id, observation_id: obs.id, reason: null }, this.context.now());
-        });
-      } else if (['sold','refunded','delisted','cancelled'].includes(listing.state)) {
-        db.transaction(() => {
-          db.setActionState(action.id,'FAILED',this.context.now(),`Observed ${listing.state}; requested operation did not complete`);
-          this.work.settle(step.id,'FAILED',obs.id,this.context.now(),`CSFloat listing is ${listing.state}; check sales before using the item`);
-        });
-      } else if (this.editProvedNotApplied(step,listing,action,obs)) {
-        // Failed, never `READY`: `resolveAction` would hand a current goal back to be sent again.
-        db.transaction(() => {
-          db.setActionState(action.id,'FAILED',this.context.now(),'complete-observation-proved-not-applied');
-          this.work.settle(step.id,'FAILED',obs.id,this.context.now(),step.kind === CSFLOAT_CANCEL
-            ? 'A CSFloat read after the delist still showed the listing up, so nothing was delisted'
-            : `A CSFloat read after the reprice still showed it at $${(listing.price_cents/100).toFixed(2)}, so the price did not change`);
-        });
-      }
+    for (const step of this.work.openOf(accountId, CSFLOAT_LISTING_KINDS, CSFLOAT_LISTING_KINDS)) this.judge(step);
+  }
+
+  /**
+   * One listing hop judged on what the record holds about its listing: the contract under the
+   * observation that last stated it, a read's or, for a reprice, its own answer's (`settleOnAnswer`).
+   * The observation must be complete, of the hop's connection, and not older than the attempt.
+   */
+  private judge(step: WorkStepRow): void {
+    const db = this.context.database, accountId = step.account_id;
+    if (!['QUEUED','AWAITING_OBSERVATION'].includes(step.state) || !step.action_id) return;
+    const action = db.action(step.action_id);
+    if (!action || !['RUNNING','AWAITING_OBSERVATION'].includes(action.state)) return;
+    if (step.state !== 'AWAITING_OBSERVATION') this.work.setState(step.id,'AWAITING_OBSERVATION',this.context.now());
+    const params = this.paramsOf(step);
+    const named = step.target_id ?? (step.kind === CSFLOAT_CREATE ? this.namedListing(action) : null);
+    if (named && !step.target_id) this.work.update(step.id,{ target_id: named },this.context.now());
+    const attempt = db.latestAttempt(action.id);
+    const candidates = named ? [this.store.contract(accountId,named)].filter((row): row is CsfloatContract => row !== undefined)
+      : this.store.contractsFor(accountId,step.local_id,params.assetId,attempt ? {
+        createdAfter: new Date(Date.parse(attempt.started_at) - CREATE_CLOCK_TOLERANCE_MS).toISOString(), knownBefore: attemptWatermark(attempt) } : undefined);
+    const listing = candidates.length === 1 ? candidates[0] : undefined;
+    if (!listing) return;
+    // A listing the answer named that is not about the hop's asset is not this create's, whatever the venue said.
+    if (step.kind === CSFLOAT_CREATE && listing.asset_id !== params.assetId) return;
+    const obs = db.observation(accountId,listing.observation_id);
+    if (!obs?.complete || obs.error || obs.generation !== params.generation || !postAttempt(db,action,obs,false)) return;
+    const applied = step.kind === CSFLOAT_CANCEL ? ['delisted','cancelled'].includes(listing.state)
+      : step.kind === CSFLOAT_CREATE ? ['listed','sold'].includes(listing.state) && listing.price_cents === params.priceCents
+        : listing.state === 'listed' && listing.price_cents === params.priceCents;
+    if (applied) {
+      db.transaction(() => {
+        db.resolveAction(action,obs.id,true,this.context.now());
+        this.work.update(step.id, { state: 'DONE', target_id: listing.listing_id, observation_id: obs.id, reason: null }, this.context.now());
+      });
+    } else if (['sold','refunded','delisted','cancelled'].includes(listing.state)) {
+      db.transaction(() => {
+        db.setActionState(action.id,'FAILED',this.context.now(),`Observed ${listing.state}; requested operation did not complete`);
+        this.work.settle(step.id,'FAILED',obs.id,this.context.now(),`CSFloat listing is ${listing.state}; check sales before using the item`);
+      });
+    } else if (this.editProvedNotApplied(step,listing,action,obs)) {
+      // Failed, never `READY`: `resolveAction` would hand a current goal back to be sent again.
+      db.transaction(() => {
+        db.setActionState(action.id,'FAILED',this.context.now(),'complete-observation-proved-not-applied');
+        this.work.settle(step.id,'FAILED',obs.id,this.context.now(),step.kind === CSFLOAT_CANCEL
+          ? 'A CSFloat read after the delist still showed the listing up, so nothing was delisted'
+          : `A CSFloat read after the reprice still showed it at $${(listing.price_cents/100).toFixed(2)}, so the price did not change`);
+      });
     }
   }
 
@@ -819,17 +1076,24 @@ export class CsfloatSellingService {
   }
 
   /**
-   * What proves a delist or reprice CSFloat accepted: that listing's own read, begun after the
-   * send returned (CSF-45). The stall cannot prove it, because a listing the stall no longer holds
-   * may have sold. The refresh loop reads the listing for as long as the hop waits — at once, then
-   * on the proof intervals, then on the listing's own cadence — so a read that fails is followed
-   * by another rather than by nothing, and a restart reads for it from the record. A create is
-   * proved by the stall walk its send nudges, which the stall's cadence repeats.
+   * What proves a delist CSFloat accepted, and a reprice whose answer settled nothing: that
+   * listing's own read, begun after the send returned (CSF-45). The stall cannot prove it, because
+   * a listing the stall no longer holds may have sold. The refresh loop reads the listing for as
+   * long as the hop waits — at once, then on the proof intervals, then on the listing's own cadence
+   * — so a read that fails is followed by another rather than by nothing, and a restart reads for
+   * it from the record. A create is proved by the stall walk its send nudges, which the stall's
+   * cadence repeats.
+   *
+   * A reprice whose answer returned the listing is settled on that answer and never waits, so it
+   * needs nothing (CSF-70). Its action does await observation in the record for the few turns
+   * between the answer being recorded and being judged, and the signal that follows the answer
+   * wakes the refresh loop in those same turns. A reprice this run is still judging therefore asks
+   * for nothing, so that no listing read rests on which of the two runs first.
    */
   needs(action: ActionRow): ProofNeed {
     const { listingId } = this.context.database.actionParams(action) as { listingId?: string | null };
-    if (!['CSFLOAT_CANCEL','CSFLOAT_REPRICE'].includes(action.kind) || !listingId) return { kind: 'none' };
-    return { kind: 'walks', walks: [{ ref: { surface: 'csfloat-listing', scope: { kind: 'item', id: listingId } }, startedAfter: attemptReturned(this.context.database,action) }] };
+    if (!['CSFLOAT_CANCEL','CSFLOAT_REPRICE'].includes(action.kind) || !listingId || this.judging.has(action.id)) return { kind: 'none' };
+    return { kind: 'walks', walks: [{ ref: { surface: CSFLOAT_LISTING_SURFACE, scope: { kind: 'item', id: listingId } }, startedAfter: attemptReturned(this.context.database,action) }] };
   }
 
   /**
@@ -840,8 +1104,13 @@ export class CsfloatSellingService {
    */
   observeConflicts(accountId: string): void {
     const db = this.context.database, now = this.context.now();
-    const conflicts = db.raw().prepare(`SELECT c.venue_order_id AS listing_id FROM venue_order c JOIN venue_order o ON o.account_id=c.account_id
-      AND (o.local_id=c.local_id OR o.asset_id=c.asset_id) WHERE c.account_id=? AND c.venue='csfloat' AND c.side='SELL' AND c.state='OPEN' AND ${STEAM_LISTED_SQL}`).all(accountId) as Array<{ listing_id: string }>;
+    // Two joins, one per identity, each on its own index (`order_resource`, `order_asset`): one join on
+    // `local_id OR asset_id` used neither and read every order of the account for every open CSFloat
+    // listing, after every CSFloat walk, 40 % of a pass's CPU on a large record (measured 2026-11-03).
+    const conflicts = db.raw().prepare(`SELECT c.venue_order_id AS listing_id FROM venue_order c JOIN venue_order o ON o.account_id=c.account_id AND o.local_id=c.local_id
+        WHERE c.account_id=? AND c.venue='csfloat' AND c.side='SELL' AND c.state='OPEN' AND ${STEAM_LISTED_SQL}
+      UNION SELECT c.venue_order_id AS listing_id FROM venue_order c JOIN venue_order o ON o.account_id=c.account_id AND o.asset_id=c.asset_id
+        WHERE c.account_id=? AND c.venue='csfloat' AND c.side='SELL' AND c.state='OPEN' AND ${STEAM_LISTED_SQL}`).all(accountId, accountId) as Array<{ listing_id: string }>;
     if (this.store.policy().preventDuplicates) {
       for (const row of conflicts) db.raw().prepare(`INSERT INTO venue_conflict(account_id,conflict_key,reason,observed_at) VALUES (?,?,?,?)
         ON CONFLICT(account_id,conflict_key) DO UPDATE SET resolved_at=NULL`).run(accountId,`duplicate:${row.listing_id}`,`Item advertised on Steam and CSFloat (${row.listing_id})`,now);

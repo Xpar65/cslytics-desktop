@@ -32,3 +32,17 @@ export function wearBandSql(column: string): string {
   const cases = WEAR_TIERS.slice(0, -1).map((tier) => `WHEN ${column}<${tier.max} THEN ${tier.band}`).join(' ');
   return `CASE WHEN ${column} IS NULL THEN NULL ${cases} ELSE ${WEAR_TIERS[WEAR_TIERS.length - 1]!.band} END`;
 }
+
+/**
+ * One market kind, spelled as one string: an identity key and a wear tier, the pair a market name
+ * stands for. A match key never holds `@`, so the two halves cannot run into each other. An item
+ * with no float has an empty tier.
+ */
+export function kindKey(matchKey: string, band: number | null | undefined): string {
+  return `${matchKey}@${band ?? ''}`;
+}
+
+/** The same spelling as SQL, over a match-key column and a float column. Spelled from `wearBandSql`, so the two cannot disagree. */
+export function kindKeySql(matchKeyColumn: string, wearColumn: string): string {
+  return `${matchKeyColumn} || '@' || IFNULL(${wearBandSql(wearColumn)}, '')`;
+}

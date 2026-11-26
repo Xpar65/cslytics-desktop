@@ -28,10 +28,11 @@ import type { ImageFetch } from './fetch.js';
  *
  * ## What it guarantees
  *
- * 1. **Seen once is kept.** Every reference this app addresses is content-addressed upstream — an
- *    economy hash is derived from the image, and an avatar hash changes when the avatar does — so
- *    a stored file can never be stale and is *never revalidated*. There is no conditional request,
- *    no `max-age`, no expiry. That is what makes an offline launch look like an online one.
+ * 1. **Seen once is kept.** Every reference this app addresses is content-addressed upstream —
+ *    an economy hash is derived from the image, an avatar hash changes when the avatar does, and
+ *    a collection emblem is named for the hash of its bytes — so a stored file can never be stale
+ *    and is *never revalidated*. There is no conditional request, no `max-age`, no expiry. That
+ *    is what makes an offline launch look like an online one.
  * 2. **A failure is attributable.** Status, content type and host are logged once per reference
  *    per transition, so the next occurrence names which of the causes above it was instead of
  *    leaving a shrug on the screen.
@@ -75,8 +76,11 @@ const EXTENSIONS = new Map<string, string>([
   ['image/webp', 'webp'],
   ['image/gif', 'gif'],
   ['image/avif', 'avif'],
-  ['image/bmp', 'bmp']
+  ['image/bmp', 'bmp'],
+  ['image/svg+xml', 'svg']
 ]);
+/** The one type here that is a document rather than pixels: the game's newer collection emblems. */
+const VECTOR_TYPE = 'image/svg+xml';
 
 type Stored = { file: string; bytes: number; used: number };
 type Failure = { attempts: number; nextAt: number; reason: string };
@@ -177,7 +181,12 @@ export class ImageCache {
       headers: {
         'content-type': type,
         'content-length': String(bytes.byteLength),
-        'cache-control': 'public, max-age=31536000, immutable'
+        'cache-control': 'public, max-age=31536000, immutable',
+        'x-content-type-options': 'nosniff',
+        // A vector drawing is a document, and a document can carry script. Drawn by an `<img>` it
+        // runs none and loads nothing. This says the same for any other way it could be opened:
+        // no script, no request, no origin.
+        ...(type === VECTOR_TYPE ? { 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox" } : {})
       }
     });
   }
@@ -228,6 +237,10 @@ export class ImageCache {
       const bytes = new Uint8Array(await response.arrayBuffer());
       if (bytes.byteLength === 0) return this.note(key, ref, 'empty body');
       if (bytes.byteLength > MAX_BYTES) return this.note(key, ref, `${bytes.byteLength} bytes exceeds the ceiling`);
+      // The other types are told from an HTML page by their label alone, because a browser will
+      // not decode a page as pixels. A vector is markup, as a block page is, so its label is not
+      // enough: what is stored under it has to open as a drawing.
+      if (type === VECTOR_TYPE && !opensAsDrawing(bytes)) return this.note(key, ref, 'labelled a vector drawing, and is not one');
 
       const entry = await this.store(key, extension, bytes);
       this.fetched += 1;
@@ -305,6 +318,13 @@ export class ImageCache {
       this.queue.shift()?.();
     }
   }
+}
+
+/** Whether bytes begin as an SVG document does: its root element, after a declaration, a doctype or a comment. */
+function opensAsDrawing(bytes: Uint8Array): boolean {
+  // The decoder drops a byte-order mark itself, so the text starts at the document.
+  const head = new TextDecoder('utf-8').decode(bytes.subarray(0, 2048));
+  return /^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--[\s\S]*?-->\s*|<!DOCTYPE[^>]*>\s*)*<svg[\s>]/i.test(head);
 }
 
 function contentTypeOf(file: string): string {

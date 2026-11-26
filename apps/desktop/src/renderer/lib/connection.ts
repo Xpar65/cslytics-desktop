@@ -72,7 +72,7 @@ export function describeConnection(connection: AccountConnection | undefined): C
         tone: 'partial',
         label: 'Steam only',
         detail: connection.gc.detail
-          ? `Signed in to Steam; no CS2 Game Coordinator session — ${connection.gc.detail}. Market and wallet still work; a sync will try again.`
+          ? `Signed in to Steam. No CS2 Game Coordinator session: ${connection.gc.detail}. Market and wallet still work; a sync will try again.`
           : 'Signed in to Steam; no CS2 Game Coordinator session yet. Market and wallet still work, and a sync will connect one.',
         gcReady: false,
         action: 'connect'

@@ -34,6 +34,11 @@ export type EconomicEventInput = {
   correctsSourceKey?: string | null;
 };
 
+/** The one source key of a buy-order fill: the order and its cumulative purchased count, whoever saw it (BUY-04). */
+export function buyOrderFillKey(buyOrderId: string, purchasedTotal: number): string {
+  return `buy-order:${buyOrderId}:purchased:${purchasedTotal}`;
+}
+
 /**
  * The trading ledger and the wallet money it commits, over the one writer (holdings plan §10.1).
  * A posting is written once per source key; an amount is evidenced or unknown, never invented.
@@ -89,10 +94,12 @@ export class LedgerStore {
   recordBuyOrderFill(input: {
     accountId: string; buyOrderId: string; purchasedTotal: number; delta: number;
     unitPriceCents: number; observationId: number; now: string;
+    /** What the venue calls the item, for the fact a person is told of. */
+    hashName?: string | null;
   }): boolean {
     const posted = this.postEconomicEvent({
       accountId: input.accountId,
-      sourceKey: `buy-order:${input.buyOrderId}:purchased:${input.purchasedTotal}`,
+      sourceKey: buyOrderFillKey(input.buyOrderId, input.purchasedTotal),
       kind: 'BUY_ORDER_FILL',
       occurredAt: input.now,
       quantity: input.delta,
@@ -105,7 +112,34 @@ export class LedgerStore {
       UPDATE reservation SET amount_cents=MAX(0, amount_cents - ?)
       WHERE account_id=? AND ref_kind='BUY_ORDER' AND ref_id=? AND state IN ('ACTIVE','SUBMITTED_UNOBSERVED')
     `).run(input.delta * input.unitPriceCents, input.accountId, input.buyOrderId);
+    // The fact the bell and a host read (`read/queries/facts.ts`), written by the same posting, so
+    // it is written exactly once too. The limit is named as the limit, never as a price paid; the
+    // command is the one whose create became this order, `null` for an order made elsewhere.
+    const command = this.db.raw().prepare(`SELECT s.command_id AS commandId FROM venue_order v JOIN work_step s ON s.action_id=v.action_id
+      WHERE v.account_id=? AND v.venue='steam' AND v.side='BUY' AND v.venue_order_id=? LIMIT 1`)
+      .get(input.accountId, input.buyOrderId) as { commandId: string } | undefined;
+    this.db.addEvent(input.accountId, 'BUY_ORDER_FILL', {
+      buyOrderId: input.buyOrderId, hashName: input.hashName ?? null, purchasedTotal: input.purchasedTotal, delta: input.delta,
+      unitPriceCents: input.unitPriceCents, commandId: command?.commandId ?? null, sourceKey: buyOrderFillKey(input.buyOrderId, input.purchasedTotal)
+    }, input.now);
     return true;
+  }
+
+  /**
+   * Closes out a buy order's reservation once the order is no longer active.
+   *
+   * What a fill consumed has already been subtracted by `recordBuyOrderFill`, so whatever is
+   * left is the unspent remainder and that is what returns to the wallet. A row that reached
+   * zero is CONSUMED rather than RELEASED, because those are different histories. Idempotent: a
+   * settled row is left as it is.
+   */
+  settleBuyOrderReservation(accountId: string, buyOrderId: string): void {
+    const row = this.db.raw().prepare(`SELECT amount_cents FROM reservation
+      WHERE account_id=? AND ref_kind='BUY_ORDER' AND ref_id=? AND state IN ('ACTIVE','SUBMITTED_UNOBSERVED')`)
+      .get(accountId, buyOrderId) as { amount_cents: number } | undefined;
+    if (!row) return;
+    this.db.raw().prepare(`UPDATE reservation SET state=? WHERE account_id=? AND ref_kind='BUY_ORDER' AND ref_id=?`)
+      .run(row.amount_cents > 0 ? 'RELEASED' : 'CONSUMED', accountId, buyOrderId);
   }
 
   /**

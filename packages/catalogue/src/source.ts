@@ -31,7 +31,7 @@ export const CATALOGUE_BASE = `https://${CATALOGUE_HOST}/free/v1/catalogue`;
 /**
  * The one place the catalogue meets the network.
  *
- * Four rules, each of which fails silently at a call site:
+ * Five rules, each of which fails silently at a call site:
  *
  *  1. **One host.** Every request is built from `CATALOGUE_BASE` and a path that would escape it
  *     throws before a request is made. Nothing accepts a caller-supplied URL.
@@ -44,6 +44,15 @@ export const CATALOGUE_BASE = `https://${CATALOGUE_HOST}/free/v1/catalogue`;
  *  4. **A transport fact is not a verdict.** A timeout, a 502 and a 404 are different things, and
  *     only `absent` means "the catalogue does not have this". Everything else leaves the applied
  *     revision exactly where it was.
+ *  5. **No HTTP cache, in either direction.** `cache: 'no-store'`. The origin marks every file
+ *     fresh for a day and republishes a generation under the same paths, so a cache between here
+ *     and the origin pairs today's index with yesterday's shard. The index is asked for with its
+ *     ETag, which goes past the cache; a shard was asked for plainly, and the network stack
+ *     answered from its own copy. The digest then refused the whole generation, on every sync,
+ *     until that copy stopped being fresh a day later, and a `collections.json` with no digest to
+ *     refuse it would have been applied stale. What this app has applied is in its own store, with
+ *     the index's ETag to ask whether it is still current, so a second copy in the network stack
+ *     buys nothing and is one nothing here verifies or can clear.
  */
 export class HttpCatalogueSource implements CatalogueSource {
   constructor(
@@ -97,7 +106,7 @@ export class HttpCatalogueSource implements CatalogueSource {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await this.fetchImpl(url, { method: 'GET', headers, redirect: 'manual', signal: controller.signal });
+      const response = await this.fetchImpl(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store', signal: controller.signal });
       if (response.status === 304) return { kind: 'not-modified' };
       if (response.status === 404) return { kind: 'absent' };
       if (response.status >= 300 && response.status < 400) return { kind: 'failed', detail: `redirected with ${response.status}` };

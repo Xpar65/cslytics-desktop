@@ -1,7 +1,9 @@
-import type { MarketBuyOrder, MarketListing } from '@cslytics/ports';
+import { LISTING_PRICE_COOLDOWN_MS, type BuyOrderStatus, type MarketBuyOrder, type MarketListing } from '@cslytics/ports';
 import type { OrderConfidence, OrderSide, OrderState, OrderVenue, SteamListingBucket } from './alphabets.js';
 import type { ActionRow, EngineDatabase } from './database.js';
+import { PRICE_ANSWER_GUARD_MS } from '../kernel/price-answer.js';
 import { COMMITTED_SQL, STEAM_LISTED_SQL } from './commitment.js';
+import { LedgerStore } from './ledger.js';
 
 /**
  * The orders of an account on every venue and either side, and the only writer of a binding
@@ -53,7 +55,56 @@ export type VenueOrderRow = {
 export type SteamOrderRow = {
   buyer_price_cents: number | null;
   raw_bucket: SteamListingBucket | null;
+  /**
+   * When Steam's cooldown on the listing's price ends, as far as the record can say: from an
+   * answer the engine timed, from the wait Steam named in a refusal, or from two walks close
+   * enough together to bound an event neither timed. `null` is not known to be cooling down.
+   */
+  reprice_ready_at: string | null;
+  /**
+   * When a venue answer last set this row's price. A walk begun at or before it, and no more than
+   * `PRICE_ANSWER_GUARD_MS` before it, cannot have seen that answer and leaves the price alone.
+   * It is kept for as long as the row is, whatever later walks have written, so a walk that was
+   * already under way at the answer is refused however late it lands. `null` for a row no answer
+   * ever priced.
+   */
+  price_stated_at: string | null;
+  /**
+   * The seller price that answer stated, until a walk begun after the answer has looked at the
+   * listing: that walk compares the two, reports a difference once, and clears this. `null` once
+   * one has looked, and for a row no answer priced.
+   */
+  price_stated_cents: number | null;
 };
+
+/**
+ * When a walk of the book began and finished, and when the complete walk before it began; `null`
+ * when the record holds none before it. A walk that has not finished is stamped as finishing now.
+ */
+export type SteamWalkTimes = { startedAt: string; finishedAt: string; previousStartedAt: string | null };
+
+/**
+ * A listing whose price a venue answer stated and the first walk begun after that answer shows at
+ * another. Both prices are what the seller receives, in the listing's own currency; `statedAt` is
+ * when the answer stated it, which is what a later change of ours on the listing is dated against.
+ */
+export type PriceContradiction = { listingId: string; statedCents: number; observedCents: number; statedAt: string };
+
+/**
+ * Whether a walk cannot have seen an answer that set a listing's price: it began at or before the
+ * answer, so any of its pages may have been read before the price changed. Both moments are the
+ * engine's own clock, so a clock set back after the answer makes every later walk look as if it
+ * began before it, and `guardMs` is what ends that. It is measured from when the walk was written
+ * (`finishedAt`), not from when it began: on a clock that only moves forward a walk is written after
+ * every answer the record holds when it is written, however long it was open, and a walk stays open
+ * long after its pages when it reads, at the read budget's pace, each buy order that left the book
+ * (in-place reprice plan D25). Only a clock set back writes a walk more than `guardMs` before an
+ * answer it is compared with; such a walk writes what it shows like any other (`PRICE_ANSWER_GUARD_MS`).
+ */
+export function begunBeforeAnswer(walk: Pick<SteamWalkTimes, 'startedAt' | 'finishedAt'>, statedAt: string, guardMs: number = PRICE_ANSWER_GUARD_MS): boolean {
+  if (walk.startedAt > statedAt) return false;
+  return Date.parse(statedAt) - Date.parse(walk.finishedAt) <= guardMs;
+}
 
 /** A Steam sell listing: the parent joined to its satellite. */
 export type SteamListingRow = VenueOrderRow & SteamOrderRow;
@@ -70,8 +121,24 @@ export type SeenSteamListing = { listing: MarketListing; bucket: SteamListingBuc
 /** How an order ended, as the order service graded it. */
 export type OrderEnding = { orderId: string; state: OrderState; confidence: OrderConfidence; reason: string; evidence: number };
 
-const STEAM_LISTING_SELECT = `SELECT v.*, s.buyer_price_cents, s.raw_bucket FROM venue_order v
+const STEAM_LISTING_SELECT = `SELECT v.*, s.buyer_price_cents, s.raw_bucket, s.reprice_ready_at, s.price_stated_at, s.price_stated_cents FROM venue_order v
     JOIN steam_order s ON s.account_id=v.account_id AND s.order_id=v.order_id`;
+
+/** Provenance for a fill posting from `getbuyorderstatus`, deliberately outside `FRESHNESS`: a per-order read, not a schedulable walk. */
+export const BUY_ORDER_STATUS_SURFACE = 'steam-buy-order-status';
+
+/**
+ * How long a buy order the book stopped showing may stay unexplained while Steam's own counter
+ * cannot be read. After it, the order is ended on the book alone, provisionally, so its money is
+ * not held for ever by a read that never answers (standing buy orders plan D8).
+ */
+export const UNEXPLAINED_BUY_ORDER_MS = 24 * 60 * 60_000;
+
+/**
+ * What Steam's per-order counter said about an order the book no longer shows, by Steam's id:
+ * its status, or `null` when the read failed. An order not in the map was not asked about.
+ */
+export type VanishedStatuses = ReadonlyMap<string, BuyOrderStatus | null>;
 
 export class OrderStore {
   constructor(private readonly db: EngineDatabase) {}
@@ -252,16 +319,47 @@ export class OrderStore {
    * listings naming one holding is the world contradicting itself: both are quarantined and the
    * holding's goal suspended until a person looks. The phone-confirmation event is emitted on
    * the transition only, so an unconfirmed listing does not append one per walk.
+   *
+   * **A price a venue answer stated** (`price_stated_at`, `price_stated_cents`). A walk that began
+   * at or before the answer cannot have seen it, and leaves the row's two price figures alone:
+   * without that, a walk already under way when a raise was answered would put the old price back.
+   * The time is never cleared, so this holds for every such walk however late it lands and however
+   * many walks begun after the answer have written the row meanwhile. It holds for a walk however
+   * long it was open, and not for one written more than `PRICE_ANSWER_GUARD_MS` before the answer:
+   * the two moments are read off one clock, and only a clock set back writes a walk before an answer
+   * it is compared with (`begunBeforeAnswer`); that walk writes what it shows like any other.
+   *
+   * The first walk the guard lets through is the first to have looked since the answer. It writes
+   * what it shows, as every walk does, and clears the stated price it was compared with; when it
+   * shows another price, the listing is returned as a contradiction, and the caller decides whether
+   * a later change of its own explains it (`priceChangeSentSince`, at the price the walk shows).
+   * Cleared with that walk, the comparison is made once.
+   *
+   * **The cooldown of an event nobody timed** (`reprice_ready_at`). Steam holds a listing's price
+   * for `LISTING_PRICE_COOLDOWN_MS` after it goes live and after every change, and the book does
+   * not say when either happened. A listing this walk is the first to show active, or shows at a
+   * price the row did not have, did so between the previous complete walk and the moment this one
+   * read the listing's page, which may be well after this walk began. When the two walks began no
+   * more than the cooldown apart, the cooldown ends no later than this walk's finish plus its
+   * length, and that is written: the finish, because a stamp from the start can end before Steam's
+   * own cooldown does, and the send it times is then refused. Further apart, or on the first walk of a book, nothing
+   * bounds it and the column is left as it was: unknown costs one refused call, and a countdown on
+   * every listing of a first walk would be a guess.
    */
-  observeSteamListings(accountId: string, observationId: number, seen: readonly SeenSteamListing[], now: string): void {
+  observeSteamListings(accountId: string, observationId: number, seen: readonly SeenSteamListing[], now: string,
+    walk: SteamWalkTimes = this.steamWalkTimes(accountId, observationId), guardMs: number = PRICE_ANSWER_GUARD_MS): PriceContradiction[] {
+    const contradicted: PriceContradiction[] = [];
+    const bounded = walk.previousStartedAt !== null && Date.parse(walk.startedAt) - Date.parse(walk.previousStartedAt) <= LISTING_PRICE_COOLDOWN_MS;
+    const boundedEnd = bounded ? new Date(Date.parse(walk.finishedAt) + LISTING_PRICE_COOLDOWN_MS).toISOString() : null;
     const seenIds = new Set(seen.map((row) => row.listing.listingId));
     for (const row of this.openSteamListings(accountId)) {
       if (!seenIds.has(row.venue_order_id!)) {
         this.sqlite.prepare(`UPDATE venue_order SET gone_obs=? WHERE account_id=? AND order_id=?`).run(observationId, accountId, row.order_id);
       }
     }
-    const satellite = this.sqlite.prepare(`INSERT INTO steam_order(account_id, order_id, buyer_price_cents, raw_bucket) VALUES (?, ?, ?, ?)
-      ON CONFLICT(account_id, order_id) DO UPDATE SET buyer_price_cents=excluded.buyer_price_cents, raw_bucket=excluded.raw_bucket`);
+    const satellite = this.sqlite.prepare(`INSERT INTO steam_order(account_id, order_id, buyer_price_cents, raw_bucket, reprice_ready_at, price_stated_at, price_stated_cents) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, order_id) DO UPDATE SET buyer_price_cents=excluded.buyer_price_cents, raw_bucket=excluded.raw_bucket,
+        reprice_ready_at=excluded.reprice_ready_at, price_stated_at=excluded.price_stated_at, price_stated_cents=excluded.price_stated_cents`);
     for (const { listing, bucket } of seen) {
       const assetId = listing.asset.assetId;
       const state = STEAM_BUCKET_STATE[bucket];
@@ -270,13 +368,27 @@ export class OrderStore {
       const item = this.db.itemByAssetId(accountId, assetId) ?? (own?.local_id ? this.db.itemByLocalId(accountId, own.local_id) : undefined);
       const localId = item?.local_id ?? null;
       const wasPending = existing !== undefined && existing.gone_obs === null && existing.raw_bucket === 'PENDING_CONFIRMATION';
+      // A price an answer stated stands against a walk that cannot have seen the answer.
+      const stated = existing?.price_stated_at ?? null;
+      const unseen = existing !== undefined && stated !== null && begunBeforeAnswer(walk, stated, guardMs);
+      const receiveCents = unseen ? existing.price_cents ?? listing.priceReceiveCents : listing.priceReceiveCents;
+      const buyerCents = unseen ? existing.buyer_price_cents ?? listing.buyerPriceCents : listing.buyerPriceCents;
+      // The first walk to have looked since the answer: what it shows is compared with what the answer stated, once.
+      const owedComparison = unseen ? null : existing?.price_stated_cents ?? null;
+      if (stated !== null && owedComparison !== null && owedComparison !== listing.priceReceiveCents) {
+        contradicted.push({ listingId: listing.listingId, statedCents: owedComparison, observedCents: listing.priceReceiveCents, statedAt: stated });
+      }
+      // Live for the first time in this walk, or at a price the row did not have: an event between two walks.
+      const wasActive = existing !== undefined && existing.gone_obs === null && existing.first_seen_obs !== null && existing.raw_bucket === 'ACTIVE';
+      const untimed = bucket === 'ACTIVE' && (!wasActive || existing.price_cents !== receiveCents);
+      const readyAt = untimed && boundedEnd !== null ? boundedEnd : existing?.reprice_ready_at ?? null;
       let orderId: string;
       if (own) {
         orderId = own.order_id;
         this.sqlite.prepare(`UPDATE venue_order SET venue_order_id=?, local_id=?, asset_id=?, hash_name=?, price_cents=?, state=?, confidence='proven',
             first_seen_obs=COALESCE(first_seen_obs, ?), last_seen_obs=?, gone_obs=NULL, transactable_after=?, ended_at=NULL, end_reason=NULL, end_evidence=NULL
           WHERE account_id=? AND order_id=?`)
-          .run(listing.listingId, localId, assetId, listing.asset.marketHashName, listing.priceReceiveCents, state,
+          .run(listing.listingId, localId, assetId, listing.asset.marketHashName, receiveCents, state,
             observationId, observationId, listing.holdUntil ?? null, accountId, orderId);
       } else {
         orderId = listing.listingId;
@@ -286,7 +398,8 @@ export class OrderStore {
           .run(accountId, orderId, localId, assetId, listing.asset.marketHashName, listing.listingId, listing.priceReceiveCents,
             state, listing.holdUntil ?? null, now, observationId, observationId);
       }
-      satellite.run(accountId, orderId, listing.buyerPriceCents, bucket);
+      // The time of the answer stays; the price it stated stays only until a walk has been let through to compare it.
+      satellite.run(accountId, orderId, buyerCents, bucket, readyAt, stated, unseen ? existing?.price_stated_cents ?? null : null);
       if (bucket === 'PENDING_CONFIRMATION' && !wasPending) {
         this.db.addEvent(accountId, 'listing-awaiting-phone-confirmation', { listingId: listing.listingId, localId, hashName: listing.asset.marketHashName }, now);
       }
@@ -299,6 +412,53 @@ export class OrderStore {
       const goal = this.db.currentDesiredState(accountId, 'sell-listing', duplicate.local_id);
       if (goal) this.db.suspendGoal(accountId, goal.id, 'Conflicting open listings require review', now);
     }
+    this.db.touch(accountId, 'venue_order');
+    return contradicted;
+  }
+
+  /**
+   * Whether this app sent a price change for the listing after `since` that asked for this very
+   * price: an attempt of a price change in place on it, begun after that moment and not definitely
+   * refused, whose hop asks for `priceCents`. Such a send may have landed whatever its answer said,
+   * so a walk that shows that price, other than the one an earlier answer stated, is showing ours.
+   * A walk at a price no later change of ours asked for is not explained by one (in-place reprice
+   * plan D26; CSFloat's `repricedTo` holds the same rule). Asked only when a walk shows such a price.
+   */
+  priceChangeSentSince(accountId: string, listingId: string, since: string, priceCents: number): boolean {
+    return this.sqlite.prepare(`SELECT 1 FROM work_step w INDEXED BY work_step_target JOIN attempt t ON t.action_id=w.action_id
+      WHERE w.account_id=? AND w.kind='EDIT_PRICE' AND w.target_id=? AND json_extract(w.params_json,'$.priceReceiveCents')=?
+        AND t.started_at>? AND IFNULL(t.outcome,'')<>'DEFINITIVELY_REJECTED' LIMIT 1`)
+      .get(accountId, listingId, priceCents, since) !== undefined;
+  }
+
+  /** When a walk of the book began and when the complete walk before it did, read from the record. */
+  steamWalkTimes(accountId: string, observationId: number): SteamWalkTimes {
+    const walk = this.db.observation(accountId, observationId);
+    const previous = this.db.previousCompleteObservation(accountId, 'steam-market', observationId);
+    return { startedAt: walk?.started_at ?? '', finishedAt: walk?.finished_at ?? walk?.started_at ?? '', previousStartedAt: previous?.started_at ?? null };
+  }
+
+  /**
+   * The price a venue answer stated for a listing, with when it said so and the cooldown that
+   * answer starts: the row's seller price, a buyer price by the fee rule until the next walk
+   * reads Steam's own, the time that keeps a walk begun before the answer from undoing it, and
+   * the stated price the first walk begun after it is compared with. In the caller's transaction,
+   * with the action it settles.
+   */
+  stateSteamPrice(accountId: string, listingId: string, price: { receiveCents: number; buyerCents: number }, statedAt: string, readyAt: string): void {
+    const row = this.steamListing(accountId, listingId);
+    if (!row) return;
+    this.sqlite.prepare(`UPDATE venue_order SET price_cents=? WHERE account_id=? AND order_id=?`).run(price.receiveCents, accountId, row.order_id);
+    this.sqlite.prepare(`UPDATE steam_order SET buyer_price_cents=?, price_stated_at=?, price_stated_cents=?, reprice_ready_at=? WHERE account_id=? AND order_id=?`)
+      .run(price.buyerCents, statedAt, price.receiveCents, readyAt, accountId, row.order_id);
+    this.db.touch(accountId, 'venue_order');
+  }
+
+  /** When Steam's cooldown on a listing's price ends, from a change the engine timed or the wait Steam named: it replaces whatever is held. */
+  setRepriceReadyAt(accountId: string, listingId: string, readyAt: string): void {
+    const row = this.steamListing(accountId, listingId);
+    if (!row) return;
+    this.sqlite.prepare(`UPDATE steam_order SET reprice_ready_at=? WHERE account_id=? AND order_id=?`).run(readyAt, accountId, row.order_id);
     this.db.touch(accountId, 'venue_order');
   }
 
@@ -317,6 +477,16 @@ export class OrderStore {
   steamBuyOrders(accountId: string): VenueOrderRow[] {
     return this.sqlite.prepare(`SELECT * FROM venue_order WHERE account_id=? AND venue='steam' AND side='BUY' AND venue_order_id IS NOT NULL ORDER BY opened_at, order_id`)
       .all(accountId) as VenueOrderRow[];
+  }
+
+  /**
+   * How many Steam buy orders stand on the account: every order a walk showed and nothing has
+   * ended, ours and anyone else's, and every create of ours still in flight. What an open-order
+   * cap counts (BUY-11): Steam counts the person's own orders too.
+   */
+  countStandingSteamBuyOrders(accountId: string): number {
+    return (this.sqlite.prepare(`SELECT COUNT(*) AS n FROM venue_order WHERE account_id=? AND venue='steam' AND side='BUY' AND state NOT LIKE 'ENDED_%'`)
+      .get(accountId) as { n: number }).n;
   }
 
   /** The Steam buy orders still open: shown by a walk and not ended by a walk or a status read. */
@@ -341,20 +511,57 @@ export class OrderStore {
   }
 
   /**
+   * The open Steam buy orders a walk that saw `seenIds` no longer shows and whose book count left
+   * units to buy: the ones only Steam's per-order counter can explain. An order that fills its last
+   * unit leaves the book, so its absence looks exactly like a cancellation (standing buy orders
+   * plan D8). Asked before the walk's transaction, never inside it (rule 6).
+   */
+  buyOrdersMissingFrom(accountId: string, seenIds: ReadonlySet<string>): VenueOrderRow[] {
+    return this.openSteamBuyOrders(accountId).filter((row) => !seenIds.has(row.venue_order_id!) && row.filled < row.quantity);
+  }
+
+  /**
    * One complete market walk's buy orders, written in the caller's transaction. An order seen is
    * bound by Steam's id, else to the one unseen request of ours with its terms when no other
    * unknown order on the book shares them, else adopted as the account owner's own, with Steam's
-   * id for its order id. An order no longer shown is gone (`gone_obs`) and ended on what the book
-   * said: filled when its count reached its quantity, cancelled by us when a cancel of ours names
-   * it, else cancelled at the venue, provisionally, because the book is the only oracle Steam
-   * gives a buy order and it reports counts, not reasons.
+   * id for its order id.
+   *
+   * An order no longer shown is gone (`gone_obs`, the first walk that did not show it) and is
+   * explained by Steam's own counter when the walk could read it (`statuses`): bought out is
+   * filled, closed with units left is cancelled — by us when a cancel of ours names it, else at the
+   * venue — and still active keeps it open, because the counter outranks a book that left it out.
+   * Unread, it is `UNEXPLAINED`, its money still held, and the next walk asks again; after
+   * `UNEXPLAINED_BUY_ORDER_MS` it is ended on the book alone, provisionally. An order whose book
+   * count already reached its quantity needs no read: it is filled.
    */
-  observeSteamBuyOrders(accountId: string, observationId: number, seen: readonly MarketBuyOrder[], now: string): void {
+  observeSteamBuyOrders(accountId: string, observationId: number, seen: readonly MarketBuyOrder[], now: string, statuses: VanishedStatuses = new Map()): void {
     const seenIds = new Set(seen.map((order) => order.buyOrderId));
     for (const row of this.openSteamBuyOrders(accountId)) {
       if (seenIds.has(row.venue_order_id!)) continue;
-      this.sqlite.prepare(`UPDATE venue_order SET gone_obs=? WHERE account_id=? AND order_id=?`).run(observationId, accountId, row.order_id);
-      this.endSteamBuyOrder(accountId, { ...row, gone_obs: observationId }, row.filled, observationId, now);
+      const status = statuses.get(row.venue_order_id!);
+      if (row.filled < row.quantity && status?.active === true) {
+        this.sqlite.prepare(`UPDATE venue_order SET filled=MAX(filled, ?) WHERE account_id=? AND order_id=?`).run(status.purchased, accountId, row.order_id);
+        continue;
+      }
+      const goneObs = row.gone_obs ?? observationId;
+      this.sqlite.prepare(`UPDATE venue_order SET gone_obs=? WHERE account_id=? AND order_id=?`).run(goneObs, accountId, row.order_id);
+      const gone = { ...row, gone_obs: goneObs };
+      if (row.filled >= row.quantity) {
+        this.endSteamBuyOrder(accountId, gone, row.filled, observationId, now, 'book');
+        continue;
+      }
+      if (status) {
+        const filled = Math.max(row.filled, status.purchased);
+        this.sqlite.prepare(`UPDATE venue_order SET filled=? WHERE account_id=? AND order_id=?`).run(filled, accountId, row.order_id);
+        this.endSteamBuyOrder(accountId, gone, filled, observationId, now, 'counter');
+        continue;
+      }
+      const since = this.db.observation(accountId, goneObs)?.finished_at ?? now;
+      if (Date.parse(now) - Date.parse(since) >= UNEXPLAINED_BUY_ORDER_MS) {
+        this.endSteamBuyOrder(accountId, gone, row.filled, observationId, now, 'book');
+      } else if (row.state !== 'UNEXPLAINED') {
+        this.sqlite.prepare(`UPDATE venue_order SET state='UNEXPLAINED', confidence='unknown' WHERE account_id=? AND order_id=?`).run(accountId, row.order_id);
+      }
     }
     const unknown = seen.filter((order) => !this.byVenueId(accountId, 'steam', order.buyOrderId));
     const terms = (order: MarketBuyOrder): string => `${order.hashName}\u0000${order.priceCents}\u0000${order.quantity}`;
@@ -381,19 +588,30 @@ export class OrderStore {
   /** What `getbuyorderstatus` said about one order: its count so far, and whether Steam still holds it open. */
   recordSteamBuyOrderStatus(accountId: string, order: VenueOrderRow, status: { active: boolean; purchased: number }, observationId: number, now: string): void {
     this.sqlite.prepare(`UPDATE venue_order SET filled=? WHERE account_id=? AND order_id=?`).run(status.purchased, accountId, order.order_id);
-    if (!status.active && !order.state.startsWith('ENDED_')) this.endSteamBuyOrder(accountId, order, status.purchased, observationId, now);
+    if (!status.active && !order.state.startsWith('ENDED_')) this.endSteamBuyOrder(accountId, order, status.purchased, observationId, now, 'counter');
     this.db.touch(accountId, 'venue_order');
   }
 
-  private endSteamBuyOrder(accountId: string, order: VenueOrderRow, filled: number, evidence: number, now: string): void {
+  /**
+   * How a buy order ended, graded by what said so: Steam's per-order counter (`counter`) proves a
+   * fill or a close, while the book alone (`book`) proves a fill only when its own count said every
+   * unit was bought, and a close only provisionally.
+   */
+  private endSteamBuyOrder(accountId: string, order: VenueOrderRow, filled: number, evidence: number, now: string, basis: 'counter' | 'book'): void {
     const cancelled = this.sqlite.prepare(`SELECT 1 FROM action a JOIN attempt t ON t.action_id=a.id
       WHERE a.account_id=? AND a.kind='CANCEL_BUY_ORDER' AND json_extract(a.params_json,'$.buyOrderId')=? LIMIT 1`).get(accountId, order.venue_order_id);
+    const told = basis === 'counter';
     const ending: OrderEnding = filled >= order.quantity
-      ? { orderId: order.order_id, state: 'ENDED_FILLED', confidence: 'proven', reason: 'The book reports every unit bought', evidence }
+      ? { orderId: order.order_id, state: 'ENDED_FILLED', confidence: 'proven', reason: told ? 'Steam reports every unit bought' : 'The book reports every unit bought', evidence }
       : cancelled
-        ? { orderId: order.order_id, state: 'ENDED_CANCELLED_BY_US', confidence: 'proven', reason: 'Gone from the book after a cancel of ours', evidence }
-        : { orderId: order.order_id, state: 'ENDED_CANCELLED_EXTERNALLY', confidence: 'probable', reason: 'Gone from the book with units left to buy; cancellation is provisional', evidence };
+        ? { orderId: order.order_id, state: 'ENDED_CANCELLED_BY_US', confidence: told ? 'proven' : 'probable',
+          reason: told ? 'Steam reports it closed after a cancel of ours' : 'Gone from the book after a cancel of ours; Steam never said how it ended', evidence }
+        : { orderId: order.order_id, state: 'ENDED_CANCELLED_EXTERNALLY', confidence: 'probable',
+          reason: told ? 'Steam reports it closed with units left to buy, and no cancel of ours names it' : 'Gone from the book with units left to buy; cancellation is provisional', evidence };
     this.end(accountId, ending, now);
+    // An order no longer open commits nothing more: what a fill spent is gone, the rest returns.
+    // A fill this walk or poll saw was posted before this ending, so the remainder is current.
+    if (order.venue_order_id) new LedgerStore(this.db).settleBuyOrderReservation(accountId, order.venue_order_id);
   }
 
   /** The one unseen request of ours with these terms, or none when there is not exactly one. */

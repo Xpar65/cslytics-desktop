@@ -1,7 +1,9 @@
 import { currencyById } from '@cslytics/market-data';
 import { CSFLOAT_CURRENCY } from '@cslytics/ports';
 import type { IconName } from '../components/Icon.js';
-import { formatAmount } from './money.js';
+import { COOLDOWN_CAUSE, isHeldForCooldown, isUnsent, isWaitingPriceChange } from '../features/work/work-busy.js';
+import { currencyOf, formatAmount, type CurrencyRef } from './money.js';
+import { formatClock, formatDateTime } from './time.js';
 
 /**
  * Words for codes.
@@ -64,7 +66,7 @@ export function locationLabel(location: string | null | undefined): StateLabel {
 }
 
 export const UNRESOLVED_REASON: Readonly<Record<string, string>> = {
-  'not-in-revision': 'Not in the current catalogue — it may have been released since the last update',
+  'not-in-revision': 'Not in the current catalogue. It may be newer than the last update.',
   'never-fetched': 'The catalogue has not been downloaded yet',
   'lookup-failed': 'The catalogue could not be reached for this item',
   'no-identity': 'Steam named no item for this line, and no walk matched it to one'
@@ -78,6 +80,27 @@ export const LISTING_STATUS: Readonly<Record<string, StateLabel>> = {
   PENDING_CONFIRMATION: { label: 'Confirm on phone', tone: 'accent', icon: 'smartphone' },
   ABSENT: { label: 'Gone', tone: 'quiet', icon: 'x-circle' }
 };
+
+/**
+ * How Steam changes a listing's price, in the words every place that offers a reprice uses: the
+ * chip on a staged row, and the caption under Reprice in the item inspector.
+ *
+ * Steam asks for a lower price to be confirmed in the Steam Mobile app on most accounts and by a
+ * link it e-mails on others, and nothing here knows which until Steam has answered a change, so
+ * these words are true of both. Once a lower price waits, the listing and the waiting list say
+ * which (`pendingTitle`, `waitingBadge`).
+ */
+export const STEAM_PRICE_CHANGE = {
+  /** A chip's worth: the one step a person may be asked for. */
+  short: 'Lowering needs confirming',
+  /** A caption's worth: where the price changes, and what a lower one waits for. */
+  caption: 'The price changes on the same listing. A lower price waits for you to confirm it.',
+  /** All of it, for a tip. */
+  text: 'The price changes on the same listing. A higher price applies at once. A lower price waits for you to confirm it, in the Steam Mobile app or with a link Steam e-mails you, and the listing stays at its current price until then. Steam allows one price change every 5 minutes per listing.'
+} as const;
+
+/** Why a change staged inside the cooldown is not sent at once: the tip on the row's countdown. */
+export const STEAM_PRICE_CHANGE_HELD = 'Steam allows one price change per listing every 5 minutes. A change sent now is held, and sent when the wait ends.';
 
 /** The order alphabet of `venue_order` (engine `db/alphabets.ts`), in a person's words. */
 export const ORDER_STATE: Readonly<Record<string, StateLabel>> = {
@@ -182,10 +205,10 @@ export const WORK_STATE: Readonly<Record<string, StateLabel>> = {
   // A transfer batch retrieving a crated item before its offer goes: the hop is a casket move,
   // proved by a later complete walk, and the send waits on it.
   RETRIEVING: { label: 'Retrieving from storage', tone: 'accent', icon: 'archive' },
-  // A listing from a unit whose retrieve was observed: the item is loose, and the listing waits
-  // for the marketplace's own copy of the inventory to show it (CSF-32). `workStateLabel` names
-  // the marketplace.
-  AWAITING_VENUE: { label: 'Retrieved, waiting for Steam to see it', tone: 'accent', icon: 'eye' },
+  // A CSFloat listing CSFloat refused because its copy of the inventory does not hold the item
+  // yet: it is sent again on a schedule until CSFloat shows it, or gives up after an hour (CSF-58).
+  // `inventoryWaitPhrase` says when.
+  AWAITING_VENUE: { label: 'Waiting for CSFloat to show the item in its inventory', tone: 'accent', icon: 'eye' },
   // An offer this app sent, by what Steam shows of it: live and waiting on the other account,
   // accepted and held by Steam, accepted and waiting for both inventories to prove the move.
   ACTIVE: { label: 'On Steam, waiting for the other account', tone: 'accent', icon: 'send' },
@@ -210,18 +233,62 @@ export const WORK_STATE: Readonly<Record<string, StateLabel>> = {
 /**
  * What a `RETRYING` member is doing, with the countdown: "Steam still shows it · trying again in
  * 0:27 · attempt 2 of 4", then "sending again" once the moment has passed and the resend is the
- * engine's next turn. The marketplace is the row's, as `workStateLabel` names it. Written here
- * rather than in the panel so the indicator's sentence and the panel's caption cannot drift.
+ * engine's next turn. When the marketplace refused the send for its pace (`retryCause: 'rate-limit'`,
+ * a 429) it says so instead: "CSFloat asked to slow down · trying again in 0:27". The marketplace is
+ * the row's, as `workStateLabel` names it. Written here rather than in the panel so the indicator's
+ * sentence and the panel's caption cannot drift.
  */
 export function retryPhrase(
-  row: { retryAt: string | null; attempt: number | null; attemptLimit: number | null },
+  row: { retryAt: string | null; attempt: number | null; attemptLimit: number | null; retryCause?: string | null | undefined },
   venue: 'steam' | 'csfloat' | undefined,
   now = Date.now()
 ): string {
+  // Not a retry: nothing was refused or proved absent. The change has not been sent, and waits on Steam's own clock.
+  if (row.retryCause === COOLDOWN_CAUSE) return cooldownPhrase(row, now);
   const leftMs = row.retryAt ? Date.parse(row.retryAt) - now : 0;
   const when = leftMs > 0 ? `trying again in ${formatCountdown(leftMs)}` : 'sending again';
   const count = row.attempt !== null && row.attemptLimit !== null ? ` · attempt ${row.attempt} of ${row.attemptLimit}` : '';
-  return `${VENUE_NAME[venue ?? 'steam']} still shows it · ${when}${count}`;
+  const why = row.retryCause === 'rate-limit' ? 'asked to slow down' : 'still shows it';
+  return `${VENUE_NAME[venue ?? 'steam']} ${why} · ${when}${count}`;
+}
+
+/**
+ * What a price change held for the cooldown (`isHeldForCooldown`) is doing, with the countdown:
+ * "Steam's 5-minute price-change cooldown · 3:41", then "sending now" once the moment has passed
+ * and the send is the engine's next turn.
+ */
+export function cooldownPhrase(row: { retryAt: string | null }, now = Date.now()): string {
+  const leftMs = row.retryAt ? Date.parse(row.retryAt) - now : 0;
+  return `Steam's 5-minute price-change cooldown · ${leftMs > 0 ? formatCountdown(leftMs) : 'sending now'}`;
+}
+
+/**
+ * When a lower Steam price waiting for its confirmation is dropped, as the engine gives it (the
+ * work read's `waitDeadline`, the waiting read's `expiresAt`): "dropped at 14:05 if not
+ * confirmed". The listing keeps the price it has after that. `null` when there is no deadline to
+ * say, or it is not an instant.
+ */
+export function priceChangeDeadlinePhrase(deadline: string | null | undefined): string | null {
+  if (!deadline) return null;
+  const at = Date.parse(deadline);
+  return Number.isFinite(at) ? `dropped at ${formatClock(at)} if not confirmed` : null;
+}
+
+/**
+ * What an `AWAITING_VENUE` member is doing: a CSFloat listing waiting for CSFloat's copy of the
+ * inventory to show its item (CSF-58). "Trying again in 0:47 · gives up at 14:32", then "trying
+ * again now" once the moment has passed and the send is the engine's next turn; and, while the
+ * account's reads of that copy are paused for the day, that the listing is still being sent.
+ */
+export function inventoryWaitPhrase(
+  row: { retryAt: string | null; waitDeadline?: string | null | undefined; readsPausedUntil?: string | null | undefined },
+  now = Date.now()
+): string {
+  const leftMs = row.retryAt ? Date.parse(row.retryAt) - now : 0;
+  const parts = [leftMs > 0 ? `Trying again in ${formatCountdown(leftMs)}` : 'Trying again now'];
+  if (row.waitDeadline) parts.push(`gives up at ${formatClock(row.waitDeadline)}`);
+  if (row.readsPausedUntil) parts.push(`CSFloat inventory reads paused until ${formatClock(row.readsPausedUntil)} (daily limit); still trying`);
+  return parts.join(' · ');
 }
 
 /** How a command's members stand, counted in items, and the one reason its failures share when they share one. */
@@ -297,6 +364,9 @@ export const DESTINATION: Readonly<Record<string, Destination>> = {
   ACCOUNT_TRANSFER: { icon: 'send', verb: 'Transferring', done: 'Transferred' },
   LIST: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'steam' },
   REPRICE: { icon: 'pencil', verb: 'Repricing', done: 'Repriced', venue: 'steam' },
+  // A new price by the older route: the listing is removed and the item listed again. The desktop
+  // never asks for it; this row is for a window over an engine host that does.
+  RELIST: { icon: 'refresh', verb: 'Relisting', done: 'Relisted', venue: 'steam' },
   // A delist asked for by hand. The engine has no such command: the work read names it.
   DELIST: { icon: 'trash', verb: 'Delisting', done: 'Delisted', venue: 'steam', joiner: 'from' },
   DELIST_TO_STORE: { icon: 'undo', verb: 'Delisting', done: 'Delisted', venue: 'steam', joiner: 'from' },
@@ -317,8 +387,12 @@ export const DESTINATION: Readonly<Record<string, Destination>> = {
   // kind and a CSFloat one `CSFLOAT_<operation kind>`, as for a listing.
   BUY_ORDER_CREATE: { icon: 'shopping-cart', verb: 'Placing', done: 'Placed', venue: 'steam', noun: 'buy order' },
   BUY_ORDER_CANCEL: { icon: 'trash', verb: 'Cancelling', done: 'Cancelled', venue: 'steam', noun: 'buy order' },
+  CSFLOAT_BUY_ORDER_CREATE: { icon: 'shopping-cart', verb: 'Placing', done: 'Placed', venue: 'csfloat', noun: 'buy order' },
   CSFLOAT_BUY_ORDER_EDIT: { icon: 'pencil', verb: 'Changing', done: 'Changed', venue: 'csfloat', noun: 'buy order' },
-  CSFLOAT_BUY_ORDER_CANCEL: { icon: 'trash', verb: 'Cancelling', done: 'Cancelled', venue: 'csfloat', noun: 'buy order' }
+  CSFLOAT_BUY_ORDER_CANCEL: { icon: 'trash', verb: 'Cancelling', done: 'Cancelled', venue: 'csfloat', noun: 'buy order' },
+  // A row of the listing workspace handed to a listing strategy a build offers, or let go by one
+  // (`LISTING_STRATEGY_KIND`). The engine has no such command: only the window's outbox names it.
+  LISTING_STRATEGY: { icon: 'route', verb: 'Handing over', done: 'Handed over' }
 };
 
 /** The hop an item is on now, so a chained command reads as two steps rather than one jump. */
@@ -327,6 +401,10 @@ export const ACTION_DESTINATION: Readonly<Record<string, Destination>> = {
   RETRIEVE_FROM_CASKET: { icon: 'download', verb: 'Retrieving', done: 'Retrieved' },
   CREATE_SELL_LISTING: { icon: 'tag', verb: 'Listing', done: 'Listed', venue: 'steam' },
   REMOVE_SELL_LISTING: { icon: 'undo', verb: 'Delisting', done: 'Delisted', venue: 'steam', joiner: 'from' },
+  // A Steam reprice's one hop: the price is changed on the listing that is there.
+  UPDATE_SELL_LISTING_PRICE: { icon: 'pencil', verb: 'Repricing', done: 'Repriced', venue: 'steam' },
+  // A lower price that was waiting for its confirmation being withdrawn: the listing keeps the price it has.
+  DISCARD_SELL_LISTING_PRICE_CHANGE: { icon: 'undo', verb: 'Cancelling the price change', done: 'Cancelled the price change', venue: 'steam' },
   SEND_TRADE_OFFER: { icon: 'send', verb: 'Sending', done: 'Sent' },
   ACCEPT_TRADE_OFFER: { icon: 'check', verb: 'Accepting', done: 'Accepted' },
   // The hops of a transfer between owned accounts, by the kind of the action that carries each.
@@ -361,18 +439,145 @@ export function destinationOf(commandKind: string, actionKind?: string | null): 
   return hop ?? DESTINATION[commandKind] ?? { icon: 'package', verb: 'Working on' };
 }
 
+/** One step of a chain: the action kind it is, and how `ACTION_DESTINATION` says it. */
+export type Hop = Destination & { kind: string };
+
+/** The two hops of a price change by the older route: the listing is removed, then the item listed again. */
+const RELIST_CHAIN: readonly string[] = ['REMOVE_SELL_LISTING', 'CREATE_SELL_LISTING'];
+
 /**
- * A lock, in words and with its consequence.
+ * The hops a member passes through.
+ *
+ * Derived from the command kind rather than read from the plan, because the plan is the engine's
+ * and this is a caption. A LIST member carrying a retrieve action is the chained case: it is being
+ * taken out of a unit first, and the glyph must not show the Steam mark until that is observed.
+ *
+ * A Steam reprice is one hop, the price changed on the listing that is there, so its row reads as
+ * one step. The older route, `RELIST`, is two. An engine from before the price edit ran that same
+ * chain under the name `REPRICE`: its member is carried by one of the chain's two actions, and is
+ * shown as the chain it is.
+ *
+ * Fewer than two hops is no chain to draw: the row says its one step on a single line.
+ */
+export function chainFor(member: { commandKind: string; actionKind: string | null }): Hop[] {
+  const hops = (...kinds: string[]): Hop[] => kinds.map((kind) => ({ kind, ...ACTION_DESTINATION[kind]! }));
+  if (member.commandKind === 'LIST' && member.actionKind === 'RETRIEVE_FROM_CASKET') return hops('RETRIEVE_FROM_CASKET', 'CREATE_SELL_LISTING');
+  // The engine's name for a CSFloat list; `CSFLOAT_LIST` is only the outbox's word for it.
+  if (member.commandKind === 'CSFLOAT_CREATE' && member.actionKind === 'RETRIEVE_FROM_CASKET') return hops('RETRIEVE_FROM_CASKET', 'CSFLOAT_CREATE');
+  if (member.commandKind === 'DELIST_TO_STORE') return hops('REMOVE_SELL_LISTING', 'STORE_IN_CASKET');
+  if (member.commandKind === 'RELIST') return hops(...RELIST_CHAIN);
+  if (member.commandKind === 'REPRICE') {
+    const older = member.actionKind !== null && RELIST_CHAIN.includes(member.actionKind);
+    return older ? hops(...RELIST_CHAIN) : hops('UPDATE_SELL_LISTING_PRICE');
+  }
+  return [];
+}
+
+/**
+ * The hop a member is on.
+ *
+ * The engine reports the newest action carrying the member. When that action is `DONE` and the
+ * chain has another hop, the member is waiting for the next one to be sent — a crated item whose
+ * retrieve was observed is queued for listing, not still retrieving — so the highlight moves on.
+ */
+export function currentHop(member: { actionKind: string | null; actionState: string | null }, hops: readonly Hop[]): string | null {
+  if (member.actionState !== 'DONE') return member.actionKind;
+  const index = hops.findIndex((hop) => hop.kind === member.actionKind);
+  return index >= 0 ? hops[index + 1]?.kind ?? member.actionKind : member.actionKind;
+}
+
+/**
+ * Why a Steam price change failed, by the engine's code for it. Each says what became of the
+ * listing, because that is what a person needs to know before doing anything else: its price
+ * was not changed.
+ */
+const PRICE_CHANGE_FAILURE: ReadonlyMap<string, string> = new Map([
+  ['price-edit-unavailable', "Steam would not change this listing's price. Remove the listing and list the item again."],
+  ['not-confirmed', 'The lower price was not confirmed in time. Nothing changed.'],
+  ['unanswered', 'Steam did not answer. Nothing changed; try again.'],
+  ['withdrawal-unheard', 'Steam did not answer the cancel. The lower price may still be waiting for your confirmation in the Steam app: decline it there.']
+]);
+
+/** The action kinds that carry a Steam price change: the change itself, and a waiting lower price being withdrawn. */
+const PRICE_CHANGE_ACTIONS: ReadonlySet<string> = new Set(['UPDATE_SELL_LISTING_PRICE', 'DISCARD_SELL_LISTING_PRICE_CHANGE']);
+
+/**
+ * Why a piece of work failed or was refused, for a person.
+ *
+ * The engine's reason is shown as it wrote it, with one exception: a Steam price change fails with
+ * a short code, and a code is not a reason anybody can act on, so those are put in plain words.
+ * The codes are read only on a price change. On any other work the same word would mean something
+ * else, and is left as the engine wrote it.
+ */
+export function failureReason(reason: string, work: { commandKind: string; actionKind?: string | null | undefined }): string {
+  const priceChange = work.commandKind === 'REPRICE' || (work.actionKind != null && PRICE_CHANGE_ACTIONS.has(work.actionKind));
+  // A map, not an object: a reason is free text, and an object would answer `toString` with a function.
+  return (priceChange ? PRICE_CHANGE_FAILURE.get(reason) : undefined) ?? reason;
+}
+
+/**
+ * What a command's Stop button does, in its own words, or `null` when it would do nothing.
+ *
+ * `command.stop` halts every hop of the command not yet sent, a price change held for its
+ * listing's cooldown included (`isUnsent`), and withdraws every lower Steam price of the command
+ * still waiting for its confirmation (`isWaitingPriceChange`): the engine sends Steam a discard
+ * and the listing keeps the price it has. Everything else that was sent is left to finish. One
+ * press reaches the whole command, and the listing workspace sends its Steam rows as one command,
+ * so the words count the lower prices it cancels. Whether the command is one Stop can reach at all
+ * (a CSFloat operation, a hand delist and a send still in the outbox are not) is the panel's.
+ */
+export function stopOffer(members: ReadonlyArray<{ memberState: string; retryCause?: string | null | undefined; actionKind?: string | null | undefined }>): { label: string; title: string } | null {
+  const unsent = members.some(isUnsent);
+  const withdraws = members.filter(isWaitingPriceChange).length;
+  if (!unsent && withdraws === 0) return null;
+  const rest = 'Anything else already sent is left to finish.';
+  if (withdraws === 0) return { label: 'Remove all queued', title: `Remove everything here that has not been sent yet. ${rest}` };
+  const prices = withdraws === 1 ? 'the lower price' : `${withdraws} lower prices`;
+  const waiting = `${withdraws === 1 ? 'the lower price' : `the ${withdraws} lower prices`} waiting for you to confirm`;
+  const stays = withdraws === 1 ? 'Its listing stays at the price it has.' : 'Their listings stay at the prices they have.';
+  return unsent
+    ? { label: `Remove queued and cancel ${prices}`, title: `Remove everything here that has not been sent yet, and withdraw ${waiting}. ${stays} ${rest}` }
+    : { label: `Cancel ${prices}`, title: `Withdraw ${waiting}. ${stays} ${rest}` };
+}
+
+/**
+ * The price on a work row, saying which figure it is and in its currency: "you receive A$ 9.00
+ * AUD", "buyer pays $42.00 USD", "up to $3.00 USD". `null` when the row has no price, or when the
+ * currency the figure is in is not known: a figure printed in a currency it was not sent in, or
+ * with none, states a price nobody asked for.
+ *
+ * Which figure is the row's kind. A Steam command's member carries what the seller receives (rule
+ * 4); a CSFloat listing or reprice carries what the buyer pays, and a buy order its limit. A send
+ * still in the window's outbox carries what the seller receives and the currency it was priced
+ * in, because it may have no marketplace of its own (a row handed to a listing strategy). Any
+ * other row's currency is its marketplace's: US dollars on CSFloat, the account's wallet on Steam
+ * (`wallet`, `null` until a read has named it); a row on no marketplace prints no figure.
+ */
+export function workFigure(
+  row: { commandKind: string; priceReceiveCents: number | null; outbox?: true | undefined; currency?: CurrencyRef },
+  venue: 'steam' | 'csfloat' | undefined,
+  wallet: number | null | undefined
+): string | null {
+  if (row.priceReceiveCents === null) return null;
+  const currency: CurrencyRef = row.outbox ? row.currency : venue === 'csfloat' ? CSFLOAT_CURRENCY : venue === 'steam' ? wallet : null;
+  if (currencyOf(currency) === undefined) return null;
+  const amount = formatAmount(row.priceReceiveCents, currency);
+  if (row.outbox) return `you receive ${amount}`;
+  if (row.commandKind.includes('BUY_ORDER')) return `up to ${amount}`;
+  return row.commandKind.startsWith('CSFLOAT_') ? `buyer pays ${amount}` : `you receive ${amount}`;
+}
+
+/**
+ * A lock in words: "Market-locked until 29 Nov 2026, 19:00", in the time zone chosen in Settings.
  *
  * Never a bare ISO string: the date is what a person needs, formatted the way they read dates.
+ * What the lock permits is not repeated here; the buttons it disables say so in their own reason.
  * A caption is only ever produced for a lock that is still in the future — `lockOf` returns
  * nothing once the date has passed — so this never has to hedge about whether a lock is live.
  */
 export function lockLabel(kind: 'market' | 'trade', until: string): string {
   const when = formatDateTime(until);
-  return kind === 'market'
-    ? `Market-locked until ${when} — can be stored, not listed`
-    : `Trade-protected until ${when} — cannot be stored or listed`;
+  return kind === 'market' ? `Market-locked until ${when}` : `Trade-protected until ${when}`;
 }
 
 // ---------------------------------------------------------------------------- filter chips
@@ -387,6 +592,7 @@ export function chipLabel(chip: {
   kind: string; text: string; minWear?: number | undefined; maxWear?: number | undefined;
   op?: string | undefined; value?: number | undefined; quality?: string | undefined;
   location?: string | undefined; listed?: boolean | undefined; lock?: string | undefined;
+  accessory?: string | undefined;
 }): string {
   const number = (value: number): string => String(Number(value.toFixed(4)));
   switch (chip.kind) {
@@ -422,6 +628,8 @@ export function chipLabel(chip: {
     case 'where': return chip.listed ? LISTED.label : chip.location ? LOCATION[chip.location]?.label ?? chip.text : chip.text;
     case 'tradable': return 'Tradable';
     case 'lock': return chip.lock === 'market' ? 'Market-locked' : 'Trade-protected';
+    // What is applied to the item: anything in a kind of slot, or one sticker, patch or charm by name.
+    case 'applied': return chip.accessory === 'sticker' ? 'With stickers' : chip.accessory === 'charm' ? 'With a charm' : `With ${chip.text}`;
     case 'item': return chip.text;
     default: return chip.text;
   }
@@ -489,29 +697,52 @@ export function stateLabel(table: Readonly<Record<string, StateLabel>>, code: st
  * walk instead, so the venue in the sentence is the row's `destinationOf`, not a fixed word. The
  * listing workspace used to say "waiting for CSFloat to show it" on its own row; now that a sent
  * row lives only on the work panel, this is where the venue has to be right.
+ *
+ * `work` is what else the row says about itself, for the two states whose words depend on it: why
+ * it waits (`retryCause`), and the action that carries it (`actionKind`).
  */
-export function workStateLabel(code: string | null | undefined, venue: 'steam' | 'csfloat' | undefined): StateLabel {
+export function workStateLabel(
+  code: string | null | undefined,
+  venue: 'steam' | 'csfloat' | undefined,
+  work: { retryCause?: string | null | undefined; actionKind?: string | null | undefined } = {}
+): StateLabel {
+  // A price change held for Steam's cooldown is reported in the state of work waiting on its
+  // venue, whose words are about CSFloat's copy of the inventory. Its cause says what it is.
+  if (code !== null && code !== undefined && isHeldForCooldown({ memberState: code, retryCause: work.retryCause })) return COOLDOWN_HELD;
+  // A lower price waiting for its confirmation is a listing still on sale at the price it has, not
+  // one waiting to go on the market: what is confirmed is the price.
+  if (code === 'AWAITING_CONFIRMATION' && work.actionKind === 'UPDATE_SELL_LISTING_PRICE') return PRICE_AWAITING_CONFIRMATION;
   const base = stateLabel(WORK_STATE, code);
   if (!venue || venue === 'steam') return base;
   return { ...base, label: base.label.replace(VENUE_NAME.steam, VENUE_NAME[venue]) };
 }
 
+const COOLDOWN_HELD: StateLabel = { label: 'Held until Steam allows a price change', tone: 'accent', icon: 'clock' };
+/**
+ * A work row does not say how the person confirms (the mobile app, or a link Steam e-mailed), so
+ * the words are the ones true of both; the waiting list and the listing say which.
+ */
+const PRICE_AWAITING_CONFIRMATION: StateLabel = { label: 'On Steam, waiting for you to confirm the new price', tone: 'accent', icon: 'shield-check' };
+
+/**
+ * What a row of the waiting list is, by the engine's kind for it. A lower price waiting for its
+ * confirmation is a kind of its own: the listing it belongs to is on the market all the while.
+ */
+export const WAITING_KIND: Readonly<Record<string, string>> = {
+  SELL_LISTING: 'Sell listing',
+  BUY_ORDER: 'Buy order',
+  TRADE_OFFER: 'Trade offer',
+  LISTING_PRICE_CHANGE: 'Price change'
+};
+
+export function waitingKindLabel(kind: string): string {
+  return WAITING_KIND[kind] ?? humanize(kind);
+}
+
 // ---------------------------------------------------------------------------- dates and money
 
-const DATE_TIME = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-const DATE_ONLY = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
-
-export function formatDateTime(iso: string | null | undefined): string {
-  if (!iso) return '—';
-  const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? iso : DATE_TIME.format(date);
-}
-
-export function formatDate(iso: string | null | undefined): string {
-  if (!iso) return '—';
-  const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? iso : DATE_ONLY.format(date);
-}
+// Dates are printed in the time zone chosen in Settings (lib/time.ts); these stay importable from here.
+export { formatDate, formatDateTime } from './time.js';
 
 /** "3 minutes ago", "in 2 days", "just now". Past and future both read naturally. */
 export function formatRelative(iso: string | null | undefined, now = new Date()): string {

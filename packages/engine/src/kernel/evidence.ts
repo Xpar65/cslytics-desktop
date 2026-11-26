@@ -6,7 +6,7 @@ import { CsfloatStore } from '../db/csfloat.js';
 export type Freshness = 'FRESH' | 'STALE' | 'INCOMPLETE' | 'NEVER';
 export type Surface =
   | 'gc-inventory' | 'gc-casket' | 'gc-event' | 'gc-storage-units'
-  | 'steam-market' | 'steam-market-history' | 'steam-wallet'
+  | 'steam-market' | 'steam-market-history' | 'steam-market-listing-times' | 'steam-wallet'
   | 'steam-trade-offers' | 'steam-trade-history' | 'steam-trade-inventory'
   | 'steam-persona'
   | 'csfloat-account-status' | 'csfloat-stall' | 'csfloat-inventory' | 'csfloat-trades' | 'csfloat-trade' | 'csfloat-listing' | 'csfloat-buy-orders'
@@ -36,8 +36,10 @@ export type Evidence<T> =
  */
 export const FRESHNESS: Record<Surface, { maxAgeMs: number; scope: ScopeKind; proves: 'presence' | 'set' }> = {
   // CSFloat allows about 120 inventory reads a day: trusted for five minutes, a steady listing loop read it 288
-  // times a day and spent the day by late morning (2026-10-25). Fifteen keeps it near 96 (CSF-51).
-  'csfloat-inventory': { maxAgeMs: 15 * 60_000, scope: 'account', proves: 'presence' },
+  // times a day and spent the day by late morning (2026-10-25). Fifteen kept it near 96 (CSF-51), until a listing read
+  // it before every send and spent it by mid-afternoon (2026-11-10). Nothing reads it to admit a listing now (CSF-58), and
+  // a read is trusted for thirty minutes, twice the interval it is read at while a listing waits on it.
+  'csfloat-inventory': { maxAgeMs: 30 * 60_000, scope: 'account', proves: 'presence' },
   'csfloat-trades': { maxAgeMs: 5 * 60_000, scope: 'account', proves: 'set' },
   'csfloat-trade': { maxAgeMs: 5 * 60_000, scope: 'item', proves: 'presence' },
   'csfloat-listing': { maxAgeMs: 5 * 60_000, scope: 'item', proves: 'presence' },
@@ -48,6 +50,9 @@ export const FRESHNESS: Record<Surface, { maxAgeMs: number; scope: ScopeKind; pr
   'gc-storage-units': { maxAgeMs: 15 * 60_000, scope: 'account', proves: 'set' },
   'steam-market': { maxAgeMs: 5 * 60_000, scope: 'account', proves: 'set' },
   'steam-market-history': { maxAgeMs: 15 * 60_000, scope: 'account', proves: 'set' },
+  // The listing time of each sale and purchase (listing times plan D1). Presence only, and no
+  // precondition reads it: a walk of it proves when listings went live, never what the log holds.
+  'steam-market-listing-times': { maxAgeMs: 15 * 60_000, scope: 'account', proves: 'presence' },
   'steam-wallet': { maxAgeMs: 5 * 60_000, scope: 'account', proves: 'set' },
   // A complete offer walk is a set claim: these are all the offers. Executed history proves
   // presence only — Steam's log is append-only, so a walk of it can never establish that a

@@ -196,6 +196,54 @@ export type ItemVariants = {
   minFloat: number | null;
   maxFloat: number | null;
   variants: ItemVariant[];
+  /**
+   * The qualities the skin is sold in, when it is sold in more than one: each with the market name
+   * that opens it at the wear this page is on. Empty for an item sold one way.
+   */
+  qualities: ItemQuality[];
+  /** The name its tile carries on a grid: the skin, whatever quality and wear this page is of. */
+  skin: string;
+  /** The collection it is part of, or `null` for an item in none. */
+  collection: CollectionRef | null;
 };
+
+/** A collection as a page names it: enough to draw its emblem and to ask for what is in it. */
+export type CollectionRef = {
+  id: string;
+  name: string;
+  /** A `cs-image:` handle main resolves, never a URL. */
+  imageUrl: string | null;
+};
+
+/**
+ * What a collection holds, as the catalogue reads it from the collection's own entries: weapon
+ * finishes a case or a terminal is opened for (`case`), weapon finishes that come any other way
+ * (`collection`), or the one type of item it is a set of.
+ */
+export type CollectionKind = 'case' | 'collection' | 'sticker' | 'charm' | 'agent' | 'other';
+
+/** One collection on the Items page before anything is asked for: its emblem, its size, its day and its kind. */
+export type CollectionTile = CollectionRef & {
+  /** How many tiles its chip shows. */
+  skins: number;
+  /** `YYYY-MM-DD`, or `null` where the catalogue names no release. */
+  releaseDate: string | null;
+  kind: CollectionKind;
+};
+
+/** One quality a skin is sold in: Normal, StatTrak™ or Souvenir. */
+export type ItemQuality = { id: 'normal' | 'stattrak' | 'souvenir'; label: string; name: string; current: boolean };
+
+/** One skin on the Items page's browse grid: a base name, never one wear of it. */
+export type SkinTile = {
+  name: string;
+  category: string;
+  rarity: { id: string; name: string; colour: string } | null;
+  /** A `cs-image:` handle main resolves, never a URL. */
+  imageUrl: string | null;
+};
+
+/** One page of the skins the Items page's chips name; `next` is where the following page starts, or `null` at the end. */
+export type SkinPage = { total: number; skins: SkinTile[]; next: number | null };
 
 export type MarketHistoryRow = ValuationSnapshotRow;

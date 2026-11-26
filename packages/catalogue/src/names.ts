@@ -72,6 +72,55 @@ export function rawFallbackName(identity: {
   return `${parts.join(' · ')}${tier ? ` (${tier.label})` : ''}`;
 }
 
+/** How a base name says its quality: after the star a knife or a pair of gloves carries, before the name. */
+const QUALITY_PREFIX = /^(★ )?(StatTrak™ |Souvenir )/;
+
+/** The qualities one skin is sold in, in the order a page offers them. */
+export type SkinQuality = 'normal' | 'stattrak' | 'souvenir';
+
+/**
+ * The skin a base name is a quality of: `★ StatTrak™ Karambit | Fade` and `★ Karambit | Fade` are
+ * one skin, as `Souvenir AWP | Dragon Lore` and `AWP | Dragon Lore` are. The answer is the normal
+ * quality's own base name, so it is a market name wherever that quality exists.
+ */
+export function skinName(marketHashNameBase: string): string {
+  return marketHashNameBase.replace(QUALITY_PREFIX, '$1');
+}
+
+/** Which quality a base name is sold as, read from the name as Steam writes it. */
+export function skinQuality(marketHashNameBase: string): SkinQuality {
+  const prefix = QUALITY_PREFIX.exec(marketHashNameBase)?.[2];
+  return prefix === 'StatTrak™ ' ? 'stattrak' : prefix === 'Souvenir ' ? 'souvenir' : 'normal';
+}
+
+/** The categories whose items are a weapon and a finish, so the name before the bar is the weapon's. */
+const WEAPON_CATEGORIES: ReadonlySet<string> = new Set(['Pistol', 'Rifle', 'SMG', 'Heavy', 'Knife', 'Gloves', 'Equipment']);
+
+/** Whether an entry is a thing a finish goes on: a weapon, a knife or gloves. */
+export function isWeapon(entry: Pick<CatalogueEntry, 'category'>): boolean {
+  return WEAPON_CATEGORIES.has(entry.category);
+}
+
+/**
+ * The weapon an entry is a skin of: `AWP`, `Karambit`, `Sport Gloves`. `null` for anything that is
+ * not a weapon, a knife or gloves: a sticker's name also has a bar in it, and `Sticker` is its
+ * category, not a weapon.
+ */
+export function weaponName(entry: Pick<CatalogueEntry, 'marketHashNameBase' | 'category'>): string | null {
+  if (!WEAPON_CATEGORIES.has(entry.category)) return null;
+  const weapon = skinName(entry.marketHashNameBase).replace(/^★ /, '').split(' | ')[0]!.trim();
+  return weapon || null;
+}
+
+/**
+ * A weapon as the game issues it, with no finish: `AWP`, `Sport Gloves`, the default `Knife`.
+ * Every player has one and no market sells it, so it is no skin to browse. A knife with no finish
+ * that *is* sold carries the star (`★ Karambit`), which is what tells the two apart.
+ */
+export function isStockWeapon(entry: Pick<CatalogueEntry, 'marketHashNameBase' | 'category'>): boolean {
+  return WEAPON_CATEGORIES.has(entry.category) && !entry.marketHashNameBase.includes(' | ') && !entry.marketHashNameBase.startsWith('★');
+}
+
 /** Steam econ quality ids that change how an item reads. */
 export function qualityLabel(quality: number): string | null {
   if (quality === 9) return 'StatTrak™';

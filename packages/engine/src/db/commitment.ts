@@ -19,8 +19,13 @@
 /** A sell order still standing against the holding: open on the venue, sent and not yet seen, or ended with no explanation. */
 const COMMITTED = "o.side='SELL' AND o.state NOT LIKE 'ENDED_%'";
 
+/** A sell listing the venue's last complete walk of its book showed: Steam's market walk, CSFloat's stall walk. */
+function listedOn(venue: 'steam' | 'csfloat'): string {
+  return `o.venue='${venue}' AND o.side='SELL' AND o.first_seen_obs IS NOT NULL AND o.gone_obs IS NULL`;
+}
+
 /** A Steam sell listing the last complete market walk showed, in any of Steam's three buckets. */
-const STEAM_LISTED = "o.venue='steam' AND o.side='SELL' AND o.first_seen_obs IS NOT NULL AND o.gone_obs IS NULL";
+const STEAM_LISTED = listedOn('steam');
 
 function names(alias: string, predicate: string): string {
   return `(EXISTS (SELECT 1 FROM venue_order o WHERE o.account_id=${alias}.account_id AND o.local_id=${alias}.local_id AND ${predicate})
@@ -41,6 +46,15 @@ export function committedSql(alias: string, venue?: 'steam' | 'csfloat'): string
 /** SQL that is true when an open Steam listing names the `item` row aliased `alias`. */
 export function steamListedSql(alias: string): string {
   return names(alias, STEAM_LISTED);
+}
+
+/**
+ * SQL that is true when a CSFloat listing the last complete stall walk showed names the `item` row
+ * aliased `alias`: the row the Listings page shows for it. A fact to show beside the item, as
+ * `steamListedSql` is; whether a second sell of it is refused is `committedSql`'s question.
+ */
+export function csfloatListedSql(alias: string): string {
+  return names(alias, listedOn('csfloat'));
 }
 
 /** The Steam-listed predicate over a `venue_order` row aliased `o`, for a query that already has the row. */

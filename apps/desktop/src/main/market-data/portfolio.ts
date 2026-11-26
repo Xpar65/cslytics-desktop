@@ -4,6 +4,7 @@ import {
   type ValuationInput, type ValuedPosition
 } from '@cslytics/market-data';
 import type { AccountHoldings, InventoryPositionRow, PositionsEnvelope } from '@cslytics/engine';
+import { kindKey } from '@cslytics/ports';
 import { baseCurrencyOf, type DesktopSettings, type EngineCommand } from '../../shared/api.js';
 import type {
   AccountFigures, BaseSum, BookConverted, CurvesSource, ItemBook, ItemCurve, ItemHistory, ItemHolding, ItemPage, ItemVariants, ObservedByCurrency, ObservedFigure,
@@ -180,14 +181,7 @@ export async function portfolioValuation(deps: PortfolioDeps, accountIds: readon
   }
 
   const rows = deps.catalogue.enrich(positions.rows).map(toPosition);
-  const names = [...new Set(rows.map((row) => row.name).filter((name): name is string => name !== null))];
-  // CSlytics's snapshot first, for every name it covers (portfolio prices plan D9); Steam's own
-  // books for the rest, which are the only names the fill is then given.
-  const snapshotHeld = deps.host.usableSnapshot();
-  const covered = snapshotHeld === null ? new Map<string, StoredPrice>() : deps.host.store.prices('steam', names);
-  const snapshot = snapshotHeld === null ? undefined : { rows: covered, generatedAt: snapshotHeld.generatedAt };
-  const books = deps.host.store.books(names.filter((name) => !covered.has(name)));
-  const statuses = deps.host.store.statuses(names);
+  const { names, snapshotHeld, covered, snapshot, books, statuses } = pricesFor(deps, rows);
   // CSlytics's Steam float curve for every skin, which the float value prices each unit by (plan D7);
   // the market value never reads one. Only the copies already held are read here; the curve fill
   // asks for the rest.
@@ -230,6 +224,67 @@ export async function portfolioValuation(deps: PortfolioDeps, accountIds: readon
     base, settings: settings.currency, valuation, needsFilter: null, observed, observedInBase: inBase, wallet, total,
     accounts: accountFigures(holdings, valuation, base, fx), status, fill: deps.host.fill(), valued, floatValued, lastSnapshotDay, observedIn, prices, curves: curvesSource
   };
+}
+
+/**
+ * What a set of positions is priced from: CSlytics's snapshot first, for every name it covers
+ * (portfolio prices plan D9), and Steam's own books cached here for the rest, which are the only
+ * names the fill is then given. Read from the cache alone; nothing is fetched.
+ */
+function pricesFor(deps: PortfolioDeps, rows: readonly Position[]) {
+  const names = [...new Set(rows.map((row) => row.name).filter((name): name is string => name !== null))];
+  const snapshotHeld = deps.host.usableSnapshot();
+  const covered = snapshotHeld === null ? new Map<string, StoredPrice>() : deps.host.store.prices('steam', names);
+  const snapshot = snapshotHeld === null ? undefined : { rows: covered, generatedAt: snapshotHeld.generatedAt };
+  const books = deps.host.store.books(names.filter((name) => !covered.has(name)));
+  const statuses = deps.host.store.statuses(names);
+  return { names, snapshotHeld, covered, snapshot, books, statuses };
+}
+
+/**
+ * Market kinds (`kindKey`) in price order, cheapest first, for the Inventory tiles' *Price* sort.
+ *
+ * The price is the one the Portfolio's market value gives the kind: the mid of its book, from the
+ * snapshot or from Steam's book cached here, per unit. Books come in more than one currency (the
+ * snapshot is in dollars, an account's own book in its wallet's), so each is converted to the base
+ * at the day's rate for the comparison alone; nothing converted is shown or sent. A kind with no
+ * price, or none that can be converted, is left out, and the engine pages what an order leaves out
+ * last whichever way it runs, so an unpriced item never reads as the cheapest. Equal prices fall
+ * back to the market name, so a tie reads as a list.
+ */
+export function priceOrder(positions: readonly ValuedPosition[], base: string, fx: FxRates | null): string[] {
+  const priced = new Map<string, { cents: number; name: string }>();
+  for (const row of positions) {
+    if (!row.priced) continue;
+    const kind = kindKey(row.matchKey, row.wearBand);
+    if (priced.has(kind)) continue;
+    const code = row.marketValue.native.currency;
+    const cents = code === base ? row.unitCents : convert(row.unitCents, code, base, fx)?.cents;
+    if (cents === undefined) continue;
+    priced.set(kind, { cents, name: row.name ?? '' });
+  }
+  return [...priced.entries()]
+    .sort(([leftKind, left], [rightKind, right]) => left.cents - right.cents || left.name.localeCompare(right.name) || leftKind.localeCompare(rightKind))
+    .map(([kind]) => kind);
+}
+
+/**
+ * The price order for an inventory scope and filter (`priceOrder`), over the same positions read
+ * the Portfolio values. A scope past the summary's cap has no positions to price and says so,
+ * rather than falling back to another order under a price heading.
+ */
+export async function inventoryPriceOrder(deps: PortfolioDeps, accountIds: readonly string[], filter: Record<string, unknown> | undefined): Promise<string[]> {
+  const positions = await deps.invoke({
+    type: 'inventory.positions', accountIds: [...accountIds], ...(filter === undefined ? {} : { filter })
+  } as EngineCommand) as PositionsEnvelope;
+  if (positions.kind !== 'positions') {
+    throw new Error(`${positions.groups.toLocaleString()} item types in this view, above the ${positions.cap.toLocaleString()} that can be put in price order at once. Narrow it with a search, a category or a location, or sort by float or by when it was detected.`);
+  }
+  const rows = deps.catalogue.enrich(positions.rows).map(toPosition);
+  const { snapshot, books, statuses } = pricesFor(deps, rows);
+  const base = baseCurrencyOf(deps.settings());
+  const fx = deps.host.store.latestFx() ?? null;
+  return priceOrder(valuePositions({ positions: rows, books, statuses, fx, base, ...(snapshot ? { snapshot } : {}) }).positions, base, fx);
 }
 
 /** The wallets and the market value added; a valuation made in another base is a floor until it is made again. */

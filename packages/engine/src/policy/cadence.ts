@@ -58,6 +58,9 @@ export const CADENCE: Record<Surface, CadenceRule> = {
   'gc-event': { activeMs: Number.POSITIVE_INFINITY, backgroundMs: Number.POSITIVE_INFINITY, eventDrivenOnly: true },
   'steam-market': { activeMs: FRESHNESS['steam-market'].maxAgeMs, backgroundMs: 20 * 60_000 },
   'steam-market-history': { activeMs: FRESHNESS['steam-market-history'].maxAgeMs, backgroundMs: 60 * 60_000 },
+  // The history's pace, and only for the accounts a host named (`ReadBroker.scopes`): one page a
+  // walk once the backfill is done, since the log only grows at the top (listing times plan D5).
+  'steam-market-listing-times': { activeMs: FRESHNESS['steam-market-listing-times'].maxAgeMs, backgroundMs: 60 * 60_000 },
   'steam-wallet': { activeMs: 10 * 60_000, backgroundMs: 60 * 60_000 },
   // Trades happen on someone else's schedule, so both surfaces are timer-driven. History is
   // read less often than offers because a checkpointed walk of an append-only log costs one
@@ -116,7 +119,7 @@ export type DueInput = {
   transferIntervalMs?: number;
   /** When a waiting action's need makes this scope due (`policy/proof.ts`). */
   proofDueAtMs?: number | undefined;
-  /** A history still has older pages to read (`OrderService.coverage`, `TradeService.coverage`): the backfill interval caps the tier's. */
+  /** A history still has older pages to read (`OrderService.coverage`, `TradeService.coverage`, `ListingTimesService.coverage`): the backfill interval caps the tier's. */
   backfillPending?: boolean;
 };
 
@@ -183,7 +186,7 @@ export function isDue(input: DueInput): DueVerdict {
  */
 export function hasOpenCommitment(database: EngineDatabase, accountId: string): boolean {
   const row = database.raw().prepare(`
-    SELECT COUNT(*) AS open_orders FROM venue_order WHERE account_id=? AND state NOT LIKE 'ENDED_%'
+    SELECT EXISTS (SELECT 1 FROM venue_order WHERE account_id=? AND state NOT LIKE 'ENDED_%') AS open_orders
   `).get(accountId) as { open_orders: number };
   return row.open_orders > 0;
 }

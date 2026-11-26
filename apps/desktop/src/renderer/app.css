@@ -856,6 +856,8 @@ a { color: var(--cs-accent-text); }
    inspector shows all of it. */
 .group-meta { display: flex; flex-wrap: nowrap; align-items: center; gap: 4px 8px; margin-top: 2px; overflow: hidden; white-space: nowrap; font-size: 12px; color: var(--cs-text-faint); }
 .group-meta .sep { color: var(--cs-border-strong); }
+/* An extension's badge on a group row sits in the meta line as a glyph, not over a picture. */
+.group-meta .tile-badge { position: static; width: 16px; height: 16px; }
 /* Why a row reads by def-index instead of by name. Its own class, not a second .group-meta: a
    reason is not a summary line, and tests assert on each separately. */
 .group-unresolved { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--cs-accent-text); }
@@ -1626,6 +1628,15 @@ a { color: var(--cs-accent-text); }
 /* The book is Inventory's tiles with a footer (below, under "inventory tiles"). What is left here
    is the listing's own: its price in the inspector, and the question a delist asks first. */
 .inspector-price { display: flex; flex-direction: column; gap: 2px; }
+/* The buyer's price, and under it, smaller, what the seller receives: a figure and two words each. */
+.inspector-price-line { display: flex; align-items: baseline; gap: 8px; }
+.inspector-price-line[data-size='sm'] .money { font-family: inherit; font-size: 13px; font-weight: 500; color: var(--cs-text); }
+/* A chip whose tip is its sentence: the chip is the target, and a chip is not underlined. */
+.inspector-state .tip-target:has(.badge, .status-badge),
+.inspector-actions > .tip-target,
+.inspector-listed .tip-target { text-decoration: none; cursor: default; }
+.inspector-actions > .tip-target { align-self: flex-start; }
+.inspector-listed .tip-target { display: inline-flex; align-items: center; gap: 6px; }
 .inspector-price .money { font-family: var(--cs-font-display); font-size: 20px; font-weight: 600; color: var(--cs-text-strong); }
 .inspector-price .currency-tag { font-size: 11px; }
 
@@ -1740,9 +1751,27 @@ a { color: var(--cs-accent-text); }
 .tile-badge-lock[data-lock='market'] { color: var(--cs-text-muted); }
 .tile-badge-where { top: 4px; right: 4px; }
 .tile-badge-account { bottom: 4px; right: 4px; width: 18px; height: 18px; padding: 0; }
+/* An extension's badge takes the last corner, which the busy pill owns while an open command names the item. */
+.tile-badge-tag { bottom: 4px; left: 4px; }
+.tile[data-busy]:not([data-footer]) .tile-badge-tag { display: none; }
 .tile-badge[data-size='lg'] { width: 26px; height: 26px; }
 .tile-badge-where[data-size='lg'] { top: 5px; right: 5px; }
 .tile-badge-account[data-size='lg'] { bottom: 5px; right: 5px; }
+/* A listed item's badge is its sale tags, each with the venue's mark in it (`ListingMark`): the tag
+   is the outline, so the badge drops its circle. */
+.tile-badge[data-shape='tag'] { width: auto; height: auto; border: 0; border-radius: 0; background: none; }
+
+/* A sale tag with a marketplace's mark in its body. Drawn on the surface colour with a strong edge,
+   so it reads over a skin's picture as well as on a row. */
+.listing-marks { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+.listing-mark { position: relative; display: inline-block; flex: none; vertical-align: middle; line-height: 0; }
+.listing-mark-tag { display: block; overflow: visible; }
+.listing-mark-tag path { fill: var(--cs-surface); stroke: var(--cs-border-strong); stroke-width: 1.3; }
+.listing-mark-tag circle { fill: var(--cs-text-faint); }
+.listing-mark-venue { position: absolute; top: 50%; transform: translate(-50%, -50%); line-height: 0; }
+.listing-mark-venue .venue-mark { display: block; }
+.inspector-listed { flex-wrap: wrap; gap: 6px; }
+.inspector-listed .btn-icon { margin-left: auto; }
 /* The check owns the top-right corner of a tile that can be selected, and the badge for where the
    item is moves in beside it. It is shown while the tile is selected, and otherwise only under the
    pointer, which is the only time it can be pressed. */
@@ -1764,8 +1793,15 @@ a { color: var(--cs-accent-text); }
 .tile-foot { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 4px; min-width: 0; min-height: 24px; margin-top: auto; }
 .tile-price { min-width: 0; overflow: hidden; font-size: 12.5px; font-weight: 600; color: var(--cs-text-strong); white-space: nowrap; text-overflow: ellipsis; }
 .tile-price .currency-tag { font-weight: 400; }
-.tile-actions { display: inline-flex; flex: none; }
+.tile-actions { display: inline-flex; flex: none; align-items: center; }
 .tile-actions .btn-icon.btn-sm { padding: 3px; }
+.tile-actions[data-busy] { gap: 4px; }
+/* In the pencil's place while Steam's price-change cooldown runs: a clock and m:ss. It is the
+   height of the buttons it stands among, so the footer stays one line and the tile the height it
+   is pinned at, and as narrow as it can be, because every pixel it takes comes off the price
+   beside it. A busy tile shows its pill and not this. */
+.tile-cooldown { display: inline-flex; flex: none; align-items: center; gap: 2px; font-size: 11px; line-height: 14px; color: var(--cs-text-muted); white-space: nowrap; }
+.tile-actions .btn.tile-cooldown { padding: 3px 2px; gap: 2px; font-size: 11px; font-weight: 400; line-height: 14px; }
 .tile-foot .delist-prompt { width: 100%; }
 .tile-foot .delist-prompt .btn-sm { padding: 2px 8px; }
 .tile-state { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -1832,6 +1868,19 @@ a { color: var(--cs-accent-text); }
 .inspector-hero { display: flex; gap: 12px; align-items: flex-start; }
 .inspector-hero[data-preview='expanded'] { flex-direction: column; align-items: stretch; }
 .inspector-hero-text { min-width: 0; flex-grow: 1; }
+/* What is applied sits in the picture's tile, centred along its foot, when the preview is expanded.
+   Collapsed there is no tile: the strip is a row of its own across the aside, under the small picture
+   and the name beside it, and the name keeps its place beside the picture however long it is. */
+.inspector-hero[data-preview='expanded'] .inspector-picture {
+  display: flex; flex-direction: column;
+  background: var(--cs-surface-inset); border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius);
+  animation: cs-slide-down var(--cs-dur) var(--cs-ease-out) both;
+}
+.inspector-hero[data-preview='expanded'] .inspector-picture > .inspector-accessories { justify-content: center; padding: 0 6px 2px; }
+.inspector-hero[data-preview='collapsed'] .inspector-picture { display: contents; }
+.inspector-hero[data-preview='collapsed'] { flex-wrap: wrap; }
+.inspector-hero[data-preview='collapsed'] > .inspector-hero-text { flex-basis: 0; }
+.inspector-hero[data-preview='collapsed'] .inspector-picture > .inspector-accessories { order: 1; flex-basis: 100%; }
 .inspector-name { font-size: 14px; font-weight: 600; color: var(--cs-text-strong); line-height: 1.3; }
 .inspector-meta { font-size: 12px; margin-top: 2px; }
 
@@ -1863,9 +1912,6 @@ a { color: var(--cs-accent-text); }
 .inspector-hero[data-preview='expanded'] .inspector-preview {
   width: 100%;
   aspect-ratio: 4 / 3;
-  background: var(--cs-surface-inset);
-  border: 1px solid var(--cs-border-faint);
-  animation: cs-slide-down var(--cs-dur) var(--cs-ease-out) both;
 }
 .inspector-hero[data-preview='expanded'] .inspector-preview .item-thumbnail {
   border-radius: calc(var(--cs-radius) - 1px);
@@ -1889,8 +1935,76 @@ a { color: var(--cs-accent-text); }
   color: var(--cs-text);
   border-color: var(--cs-border-strong);
 }
-.inspector-wear { display: flex; flex-direction: column; gap: 4px; }
-.inspector-wear .wear-bar { width: 100%; }
+/* The float line: the scale, the float beside it, the pattern after. The whole line is one tip
+   target, which carries the tier and the norm float, so nothing is underlined to say so. */
+.inspector-wear { display: block; }
+.inspector-wear .tip-target { display: flex; align-items: center; gap: 8px; font-size: 12px; text-decoration: none; cursor: default; }
+.inspector-wear .wear-bar { flex: 1 1 auto; width: auto; min-width: 48px; }
+.inspector-wear .num { color: var(--cs-text); }
+/* What is applied to the item: stickers or patches in slot order, then the charm set a little apart.
+   Each has a square slot of its own, up to 44 px and never more than a sixth of the strip, so five
+   stickers and a charm stay one row at the inspector's narrowest; anything after them, such as what
+   they add, takes the next line rather than squeezing them. A scraped sticker fades with its wear;
+   the floor keeps a fully scraped one recognisable, since which sticker it was still matters. */
+.inspector-accessories { container-type: inline-size; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.accessory { display: flex; flex: none; width: min(44px, (100cqi - 16px) / 6); }
+.accessory + .accessory[data-kind='charm-slot'] { margin-left: 6px; }
+.inspector-accessories .tip-target { position: relative; display: block; text-decoration: none; border-radius: var(--cs-radius); }
+.accessory > .tip-target { width: 100%; padding-bottom: 14px; }
+.accessory-art { display: block; width: 100%; aspect-ratio: 1; pointer-events: none; }
+.accessory-art .item-thumbnail-empty svg { width: 60%; height: 60%; }
+.accessory-art > .item-thumbnail {
+  opacity: calc(1 - 0.7 * var(--wear, 0));
+  transform: scale(0.78); transition: transform var(--cs-dur) var(--cs-ease-out);
+}
+/* Its wear, centred beneath it on the line the slot keeps free, so nothing moves when it shows. */
+.accessory-wear {
+  position: absolute; left: 0; right: 0; bottom: 0; text-align: center; white-space: nowrap;
+  color: var(--cs-text-muted); font-size: 10.5px; font-weight: 600; line-height: 14px;
+  opacity: 0; transition: opacity var(--cs-dur-fast); pointer-events: none;
+}
+/* Hovered or focused, a sticker grows to twice the size it rests at, to be read, and its wear comes
+   up beneath it. It grows upward from the foot of its slot, over the picture and the edges of what is
+   beside it, so the wear under it stays clear; its tip opens above the grown picture, not across it
+   (`Tip`'s `rise`, `ACCESSORY_RISE`). 1.56 is twice the resting 0.78, and 28% is the half of that
+   growth it is lifted by so its foot stays where it was. */
+.accessory > .tip-target:hover,
+.accessory > .tip-target:focus-visible { z-index: 1; }
+.accessory > .tip-target:hover .accessory-art > .item-thumbnail,
+.accessory > .tip-target:focus-visible .accessory-art > .item-thumbnail { transform: translateY(-28%) scale(1.56); }
+.accessory > .tip-target:hover .accessory-wear,
+.accessory > .tip-target:focus-visible .accessory-wear { opacity: 1; }
+/* One that opens on the Items page when pressed says so with the pointer. */
+.accessory[data-opens] .tip-target { cursor: pointer; }
+/* What the stickers and the charm are estimated to add, after the last of them: smaller and fainter
+   than anything on the strip, so it is there for someone who looks and says nothing to someone who
+   does not. It darkens when pointed at, which is when its tip opens with the working. */
+.accessory-value { display: flex; align-items: center; margin-left: 2px; font-size: 11.5px; white-space: nowrap; color: var(--cs-text-faint); }
+.accessory-value .tip-target { padding: 2px 4px; transition: color var(--cs-dur-fast); }
+.accessory-value .tip-target:hover,
+.accessory-value .tip-target:focus-visible { color: var(--cs-text); }
+/* The compact strip a tile, a group's item row and a listing tile carry. Each one shrinks to fit
+   before any is dropped, and loses the dark disc every other picture sits on, which at this size
+   would run the stickers together. A scraped sticker fades as the inspector's does and carries a
+   thin bar filled to its wear; a clean one carries none. */
+.accessory-strip-compact { display: inline-flex; align-items: center; gap: 2px; min-width: 0; max-width: 100%; }
+.accessory-mini { position: relative; display: block; flex: 0 1 18px; min-width: 10px; }
+.accessory-mini-art { display: block; width: 100%; aspect-ratio: 1; opacity: calc(1 - 0.7 * var(--wear, 0)); }
+.accessory-mini .item-thumbnail::before { display: none; }
+.accessory-mini .item-thumbnail-empty { border-radius: 3px; }
+.accessory-mini .item-thumbnail-empty svg { width: 70%; height: 70%; }
+.accessory-mini[data-kind='charm-slot']:not(:first-child) { margin-left: 3px; }
+.accessory-mini-bar { position: absolute; left: 2px; right: 2px; bottom: -2px; height: 2px; border-radius: 1px; background: var(--cs-border); overflow: hidden; }
+.accessory-mini-bar > span { display: block; height: 100%; background: var(--cs-text-muted); }
+/* On a tile, along the foot of the picture between its bottom corners' badges. */
+.tile-accessories { position: absolute; left: 4px; right: 4px; bottom: 4px; display: flex; justify-content: center; pointer-events: auto; }
+.tile-image:has(> .tile-badge-account) .tile-accessories { right: 26px; }
+.tile-image:has(> .tile-badge-account[data-size='lg']) .tile-accessories { right: 34px; }
+.tile-image:has(> .tile-badge-tag) .tile-accessories { left: 26px; }
+.tile-accessories .accessory-mini { flex-basis: 20px; }
+/* In a group's item row, inline with the wear and the pattern. */
+.group-meta .accessory-strip-compact { flex: none; }
+.group-meta .accessory-mini { flex-basis: 16px; }
 .inspector-where { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: var(--cs-radius); background: var(--cs-surface-inset); font-size: 12px; color: var(--cs-text-muted); }
 .inspector-actions { display: flex; flex-direction: column; gap: 10px; }
 .inspector-action { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
@@ -2200,6 +2314,22 @@ a { color: var(--cs-accent-text); }
 .listing-dock .listing-row-float { display: inline-flex; align-items: center; gap: 5px; }
 .listing-dock .listing-row-account { color: var(--cs-text-faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .listing-dock .listing-row-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+
+/* The listing strategy, on a line of its own above the figures: a build offers them, the desktop
+   none, and a row on one that sets the price shows that price where the two fields were. */
+.listing-dock .listing-row > .listing-strategy-line { grid-column: 1 / -1; }
+.listing-dock .listing-strategy-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.listing-dock .listing-strategy-line > .listing-control-label { flex: none; }
+.listing-dock .listing-strategy-select { flex: 1 1 auto; min-width: 0; max-width: 320px; }
+.listing-dock .listing-strategy-select .select { height: 28px; box-sizing: border-box; width: 100%; padding-top: 0; padding-bottom: 0; font-size: 12.5px; }
+.listing-dock .listing-strategy-price {
+  grid-column: span 2;
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  height: 28px; box-sizing: border-box;
+  font-size: 12px; color: var(--cs-text-muted);
+}
+.listing-dock .listing-strategy-price > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.listing-dock .listing-strategy-price[data-tone='warn'] { color: var(--cs-accent-text); }
 
 /* A word or two on the row; the sentence is in its tip. */
 .listing-dock .listing-chip {
@@ -2751,6 +2881,11 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .currency-setting { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .currency-setting-label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--cs-text); }
 .currency-info { flex: 0 0 auto; }
+/* Settings › General › Sticker and charm value: what the share is of, and the share, on one line. */
+.share-setting { display: flex; align-items: center; gap: 8px; }
+.share-setting-label { flex: 1 1 auto; min-width: 0; font-size: 13px; color: var(--cs-text); }
+.share-setting .input { flex: none; width: 72px; }
+.share-setting-unit { flex: none; font-size: 13px; color: var(--cs-text-faint); }
 .currency-info[aria-expanded="true"] { color: var(--cs-accent); }
 
 /*
@@ -2861,10 +2996,52 @@ button.notification-row:focus-visible { outline: 2px solid var(--cs-accent-ink);
 .items-side[data-tone="bid"] .items-level-bar > span { background: var(--cs-positive); }
 .items-side[data-tone="ask"] .items-level-bar > span { background: var(--cs-negative); }
 
-.items-recent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
-.items-recent-tile { display: flex; align-items: center; gap: 10px; padding: 8px; border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius-lg); background: var(--cs-surface); color: var(--cs-text); font: inherit; text-align: left; cursor: pointer; min-width: 0; }
-.items-recent-tile:hover { border-color: var(--cs-accent-border); background: var(--cs-accent-wash); }
-.items-recent-name { font-size: 12.5px; line-height: 1.3; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+/*
+ * Skin tiles, for Recent and for the grid the bar's chips name. One fixed height, so a page of
+ * tiles arriving under the last never moves a tile already on screen. What the skin is sits small
+ * above which one it is, so a grid of one weapon does not repeat the weapon at full size.
+ */
+.items-switches { display: flex; flex-wrap: wrap; gap: 8px 12px; }
+.items-browse[hidden] { display: none; }
+.items-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 10px; }
+/* Before the first page lands: about two rows, so the panel does not open flat and then jump. */
+.items-tiles-wait { min-height: 150px; }
+.items-tiles-more { display: flex; justify-content: center; padding-top: 14px; }
+.items-tiles-end { height: 1px; }
+.items-tile {
+  position: relative; display: flex; align-items: center; gap: 10px; height: 74px; padding: 8px 10px 8px 12px; min-width: 0;
+  border: 1px solid var(--cs-border-faint); border-radius: var(--cs-radius-lg); background: var(--cs-surface);
+  color: var(--cs-text); font: inherit; text-align: left; cursor: pointer; overflow: hidden;
+  transition: background-color var(--cs-dur-fast), border-color var(--cs-dur-fast), transform var(--cs-dur-fast);
+}
+/* The grade, as a thin edge in its colour: rarity is data, and the grid is in its order. */
+.items-tile::before { content: ''; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 0 2px 2px 0; background: var(--tile-rarity, transparent); }
+.items-tile:hover { border-color: var(--cs-accent-border); background: var(--cs-accent-wash); }
+.items-tile:active { transform: scale(0.985); }
+.items-tile:focus-visible { outline-offset: 1px; }
+.items-tile[data-placeholder] { cursor: default; }
+.items-tile > .item-thumbnail, .items-tile > .skeleton { flex: none; }
+.items-tile-text { display: grid; gap: 2px; min-width: 0; flex: 1; }
+.items-tile-text > .skeleton { display: block; }
+.items-tile-lead { font-size: 11px; line-height: 1.25; color: var(--cs-text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.items-tile-title { font-size: 12.5px; line-height: 1.3; color: var(--cs-text-strong); overflow: hidden; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+/* A collection's emblem. The box is the shape of the game's raster emblems, which fill it; a
+   vector emblem is a square drawn edge to edge and stands the same height in the middle of it.
+   An emblem is a badge with its own edge, so it sits on no glow. */
+.collection-emblem { position: relative; display: inline-grid; flex: none; }
+/* One cell exactly the size of the box. Left to size itself, the cell grows to the picture's own
+   shape, and a square vector then stands as tall as the box is wide: a third larger than a raster. */
+.collection-emblem, .collection-emblem > .item-thumbnail { grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
+.collection-emblem > .item-thumbnail::before { display: none; }
+.collection-emblem > .item-thumbnail-empty svg { width: 40%; height: 40%; }
+.items-collection-tile { gap: 12px; }
+/* A heading over each kind of collection: the label every panel carries, as the heading it is here. */
+.items-collections h2.holdings-label { margin-top: 0; }
+/* A collection's name is its whole label, with no line above it, so it may run to a third. */
+.items-collection-tile .items-tile-title { -webkit-line-clamp: 3; }
+.items-collection-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.items-collection-head > .holdings-label { margin-bottom: 0; }
+@media (prefers-reduced-motion: reduce) { .items-tile { transition: none; } .items-tile:active { transform: none; } }
 
 /* The interactive chart: drawn at its own pixel size; the tooltip is HTML over it. */
 .price-chart { position: relative; width: 100%; touch-action: pan-y; cursor: crosshair; border-radius: var(--cs-radius); outline: none; }

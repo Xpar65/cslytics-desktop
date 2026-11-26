@@ -28,7 +28,7 @@ export type VenueProfile = {
  * The bucket-to-state map of `mylistings` is `STEAM_BUCKET_STATE` in `db/orders.ts`, the walk's own.
  */
 export const STEAM_PROFILE: VenueProfile = {
-  venue: 'steam', supportsPriceEdit: false, ordersExpire: false, pendingKind: 'phone-confirm',
+  venue: 'steam', supportsPriceEdit: true, ordersExpire: false, pendingKind: 'phone-confirm',
   identityModel: 'stable-asset', whyOracle: 'per-order-history', settlementDelayDays: 0,
   priceChange: PRICE_CHANGE.steam
 };

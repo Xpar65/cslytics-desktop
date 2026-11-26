@@ -174,13 +174,13 @@ export function describeTradeState(entry: TradeStateInput, other: string): Trade
 /** Every state that is not yet a trade, or never became one. */
 function describeOpenOrEnded(entry: TradeStateInput, other: string, sent: boolean): TradeStateText {
   if (entry.tradeStatus === 'COMPLETE' && entry.origin === 'own-transfer') {
-    return { headline: 'Steam shows it complete — waiting for both inventories to show the items', detail: null, tone: 'accent', icon: 'hourglass' };
+    return { headline: 'Complete on Steam. Waiting for both inventories to show the items', detail: null, tone: 'accent', icon: 'hourglass' };
   }
   switch (entry.tradeStatus) {
     case 'PENDING':
       return { headline: 'Steam is still processing this trade', detail: `As of ${formatDateTime(entry.sortAt)}, Steam had not finished it.`, tone: 'accent', icon: 'hourglass' };
     case 'ESCROW':
-      return { headline: 'Accepted — Steam is holding the items', detail: entry.escrowUntil ? `They are released ${formatDateTime(entry.escrowUntil)}.` : null, tone: 'accent', icon: 'lock' };
+      return { headline: 'Accepted. Steam is holding the items', detail: entry.escrowUntil ? `They are released ${formatDateTime(entry.escrowUntil)}.` : null, tone: 'accent', icon: 'lock' };
     case 'FAILED':
       return { headline: 'Steam reports this trade failed', detail: null, tone: 'negative', icon: 'x-circle' };
     case 'UNKNOWN':
@@ -206,9 +206,9 @@ function describeOpenOrEnded(entry: TradeStateInput, other: string, sent: boolea
         ? { headline: 'Waiting for you to confirm on the Steam mobile app', detail: 'Nothing leaves the account until you do.', tone: 'accent', icon: 'smartphone' }
         : { headline: `Waiting for ${other} to confirm it`, detail: null, tone: 'accent', icon: 'smartphone' };
     case 'ACCEPTED':
-      return { headline: 'Accepted — waiting for Steam\'s trade history to show the trade', detail: `An accepted offer is not a delivery until the history lists the trade.${accepted(entry)}`, tone: 'accent', icon: 'hourglass' };
+      return { headline: 'Accepted. Waiting for Steam\'s trade history to show it', detail: `An accepted offer is not a delivery until the history lists the trade.${accepted(entry)}`, tone: 'accent', icon: 'hourglass' };
     case 'ESCROW':
-      return { headline: 'Accepted — Steam is holding the items', detail: entry.escrowUntil ? `They are released ${formatDateTime(entry.escrowUntil)}.` : null, tone: 'accent', icon: 'lock' };
+      return { headline: 'Accepted. Steam is holding the items', detail: entry.escrowUntil ? `They are released ${formatDateTime(entry.escrowUntil)}.` : null, tone: 'accent', icon: 'lock' };
     case 'DECLINED':
       return { headline: sent ? `${capitalise(other)} declined it` : 'You declined it', detail: null, tone: 'quiet', icon: 'ban' };
     case 'CANCELLED':

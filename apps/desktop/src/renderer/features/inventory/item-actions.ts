@@ -43,6 +43,8 @@ export type ActionRow = {
    * Game Coordinator keeps a listed item in main inventory, so a listed row is also `MAIN`.
    */
   steamListed?: number | boolean | null | undefined;
+  /** `1` when a CSFloat listing the last stall walk showed names the row. Beside `location`, as `steamListed` is. */
+  csfloatListed?: number | boolean | null | undefined;
   casketId: string | null;
   quantity: number;
   tradableAfter: string | null;
@@ -173,6 +175,10 @@ export function allowedActions(row: ActionRow, context: ActionContext, now: Date
   const stored = row.location === 'CASKET';
   // Listed is asked first everywhere below: a listed row is also in main inventory.
   const listed = row.steamListed === 1 || row.steamListed === true;
+  // A CSFloat listing leaves the item in the inventory too, and is held like a Steam one: Reprice
+  // is the one thing offered. Listing it again on either venue, storing it or sending it would
+  // each end or race the listing it already has (a product decision of 2026-11-24).
+  const onCsfloat = row.csfloatListed === 1 || row.csfloatListed === true;
   const main = row.location === 'MAIN';
   const allow = (kind: ActionKind): void => { allowed.push(kind); };
   const deny = (kind: ActionKind, reason: string): void => { blocked.push({ kind, reason }); };
@@ -199,6 +205,7 @@ export function allowedActions(row: ActionRow, context: ActionContext, now: Date
   // ---- Store ------------------------------------------------------------- market lock is fine
   if (stored) deny('STORE', 'in storage');
   else if (listed) deny('STORE', 'listed on the market');
+  else if (onCsfloat) deny('STORE', 'listed on CSFloat');
   else if (!main) deny('STORE', 'not in inventory');
   else if (lock?.kind === 'trade') deny('STORE', 'trade-protected');
   else allow('STORE');
@@ -215,6 +222,7 @@ export function allowedActions(row: ActionRow, context: ActionContext, now: Date
   // handle like a skin, so it chains the same way, and it keeps its asset id across the round-trip.
   const unmarketable = row.marketable === false || row.marketable === 0;
   if (listed) deny('LIST', 'already listed');
+  else if (onCsfloat) deny('LIST', 'already listed on CSFloat');
   else if (unmarketable) deny('LIST', 'not marketable on Steam');
   else if (lock) deny('LIST', lock.kind === 'trade' ? 'trade-protected' : 'market-locked');
   else if (stored) {
@@ -239,6 +247,7 @@ export function allowedActions(row: ActionRow, context: ActionContext, now: Date
   // A kind CSFloat does not list says so first: no wait, unlock or refresh changes it.
   else if (support === 'unsupported' && eligibility !== 'eligible') deny('CSFLOAT_LIST', CSFLOAT_UNSUPPORTED);
   else if (listed) deny('CSFLOAT_LIST', 'already listed');
+  else if (onCsfloat) deny('CSFLOAT_LIST', 'already listed on CSFloat');
   else if (lock) deny('CSFLOAT_LIST', lock.kind === 'trade' ? 'trade-protected' : 'market-locked');
   else if (stored && row.unitKind === 'fungible') deny('CSFLOAT_LIST', 'in storage; retrieve it first');
   else if (stored) {
@@ -256,6 +265,7 @@ export function allowedActions(row: ActionRow, context: ActionContext, now: Date
   // inventory.
   if (context.accountCount < 2) deny('TRANSFER', 'in a window holding one account');
   else if (listed) deny('TRANSFER', 'listed on the market');
+  else if (onCsfloat) deny('TRANSFER', 'listed on CSFloat');
   else if (lock) deny('TRANSFER', lock.kind === 'trade' ? 'trade-protected' : 'market-locked');
   else if (stored) {
     allow('TRANSFER');
@@ -264,12 +274,23 @@ export function allowedActions(row: ActionRow, context: ActionContext, now: Date
   else deny('TRANSFER', 'not in inventory');
 
   // ---- Reprice and delist ------------------------------------------------- listings only
-  for (const kind of ['REPRICE', 'DELIST_TO_STORE'] as const) {
-    if (listed) allow(kind);
-    else deny(kind, stored ? 'in storage' : 'not listed on the market');
-  }
+  // A reprice is staged in the listing workspace from the listing itself, whichever venue holds it
+  // (`holding-listings.ts`). Delisting into a unit is a Steam command: its first step cancels the
+  // Steam listing.
+  if (listed || onCsfloat) allow('REPRICE');
+  else deny('REPRICE', stored ? 'in storage' : 'not listed on the market');
+  if (listed) allow('DELIST_TO_STORE');
+  else deny('DELIST_TO_STORE', stored ? 'in storage' : onCsfloat ? 'listed on CSFloat, not on Steam' : 'not listed on the market');
 
   return { allowed, blocked, chains };
+}
+
+/** The marketplaces this row is listed on now, in the order every page shows them. */
+export function listedVenues(row: Pick<ActionRow, 'steamListed' | 'csfloatListed'>): Array<'steam' | 'csfloat'> {
+  const venues: Array<'steam' | 'csfloat'> = [];
+  if (row.steamListed === 1 || row.steamListed === true) venues.push('steam');
+  if (row.csfloatListed === 1 || row.csfloatListed === true) venues.push('csfloat');
+  return venues;
 }
 
 export type Blocker = { count: number; first: string; reason: string };

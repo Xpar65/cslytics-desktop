@@ -83,6 +83,8 @@ export type AccountHoldings = {
   currency: number | null;
   /** The Steam wallet: `balanceCents` is spendable, `delayedBalanceCents` is pending. */
   wallet: { balanceCents: number; delayedBalanceCents: number; observedAt: string } | null;
+  /** The least fee and seller price on the Steam wallet, as its latest read stated it; null until one has (`lib/wallet-minimums.ts`). */
+  walletMinimumCents?: number | null;
   /** The CSFloat balance for the connection that exists now; null with no key or no read (CSF-04). */
   csfloatWallet: VenueWallet | null;
   reservedCents: number;

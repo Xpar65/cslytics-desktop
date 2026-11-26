@@ -1,4 +1,4 @@
-import { receiveFor } from '@cslytics/ports';
+import { receiveFor, type FeeTerms } from '@cslytics/ports';
 import { currencyByCode, currencyById } from './currency.js';
 import { priceAtFloat } from './curve.js';
 import type { NameStatus, StoredBook, StoredCurve, StoredPrice } from './store.js';
@@ -193,14 +193,17 @@ export function unitPrice(book: Pick<StoredBook, 'highestBidCents' | 'lowestAskC
  * What selling `quantity` units into the bids would return after Steam's fees: walk the bid side
  * best-first, take what each level absorbs, and convert each level's buyer price to what the
  * seller receives. Units the book cannot absorb are reported, not priced.
+ *
+ * Steam's fee minimum is the seller's wallet's at the time (`FeeTerms`): the valuation charges the
+ * wallet of the book's own currency, the one its cents are in, at the instant the book was read.
  */
-export function liquidation(book: Pick<StoredBook, 'bids'>, quantity: number): { cents: number; absorbedUnits: number } {
+export function liquidation(book: Pick<StoredBook, 'bids'>, quantity: number, terms: FeeTerms): { cents: number; absorbedUnits: number } {
   let remaining = quantity;
   let cents = 0;
   for (const level of book.bids) {
     if (remaining <= 0) break;
     const taken = Math.min(remaining, level.quantity);
-    cents += receiveFor('steam', level.priceCents) * taken;
+    cents += receiveFor('steam', level.priceCents, terms) * taken;
     remaining -= taken;
   }
   return { cents, absorbedUnits: quantity - remaining };
@@ -346,7 +349,7 @@ export function valuePositions(input: ValuationInput): Valuation {
     (quote.source === 'snapshot' ? snapshotKinds : bookKinds).add(kind);
     const { code } = currency;
     const marketCents = price.cents * position.quantity;
-    const sold = liquidation(quote, position.quantity);
+    const sold = liquidation(quote, position.quantity, { walletCurrency: quote.currency, at: quote.observedAt });
     const marketFigure = figure(marketCents, code, base, fx);
     const record = input.curves?.get(position.name);
     const curve = curvePrice(position, record);

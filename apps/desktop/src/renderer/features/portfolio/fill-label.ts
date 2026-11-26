@@ -1,4 +1,5 @@
 import type { PortfolioValuation } from '../../../shared/market.js';
+import { formatClock } from '../../lib/time.js';
 
 /**
  * The Prices evidence line: where the prices came from and what the fill is doing, with the rate
@@ -69,7 +70,7 @@ export function pricingProgress(answer: Pick<PortfolioValuation, 'fill' | 'statu
 }
 
 function time(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return formatClock(iso);
 }
 
 function plural(count: number, noun: string): string {

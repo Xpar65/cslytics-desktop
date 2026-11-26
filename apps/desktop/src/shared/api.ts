@@ -63,6 +63,41 @@ export const DEFAULT_ENGINE: EngineConnection = { kind: 'local' };
 export const promptsSettingsSchema = z.object({ cslyticsSignIn: z.enum(['show', 'hidden']) }).strict();
 export type PromptsSettings = z.infer<typeof promptsSettingsSchema>;
 export const DEFAULT_PROMPTS: PromptsSettings = { cslyticsSignIn: 'show' };
+
+/** True when this runtime's `Intl` knows the IANA zone, so a date can be printed in it. */
+export function isTimeZone(zone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+/**
+ * Which time zone every date and time in the window is printed in. `zone` is an IANA name, or
+ * `null` to follow Windows, which is the default. Only the printing moves: every time the engine
+ * holds or compares stays an instant, so a lock still lifts at the moment Steam named.
+ */
+export const timeSettingsSchema = z.object({
+  zone: z.string().min(1).max(64).refine(isTimeZone, 'Not a time zone this build knows').nullable()
+}).strict();
+export type TimeSettings = z.infer<typeof timeSettingsSchema>;
+export const DEFAULT_TIME: TimeSettings = { zone: null };
+/**
+ * What share of its reference price a buyer pays for something already applied to an item, in percent:
+ * the three figures the inspector's applied-value estimate is made from (`main/market-data/applied-value.ts`).
+ * Stickers take `mixedStickerPercent`, or `sameStickerPercent` when four or more of them are the
+ * same sticker; a charm takes `charmPercent`. The defaults are what we measured on sales in late
+ * 2026. A preference of this desktop: it changes a figure the window shows and nothing that is sent.
+ */
+const sharePercent = z.number().min(0).max(100);
+export const appliedValueSettingsSchema = z.object({
+  sameStickerPercent: sharePercent,
+  mixedStickerPercent: sharePercent,
+  charmPercent: sharePercent
+}).strict();
+export type AppliedValueSettings = z.infer<typeof appliedValueSettingsSchema>;
+export const DEFAULT_APPLIED_VALUE: AppliedValueSettings = { sameStickerPercent: 20, mixedStickerPercent: 10, charmPercent: 80 };
 export const settingsSchema = z.object({
   version: z.literal(1),
   appearance: appearanceSettingsSchema,
@@ -70,7 +105,9 @@ export const settingsSchema = z.object({
   currency: currencySettingsSchema,
   csfloat: csfloatSettingsSchema,
   engine: engineConnectionSchema,
-  prompts: promptsSettingsSchema
+  prompts: promptsSettingsSchema,
+  time: timeSettingsSchema,
+  appliedValue: appliedValueSettingsSchema
 }).strict();
 export type AppearanceSettings = z.infer<typeof appearanceSettingsSchema>;
 export type AccountLaunch = z.infer<typeof accountLaunchSchema>;
@@ -80,7 +117,7 @@ export type DesktopSettings = z.infer<typeof settingsSchema>;
 export const DEFAULT_LAUNCH: AccountLaunch = { signIn: true, cs2: true };
 export const DEFAULT_CURRENCY: CurrencySettings = { base: null, baseSource: 'first-account', showAccountPagesInBase: false };
 export const DEFAULT_CSFLOAT: CsfloatSettings = { protection: true };
-export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT, engine: DEFAULT_ENGINE, prompts: DEFAULT_PROMPTS };
+export const DEFAULT_SETTINGS: DesktopSettings = { version: 1, appearance: { theme: DEFAULT_THEME_PREFERENCE }, accounts: {}, currency: DEFAULT_CURRENCY, csfloat: DEFAULT_CSFLOAT, engine: DEFAULT_ENGINE, prompts: DEFAULT_PROMPTS, time: DEFAULT_TIME, appliedValue: DEFAULT_APPLIED_VALUE };
 
 /** How the connection to an engine host is going, as the window shows it (remote engine host plan D7, D8). */
 export type EngineHostState = 'connecting' | 'connected' | 'unreachable' | 'refused';
@@ -164,7 +201,25 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   // Answered by the host from memory against its own index. No network. With `accountIds`, item
   // names those accounts hold come first, counted from the engine's group summary, which main reads
   // once per account set and keeps until one of them changes.
-  z.object({ type: z.literal('catalogue.suggest'), text: z.string().max(200), limit: z.number().int().min(1).max(25).optional(), accountIds: accountScope.optional() }).strict(),
+  // `browse` is the Items page's bar: the answer also names weapons, and every name that stands for
+  // many items is matched by whole words and says how many skins are under it.
+  z.object({ type: z.literal('catalogue.suggest'), text: z.string().max(200), limit: z.number().int().min(1).max(25).optional(), accountIds: accountScope.optional(), browse: z.boolean().optional() }).strict(),
+  // One page of the skins the Items page's chips name (a weapon, a type, a collection, a grade),
+  // one row per skin whatever its wears and qualities. Answered by main from the catalogue in memory;
+  // the window asks for the next page as it is scrolled to, never for the whole list.
+  z.object({
+    type: z.literal('catalogue.skins'),
+    chips: z.array(z.object({
+      kind: z.enum(['weapon', 'type', 'collection', 'rarity']),
+      text: z.string().min(1).max(200),
+      rarityId: z.string().max(64).optional()
+    }).strict()).min(1).max(16),
+    offset: z.number().int().min(0).max(100_000),
+    limit: z.number().int().min(1).max(120)
+  }).strict(),
+  // Every collection the catalogue has something to browse under, the newest release first: what
+  // the Items page lists before anything is asked for. Answered by main from the catalogue in memory.
+  z.object({ type: z.literal('catalogue.collections') }).strict(),
   // Stickers or charms by name, with the definition id a buy-order filter names them by: the change
   // editor's pickers. Answered by main from the catalogue, like `catalogue.suggest`.
   z.object({ type: z.literal('catalogue.accessories'), family: z.enum(['sticker', 'patch', 'charm']), text: z.string().max(200), limit: z.number().int().min(1).max(25).optional() }).strict(),
@@ -189,6 +244,9 @@ export const engineCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('cslytics.verify') }).strict(),
   z.object({ type: z.literal('cslytics.signOut') }).strict(),
   z.object({ type: z.literal('settings.currency'), currency: currencySettingsSchema }).strict(),
+  z.object({ type: z.literal('settings.time'), time: timeSettingsSchema }).strict(),
+  // The three shares the applied-value estimate is made from, written whole like every other section.
+  z.object({ type: z.literal('settings.appliedValue'), appliedValue: appliedValueSettingsSchema }).strict(),
   // What the bell has told the person, answered by main from `notifications-state.json` (notifications
   // plan §7.2): the watermark per account, and the window moving it once it has raised a page of facts.
   z.object({ type: z.literal('notifications.state') }).strict(),

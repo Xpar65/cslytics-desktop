@@ -48,6 +48,19 @@ export const SEND_ABSENCE_GRACE_MS = 30_000;
  */
 export const PRESS_PROVED_KINDS: readonly CsfloatDeliveryHop[] = ['CSFLOAT_ACCEPT', 'CSFLOAT_SEND'];
 
+/**
+ * A connection a delivery goes on over: connected, or throttled. A throttle is the absence of an
+ * answer, never a verdict on the key (CSF-21), and a status read refused for the shared request
+ * budget says nothing about the routes a delivery uses. On 2026-11-12 the `/me` check went
+ * THROTTLED at 22:36Z and every accept and send waited an hour behind it (CSF-SEND-20).
+ */
+export function deliverable(status: string | undefined): boolean {
+  return status === 'CONNECTED' || status === 'THROTTLED';
+}
+
+/** The reason a queued sale's accept waits for the shared request budget (`CsfloatDeliveryService.acceptHeld`). */
+export const CSFLOAT_BUDGET_HOLD = 'CSFLOAT_BUDGET_HOLD';
+
 /** The id of one hop of a delivery, beside its command id. */
 export function deliveryHopId(commandId: string, hop: CsfloatDeliveryHop): string {
   return `${commandId}:${hop}`;
@@ -104,7 +117,7 @@ export class CsfloatDeliveryService {
       if (existing) return this.view(existing.commandId)!;
       const row = this.store.trade(accountId,tradeId), connection = new MarketplaceStore(db).connection(accountId,'csfloat');
       if (!row || row.seller_steam_id !== db.account(accountId)?.steam_id64 || !['queued','pending'].includes(row.state_word)) throw new Error('Refresh this seller trade first');
-      if (!connection?.credential_ref || connection.status !== 'CONNECTED') throw new Error('Connect CSFloat first');
+      if (!connection?.credential_ref || !this.deliverableConnection(connection.status)) throw new Error('Connect CSFloat first');
       const obs = db.observation(accountId,row.observation_id), age = obs ? Date.parse(this.context.now())-Date.parse(obs.started_at) : NaN;
       if (!obs?.complete || obs.generation !== connection.generation || !(age >= 0 && age <= 300_000) || !row.local_id) throw new Error('Trade identity or observation is not current');
       const now = this.context.now();
@@ -182,6 +195,9 @@ export class CsfloatDeliveryService {
           // The trade read this press made still shows the sale queued: an accept whose answer was lost did not land (D4).
           const tradeObs = db.observation(accountId,this.store.trade(accountId,params.tradeId)!.observation_id)!;
           if (prior && this.provedAbsent(accept,prior,tradeObs,'CSFloat still shows the sale queued')?.kind === 'exhausted') continue;
+          // In the shared budget's reserve a new sale is not accepted: accepting promises a delivery (CSF-SEND-21).
+          const held = this.acceptHeld();
+          if (held) { this.block(id, held); continue; }
           const action = this.hopAction(accept,params,false);
           if (action.state !== 'READY') continue;
           credential = connection.credential_ref!;
@@ -226,7 +242,7 @@ export class CsfloatDeliveryService {
     // own while the offer waited left its hops open for good, and the panel hides a failed sale's work.
     if (['DONE','CANCELLED'].includes(view.state) && this.work.steps(id).every(isSettled)) return null;
     const connection = new MarketplaceStore(db).connection(accountId,'csfloat'), ports = this.context.ports.csfloat;
-    if (!connection?.credential_ref || connection.status !== 'CONNECTED' || connection.generation !== params.generation || !ports) throw new Error('Reconnect the original CSFloat account before continuing delivery');
+    if (!connection?.credential_ref || !this.deliverableConnection(connection.status) || connection.generation !== params.generation || !ports) throw new Error('Reconnect the original CSFloat account before continuing delivery');
     const trade = await this.services.trades.syncTrade(accountId,params.tradeId);
     if (!trade || trade.sellerSteamId !== db.account(accountId)?.steam_id64 || trade.listingId !== params.listingId || trade.listing.item.assetId !== params.assetId) throw new Error('Refresh the exact seller trade before proceeding');
     return { first, params, connection, ports, trade };
@@ -280,6 +296,9 @@ export class CsfloatDeliveryService {
       // accept whose answer was lost did not land, and the same action takes its next attempt (D4). On the press that
       // sent it the read came first, so nothing is doubled.
       if (prior && this.provedAbsent(accept,prior,obs,'CSFloat still shows the sale queued')?.kind === 'exhausted') return;
+      // In the shared budget's reserve a new sale is not accepted: accepting promises a delivery (CSF-SEND-21).
+      const held = this.acceptHeld();
+      if (held) { this.block(id, held); return; }
       // A sale whose bulk accept CSFloat refused whole is tried again on its own (CSF-SEND-10).
       const action = this.hopAction(accept,params,prior?.state === 'FAILED' && (prior.error ?? '').startsWith(BULK_ACCEPT_REFUSED));
       if (action.state === 'READY') await this.attempt(accept,action,() => ports.trades.accept(accountId,connection.credential_ref!,trade.tradeId),() => this.validateOwnership(first,params,trade));
@@ -444,6 +463,29 @@ export class CsfloatDeliveryService {
     if (typeof named === 'string' && named && this.work.step(send.id)?.offer_id === null) this.work.update(send.id,{ offer_id: named },this.context.now());
   }
 
+  /**
+   * Why a queued sale is not accepted now, or null when it may be.
+   *
+   * CSFloat's shared request counter (`CsfloatBudgetState`) in its reserve or spent holds every new
+   * accept until the reset: an accepted sale must be delivered, and what the reserve is kept for is
+   * delivering the sales already accepted. A sale left queued costs nothing and is accepted once the
+   * window opens; the buyer may back out of it meanwhile, which is the price of not promising what
+   * the budget may not cover (decided 2026-11-13). Isolated so a saboteur can accept anyway.
+   */
+  protected acceptHeld(): string | null {
+    const state = this.context.ports.csfloat?.budget?.state();
+    if (!state || state.phase === 'open') return null;
+    const left = state.remaining !== null && state.limit !== null ? ` (${state.remaining} of ${state.limit} left)` : '';
+    const until = state.resetAt ? ` until ${state.resetAt}` : '';
+    return `${CSFLOAT_BUDGET_HOLD}: CSFloat's shared request budget is ${state.phase === 'spent' ? 'spent' : 'in its reserve'}${left}${until}; `
+      + 'a new sale is accepted once it resets, and the sales already accepted are delivered first';
+  }
+
+  /** Whether a delivery goes on over a connection in this state (`deliverable`). Isolated so a saboteur can stop at THROTTLED as before. */
+  protected deliverableConnection(status: string | undefined): boolean {
+    return deliverable(status);
+  }
+
   /** The text the sale's offer carries: CSFloat's own (CSF-SEND-11), and the one a lost answer is found by. Isolated so a saboteur can sign it otherwise. */
   protected offerMessage(tradeId: string): string {
     return csfloatOfferMessage([tradeId]);
@@ -452,7 +494,7 @@ export class CsfloatDeliveryService {
   protected validateOwnership(first: WorkStepRow, params: CsfloatDeliveryStepParams, trade: CsfloatTrade): void {
     const db = this.context.database, now = this.context.now(), accountId = first.account_id, localId = first.local_id!;
     const connection = new MarketplaceStore(db).connection(accountId,'csfloat');
-    if (connection?.generation !== params.generation || connection.status !== 'CONNECTED') throw new Error('CSFloat connection changed');
+    if (connection?.generation !== params.generation || !this.deliverableConnection(connection.status)) throw new Error('CSFloat connection changed');
     if (trade.state === 'pending' && (!trade.deadlineAt || trade.deadlineAt <= now)) throw new Error('The CSFloat send deadline is missing or has elapsed');
     if (this.store.associate(accountId,trade.listing.item) !== localId) throw new Error('Delivery item identity is unresolved');
     const item = db.itemByLocalId(accountId,localId);
@@ -498,7 +540,7 @@ export class CsfloatDeliveryService {
       const accountId = first.account_id;
       if (['DONE','CANCELLED'].includes(view.state)) throw new Error('This delivery has already ended');
       const connection = new MarketplaceStore(db).connection(accountId,'csfloat'), ports = this.context.ports.csfloat;
-      if (!connection?.credential_ref || connection.status !== 'CONNECTED' || connection.generation !== params.generation || !ports) throw new Error('Reconnect the original CSFloat account before continuing delivery');
+      if (!connection?.credential_ref || !this.deliverableConnection(connection.status) || connection.generation !== params.generation || !ports) throw new Error('Reconnect the original CSFloat account before continuing delivery');
       const trade = await this.services.trades.syncTrade(accountId,params.tradeId);
       if (!trade || trade.sellerSteamId !== db.account(accountId)?.steam_id64 || trade.listingId !== params.listingId) throw new Error('Refresh the exact seller trade before proceeding');
       if (!['queued','pending'].includes(trade.state)) throw new Error(`CSFloat trade is already ${trade.state}`);

@@ -4,10 +4,11 @@ import { Badge, Button, Drawer, Empty, ProgressBar, Segmented, Thumbnail } from 
 import { Icon } from '../../components/Icon.js';
 import { VenueMark } from '../../components/VenueMark.js';
 import { WaitingList } from './Waiting.js';
-import { isOpenWork, useOutbox, type WorkRow } from './WorkIndicator.js';
-import { UNSENT_STATES } from './work-busy.js';
+import { isOpenWork, useOutbox, useWorkRefresh, type WorkRow } from './WorkIndicator.js';
+import { isHeldForCooldown, isWaitingPriceChange } from './work-busy.js';
 import type { WaitingState } from './use-waiting.js';
-import { ACTION_DESTINATION, DESTINATION, VENUE_NAME, commandCounts, commandHeadline, destinationOf, formatRelative, formatUsd, plural, retryPhrase, tallyCommand, workStateLabel, type Destination } from '../../lib/labels.js';
+import { DESTINATION, VENUE_NAME, chainFor, commandCounts, commandHeadline, currentHop, destinationOf, failureReason, formatRelative, inventoryWaitPhrase, plural, priceChangeDeadlinePhrase, retryPhrase, stopOffer, tallyCommand, workFigure, workStateLabel, type Destination } from '../../lib/labels.js';
+import { useNow } from '../../lib/clock.js';
 
 /** Which half of the drawer is showing. The app's work, or the person's. */
 export type WorkTab = 'work' | 'waiting';
@@ -48,6 +49,15 @@ const COMMANDLESS: ReadonlySet<string> = new Set(['DELIST', 'BUY_ORDER_CREATE', 
  * seen from two ends: `AWAITING_CONFIRMATION` in the work tab is the member, and the waiting tab
  * is the listing that member is stuck behind.
  *
+ * **A Steam price change waits in two ways, and each says which.** One asked for inside the five
+ * minutes Steam keeps between changes to a listing is held unsent (`isHeldForCooldown`) and counts
+ * down to its send, and can still be removed. A lower price that has been sent waits for the
+ * person's confirmation, with the listing on sale at its old price meanwhile, and says when the
+ * engine drops it unconfirmed; Stop withdraws it, and its button says so (`stopOffer`). One that
+ * fails says what became of the listing in plain words (`failureReason`) rather than in the
+ * engine's code for it. A row's price says which figure it is, in the currency it is in, or is
+ * not printed (`workFigure`).
+ *
  * **A strategy's work says so.** A rule the person set up acts through the same commands, and its
  * work reads "by a strategy" beside the time; a person's needs no word (strategy authority plan D5).
  *
@@ -64,16 +74,18 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
   rows: readonly WorkRow[];
   waiting: WaitingState;
   accountIds: readonly string[];
-  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null }> | undefined;
+  /** Each account, with its wallet currency once a read has named it: a Steam price on a row is in it. */
+  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; currency?: number | null | undefined }> | undefined;
   onOpenListings?: (() => void) | undefined;
 }): React.JSX.Element | null {
   const [stopping, setStopping] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [units, setUnits] = useState<StoragePageRow[]>([]);
   const outbox = useOutbox();
+  const refreshWork = useWorkRefresh();
   // A countdown is a caption that changes by itself: the clock is read once a second while a row
-  // is waiting for its resend, and not at all otherwise.
-  const now = useNow(open && rows.some((row) => row.memberState === 'RETRYING'));
+  // is waiting for its resend or for Steam's price-change cooldown, and not at all otherwise.
+  const now = useNow(open && rows.some((row) => row.memberState === 'RETRYING' || row.memberState === 'AWAITING_VENUE' || isHeldForCooldown(row)));
 
   // A casket id is a code, and codes never reach the screen. The unit has a name the user gave it
   // or that Steam gave it, and that is the only thing worth printing.
@@ -90,6 +102,10 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
       .catch(() => undefined);
     return () => { live = false; };
   }, [open, scope]);
+
+  // The account's wallet currency, when a read has named it. A price on a Steam row is in it, and
+  // printing it as any other currency would state a figure nobody was sent.
+  const walletOf = (accountId: string): number | null | undefined => accounts?.find((account) => account.id === accountId)?.currency;
 
   // The unit a hop puts the item into. Only a store hop ends in one: a retrieve ends in the
   // inventory, and a send to another account names a unit of that account, which is not in this list.
@@ -108,7 +124,11 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
   async function stop(commandId: string): Promise<void> {
     setStopping(commandId);
     setError(null);
-    try { await window.trading.invoke({ type: 'command.stop', commandId }); }
+    try {
+      await window.trading.invoke({ type: 'command.stop', commandId });
+      // A stop changes no observation surface and raises no notice: the panel reads again now.
+      refreshWork();
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setStopping(null); }
   }
@@ -154,11 +174,13 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
         const counts = first.outbox ? [] : commandCounts(tally);
         // Said once above the rows when every failure has it; each row then shows only a different one.
         const sharedReason = !first.outbox && tally.failed > 1 ? tally.sharedReason : null;
-        // Stop halts a command's unsent members, so it is offered only while one is unsent: a
-        // transfer already waiting on the phone has nothing left to remove. A CSFloat operation, a
-        // delist asked for by hand, a Steam buy-order action and a send still in the outbox have no
-        // command behind them, so there is nothing for it to stop.
-        const stoppable = !first.outbox && members.some((member) => UNSENT_STATES.has(member.memberState)) && !first.commandKind.startsWith('CSFLOAT_') && !COMMANDLESS.has(first.commandKind);
+        // Stop halts a command's unsent members and withdraws its lower prices waiting for their
+        // confirmation, so it is offered only while it would do one of those, in words that say
+        // which (`stopOffer`): a transfer already waiting on the phone has nothing left to remove.
+        // A price change still held for Steam's cooldown has not been sent, and can be removed. A
+        // CSFloat operation, a delist asked for by hand, a Steam buy-order action and a send still
+        // in the outbox have no command behind them, so there is nothing for it to stop.
+        const offer = !first.outbox && !first.commandKind.startsWith('CSFLOAT_') && !COMMANDLESS.has(first.commandKind) ? stopOffer(members) : null;
         const dismissable = first.outbox && first.memberState === 'REFUSED';
         return (
           <section className="work-command" key={commandId}>
@@ -172,10 +194,10 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
                   {accountIds.length > 1 ? <> · {first.accountId}</> : null}
                   {counts.map((part) => <React.Fragment key={part}> · {part}</React.Fragment>)}
                 </span>
-                {sharedReason ? <span className="work-command-reason caption" data-tone="warn">{sharedReason}</span> : null}
+                {sharedReason ? <span className="work-command-reason caption" data-tone="warn">{failureReason(sharedReason, first)}</span> : null}
               </span>
-              {stoppable ? (
-                <Button size="sm" variant="ghost" icon="pause" loading={stopping === commandId} onClick={() => void stop(commandId)}>Remove all queued</Button>
+              {offer ? (
+                <Button size="sm" variant="ghost" icon="pause" title={offer.title} data-testid="work-stop" loading={stopping === commandId} onClick={() => void stop(commandId)}>{offer.label}</Button>
               ) : null}
               {dismissable ? (
                 <Button size="sm" variant="ghost" icon="x" onClick={() => outbox.dismiss(commandId)}>Dismiss</Button>
@@ -188,7 +210,13 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
               const hop = destinationOf(member.commandKind, member.actionKind);
               // The command's marketplace when the hop has none: a CSFloat listing waiting on its
               // retrieve's walk is still waiting for CSFloat, not for Steam.
-              const state = workStateLabel(member.memberState, hop.venue ?? DESTINATION[member.commandKind]?.venue);
+              const venue = hop.venue ?? DESTINATION[member.commandKind]?.venue;
+              const state = workStateLabel(member.memberState, venue, member);
+              // Held unsent until Steam takes a price change on the listing again.
+              const cooling = isHeldForCooldown(member);
+              // A lower price sent and waiting for its confirmation: the engine drops it at its deadline.
+              const dropped = isWaitingPriceChange(member) ? priceChangeDeadlinePhrase(member.waitDeadline) : null;
+              const figure = workFigure(member, venue, walletOf(member.accountId));
               // A chained member shows both hops, the current one highlighted, so a crated item
               // being listed reads as "retrieve, then list" rather than jumping to the end.
               const hops = chainFor(member);
@@ -213,18 +241,31 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
                         {/* A confirmed row says what happened, not what was under way: "Stored · into Storage Unit 1". */}
                         {member.memberState === 'COMPLETE' ? hop.done ?? hop.verb : hop.verb}<Venue of={hop} />
                         {unitName(member) ? <> · into {unitName(member)}</> : null}
-                        {member.priceReceiveCents !== null ? <> · {formatUsd(member.priceReceiveCents)}</> : null}
+                        {/* Which figure it is, in the currency it is in, or nothing (`workFigure`). */}
+                        {figure ? <> · <span data-testid="work-row-price">{figure}</span></> : null}
                       </span>
                     )}
                     {member.reason && member.reason !== sharedReason && (member.memberState === 'BLOCKED' || member.memberState === 'FAILED' || member.memberState === 'REFUSED') ? (
-                      // The engine's reason, verbatim. A refusal the panel shows as a bare badge is
-                      // a recorded reason no read returns, which OP-08 says does not count.
-                      <span className="work-row-meta caption" data-tone="warn">{member.reason}</span>
+                      // The engine's reason, verbatim, or in plain words where it is a price change's
+                      // code. A refusal the panel shows as a bare badge is a recorded reason no read
+                      // returns, which OP-08 says does not count.
+                      <span className="work-row-meta caption" data-tone="warn">{failureReason(member.reason, member)}</span>
+                    ) : cooling ? (
+                      // Steam takes one price change per listing every five minutes. The change is
+                      // held until then; the person sees why it has not gone, and when it will.
+                      <span className="work-row-meta caption" data-tone="accent">{retryPhrase(member, venue, now)}</span>
+                    ) : dropped ? (
+                      // Nothing walks while a lower price waits on a person, so a time is what ends it.
+                      <span className="work-row-meta caption" data-tone="accent" data-testid="work-row-deadline">{dropped.charAt(0).toUpperCase()}{dropped.slice(1)}</span>
+                    ) : member.memberState === 'AWAITING_VENUE' ? (
+                      // CSFloat's copy of the inventory has not caught up with the item. The listing
+                      // is sent again on its schedule; the person sees when, and when it gives up.
+                      <span className="work-row-meta caption" data-tone="accent">{inventoryWaitPhrase(member, now)}</span>
                     ) : member.memberState === 'RETRYING' ? (
                       // A walk after the send still showed the old state. The engine will send
                       // again on its schedule; the person sees when, and which try it will be,
                       // rather than a wait with no end.
-                      <span className="work-row-meta caption" data-tone="warn">{retryPhrase(member, hop.venue ?? DESTINATION[member.commandKind]?.venue, now)}</span>
+                      <span className="work-row-meta caption" data-tone="warn">{retryPhrase(member, venue, now)}</span>
                     ) : member.attempt !== null && member.attempt > 1 ? (
                       <span className="work-row-meta caption quiet">attempt {member.attempt} of {member.attemptLimit}</span>
                     ) : null}
@@ -243,53 +284,8 @@ export function WorkPanel({ open, tab, onTab, onClose, rows, waiting, accountIds
   );
 }
 
-/** The wall clock, re-read once a second while `ticking`, so a countdown counts. */
-function useNow(ticking: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!ticking) return undefined;
-    setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(timer);
-  }, [ticking]);
-  return now;
-}
-
 /** " on Steam", " from CSFloat", with the marketplace's own mark — nothing for work that is on neither. */
 function Venue({ of }: { of: Destination }): React.JSX.Element | null {
   if (!of.venue) return null;
   return <span className="work-venue"> {of.joiner ?? 'on'} <VenueMark venue={of.venue} size={11} /> {VENUE_NAME[of.venue]}</span>;
-}
-
-/** One step of a chain: the action kind it is, and how `ACTION_DESTINATION` says it. */
-type Hop = Destination & { kind: string };
-
-/**
- * The hop a member is on.
- *
- * The engine reports the newest action carrying the member. When that action is `DONE` and the
- * chain has another hop, the member is waiting for the next one to be sent — a crated item whose
- * retrieve was observed is queued for listing, not still retrieving — so the highlight moves on.
- */
-function currentHop(member: WorkRow, hops: Hop[]): string | null {
-  if (member.actionState !== 'DONE') return member.actionKind;
-  const index = hops.findIndex((hop) => hop.kind === member.actionKind);
-  return index >= 0 ? hops[index + 1]?.kind ?? member.actionKind : member.actionKind;
-}
-
-/**
- * The hops a member passes through.
- *
- * Derived from the command kind rather than read from the plan, because the plan is the engine's
- * and this is a caption. A LIST member carrying a retrieve action is the chained case: it is being
- * taken out of a unit first, and the glyph must not show the Steam mark until that is observed.
- */
-function chainFor(member: WorkRow): Hop[] {
-  const hops = (...kinds: string[]): Hop[] => kinds.map((kind) => ({ kind, ...ACTION_DESTINATION[kind]! }));
-  if (member.commandKind === 'LIST' && member.actionKind === 'RETRIEVE_FROM_CASKET') return hops('RETRIEVE_FROM_CASKET', 'CREATE_SELL_LISTING');
-  // The engine's name for a CSFloat list; `CSFLOAT_LIST` is only the outbox's word for it.
-  if (member.commandKind === 'CSFLOAT_CREATE' && member.actionKind === 'RETRIEVE_FROM_CASKET') return hops('RETRIEVE_FROM_CASKET', 'CSFLOAT_CREATE');
-  if (member.commandKind === 'DELIST_TO_STORE') return hops('REMOVE_SELL_LISTING', 'STORE_IN_CASKET');
-  if (member.commandKind === 'REPRICE') return hops('REMOVE_SELL_LISTING', 'CREATE_SELL_LISTING');
-  return [];
 }

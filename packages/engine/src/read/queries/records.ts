@@ -64,6 +64,63 @@ export function pageHistory(database: EngineDatabase, request: HistoryPageReques
     FROM market_history h WHERE ${where}`,
     params, ['accountId', 'occurredAt', 'sourceKey'], { handles: n, quantity: n, groups: n, rows: n });
 }
+/** `since` is an ISO time: rows a walk finished writing, or quarantining, at or after it. */
+export type HistoryTimesPageRequest = { accountIds: readonly string[]; pageSize?: number; cursor?: string; filter?: { since?: string | undefined } };
+
+/**
+ * One sale or purchase as `QueryMyHistory` reported it (listing times plan D3, D4).
+ *
+ * `sourceKey` is `<listingId>:<eventType>`, the identity both history routes can name
+ * (`marketHistoryEventKey` in `@cslytics/ports`, which the statement below spells in SQL). `listedAt` is
+ * when the listing went live, null when Steam gave none. `amountCents` is what the route named,
+ * paid (amount and Steam's fee) on a purchase and received on a sale, in `currency`, the wallet's
+ * code; it is evidence, not the ledger's figure. `historyTime` is the old route's word on the same
+ * listing and type as the record holds it now: `agrees` to the millisecond, `differs`, or `absent`
+ * while the history walk has not read it. `quarantined` is 1 when the two routes disagree or this
+ * route said two things, and a consumer then treats the row as proof of nothing; the `conflict*`
+ * fields are what a later walk said when it disagreed with the stored row.
+ */
+export type HistoryTimeRow = {
+  accountId: string; sourceKey: string; listingId: string; eventType: number; occurredAt: string; listedAt: string | null;
+  hashName: string | null; amountCents: number | null; currency: number | null; observationId: number;
+  historyTime: 'agrees' | 'differs' | 'absent'; quarantined: 0 | 1;
+  conflictObservationId: number | null; conflictOccurredAt: string | null; conflictListedAt: string | null;
+};
+
+/**
+ * The listing times a host projects, keyset-paged by account, the walk that wrote the row, and the
+ * row's key. With `filter.since`, only what a walk finished writing or quarantining at or after it:
+ * the floor is the account's last listing-times walk that finished before `since` (one walk of a
+ * scope runs at a time, so a later id is a later finish), and each branch seeks an index.
+ */
+export function pageHistoryTimes(database: EngineDatabase, request: HistoryTimesPageRequest): PageEnvelope<HistoryTimeRow> {
+  const accounts = assertAccountScope(database, request.accountIds);
+  const since = request.filter?.since;
+  if (since !== undefined && !Number.isFinite(Date.parse(since))) throw new Error('filter.since must be an ISO-8601 time');
+  // By the listing (`history_listing_page`); `+h.event_type` keeps the planner off `history_type_page`.
+  const old = `SELECT 1 FROM market_history h WHERE h.account_id=t.account_id AND h.listing_id=t.listing_id AND +h.event_type=t.event_type`;
+  const columns = `SELECT t.account_id AS accountId, t.listing_id || ':' || t.event_type AS sourceKey, t.listing_id AS listingId,
+    t.event_type AS eventType, t.occurred_at AS occurredAt, t.listed_at AS listedAt, t.hash_name AS hashName,
+    t.amount_cents AS amountCents, t.currency AS currency, t.observation_id AS observationId,
+    CASE WHEN NOT EXISTS (${old}) THEN 'absent' WHEN EXISTS (${old} AND h.occurred_at=t.occurred_at) THEN 'agrees' ELSE 'differs' END AS historyTime,
+    (t.conflict_obs IS NOT NULL OR (EXISTS (${old}) AND NOT EXISTS (${old} AND h.occurred_at=t.occurred_at))) AS quarantined,
+    t.conflict_obs AS conflictObservationId, t.conflict_occurred_at AS conflictOccurredAt, t.conflict_listed_at AS conflictListedAt
+    FROM market_history_time t`;
+  const keys = ['accountId', 'observationId', 'sourceKey'];
+  if (since === undefined) {
+    return queryPage(database, request, 'history.times', `${columns} WHERE t.account_id IN (${accounts.map(() => '?')})`, [...accounts], keys);
+  }
+  const floor = database.raw().prepare(`SELECT id FROM observation WHERE account_id=? AND surface='steam-market-listing-times' AND finished_at<? ORDER BY id DESC LIMIT 1`);
+  const branches: string[] = [];
+  const params: Param[] = [];
+  for (const accountId of accounts) {
+    const below = (floor.get(accountId, since) as { id: number } | undefined)?.id ?? 0;
+    branches.push(`${columns} WHERE t.account_id=? AND t.observation_id>?`, `${columns} WHERE t.account_id=? AND t.conflict_obs>? AND t.observation_id<=?`);
+    params.push(accountId, below, accountId, below, below);
+  }
+  return queryPage(database, request, 'history.times', branches.join(' UNION ALL '), params, keys);
+}
+
 export function pageOrders(database: EngineDatabase, request: ScopedPageRequest): PageEnvelope<OrderPageRow> {
   const accounts = assertAccountScope(database, request.accountIds);
   const params: Param[] = [...accounts];

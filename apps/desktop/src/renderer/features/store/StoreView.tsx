@@ -4,6 +4,7 @@ import { engine, type EnrichedStoreSheet } from '../../lib/engine.js';
 import { formatAmount } from '../../lib/money.js';
 import { Panel, PanelHeader } from '../../components/ui.js';
 import type { AccountHoldings } from '../../lib/types.js';
+import { formatDateTime } from '../../lib/time.js';
 
 /**
  * The CS2 in-game store for one account: what the Game Coordinator will sell it, at the
@@ -74,12 +75,12 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
       <div className="toolbar page-controls">
         <button className="btn" disabled={busy} onClick={() => void run(() => engine.storeRefresh(accountId), 'Price sheet read from the Game Coordinator')}>Refresh price sheet</button>
         <span data-testid="store-sheet-status">
-          {sheet ? `Sheet version ${sheet.version} · ${sheet.currencyLabel} · observed ${new Date(sheet.observedAt).toLocaleString()}${sheet.parseState === 'UNPARSEABLE' ? ' · could not be parsed; showing the last parsed sheet' : ''}` : 'No price sheet has been read for this account'}
+          {sheet ? `Sheet version ${sheet.version} · ${sheet.currencyLabel} · observed ${formatDateTime(sheet.observedAt)}${sheet.parseState === 'UNPARSEABLE' ? ' · could not be parsed; showing the last parsed sheet' : ''}` : 'No price sheet has been read for this account'}
         </span>
       </div>
       <p data-testid="store-wallet">
         {holdings?.wallet
-          ? `Available to commit: ${available === null ? 'unknown' : formatAmount(available, holdings.currency)} · wallet observed ${new Date(holdings.wallet.observedAt).toLocaleString()}`
+          ? `Available to commit: ${available === null ? 'unknown' : formatAmount(available, holdings.currency)} · wallet observed ${formatDateTime(holdings.wallet.observedAt)}`
           : 'Wallet not observed yet'}
       </p>
       {message ? <p role="status">{message}</p> : null}
@@ -110,7 +111,7 @@ export function StoreView({ accountId }: { accountId: string }): React.JSX.Eleme
       <PanelHeader title="Purchases" />
       {purchases?.rows.length ? purchases.rows.map((row) => <div className="inventory-data-row" key={row.id} data-testid="store-purchase" data-state={row.state}>
         <span>{STATE_LABEL[row.state]}<br />
-          <small>{row.lines.map((line) => `${line.quantity} × ${line.entryKey}${line.observedQuantity ? ` (${line.observedQuantity} seen)` : ''}`).join(', ')} · {formatAmount(row.requestedTotalCents, row.currency)} · {new Date(row.createdAt).toLocaleString()}</small>
+          <small>{row.lines.map((line) => `${line.quantity} × ${line.entryKey}${line.observedQuantity ? ` (${line.observedQuantity} seen)` : ''}`).join(', ')} · {formatAmount(row.requestedTotalCents, row.currency)} · {formatDateTime(row.createdAt)}</small>
           {row.txnId ? <><br /><small>Transaction {row.txnId}</small></> : null}
           {row.error ? <><br /><small role="alert">{row.error}</small></> : null}</span>
         {CANCELLABLE.has(row.state) ? <button className="btn" disabled={busy} onClick={() => void run(() => engine.storeCancel(accountId, row.id), 'Cancel sent; the reserved funds return once the wallet and inventory have been observed')}>Cancel</button> : null}

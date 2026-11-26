@@ -7,7 +7,7 @@ import { formatRelative, plural } from '../../lib/labels.js';
 import { busyKeysFromWork, itemIsBusy } from '../work/work-busy.js';
 import { SortControl, type SortOption } from '../../components/SortControl.js';
 import { FilterBar } from '../../components/FilterBar.js';
-import { LISTING_CHIP_KINDS, chipsToListingFilter } from '../../components/filter-grammar.js';
+import { LISTING_CHIP_KINDS, chipsToListingFilter, type FilterChip } from '../../components/filter-grammar.js';
 import { InspectorSplit } from '../../components/InspectorSplit.js';
 import type { Workspace } from '../../components/ListingWorkspace.js';
 import { useScopedChips } from '../../components/scoped-chips.js';
@@ -28,6 +28,11 @@ const SORTS: ReadonlyArray<SortOption<ListingSort>> = [
   { id: 'float', label: 'Float', asc: 'lowest first', desc: 'highest first' },
   { id: 'seen', label: 'First seen', asc: 'oldest first', desc: 'newest first' }
 ];
+
+/** The chip a listing is found by: its number, which the engine matches as a typed name. */
+function focusChip(listing: NamedListing): FilterChip {
+  return { kind: 'name', text: listing.listingId };
+}
 
 /**
  * Every open advertisement, on every account, at every venue.
@@ -57,8 +62,12 @@ const SORTS: ReadonlyArray<SortOption<ListingSort>> = [
  *
  * The venue control offers the venues the accounts in view have set up, and a plus for each they
  * have not, which opens that venue's page in Settings (`VenueFilter`, `venueOffer`).
+ *
+ * The item inspector's *Go to listing* opens the page on one listing (`focus`): the bar holds its
+ * listing number, which a typed name finds, so the grid shows that listing and the chip says why,
+ * and the inspector holds it. Taking the chip off is the way back to the whole book.
  */
-export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue, reprice }: {
+export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue, reprice, onOpenItem, focus, onFocusTaken }: {
   accountIds: string[];
   accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; currency?: number | null | undefined }> | undefined;
   /** Which venues each account has set up (`setUpByAccount`); an account is absent until known. */
@@ -67,14 +76,29 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue, rep
   onAddVenue: (accountId: string, venue: VenueId) => void;
   /** The shell's workspace for new prices: the pencil stages a listing in it. */
   reprice: Workspace<StagedListing>;
+  /** Opens one market name on the Items page: the item page, or a sticker or charm pressed in the inspector. */
+  onOpenItem?: ((name: string) => void) | undefined;
+  /** A listing to open the page on: the item inspector's *Go to listing*. */
+  focus?: NamedListing | null | undefined;
+  /** Told once the page has opened on `focus`, so the shell lets go of it and a later visit starts afresh. */
+  onFocusTaken?: (() => void) | undefined;
 }): React.JSX.Element {
   const [venue, setVenue] = useState<'' | ListingVenue>('');
   const [state, setState] = useState('');
-  const { chips, setChips, scope, queryScope, scopeAccounts } = useScopedChips(accountIds, accounts);
+  const { chips, setChips, scope, queryScope, scopeAccounts } = useScopedChips(accountIds, accounts, focus ? [focusChip(focus)] : []);
   const [sort, setSort] = useState<ListingSort>('name');
   const [direction, setDirection] = useState<ListingSortDirection>('asc');
   const [summary, setSummary] = useState<ListingsSummary | null>(null);
-  const [subject, setSubject] = useState<NamedListing | null>(null);
+  const [subject, setSubject] = useState<NamedListing | null>(focus ?? null);
+  // A focus that arrives while the page is open replaces what the bar held, as one at mount did.
+  useEffect(() => {
+    if (!focus) return;
+    setVenue('');
+    setState('');
+    setChips([focusChip(focus)]);
+    setSubject(focus);
+    onFocusTaken?.();
+  }, [focus]);
   const [message, setMessage] = useState<Message | null>(null);
   const [revision, setRevision] = useState(0);
   const work = useOpenWork(accountIds);
@@ -184,6 +208,7 @@ export function ListingsView({ accountIds, accounts = [], setUp, onAddVenue, rep
       staged={subject !== null && reprice.state.rows.some((entry) => entry.key === listingKey(subject))}
       delisting={delisting}
       onReprice={stageReprice}
+      onOpenItem={onOpenItem}
     />
   );
 

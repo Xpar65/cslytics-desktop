@@ -1,9 +1,11 @@
-import { CSFLOAT_CURRENCY, type CsfloatBuyOrder, type CsfloatListing, type CsfloatListingItem, type CsfloatTrade } from '@cslytics/ports';
+import { CSFLOAT_CURRENCY, type CsfloatBuyOrder, type CsfloatListing, type CsfloatListingItem, type CsfloatStatedListing, type CsfloatTrade } from '@cslytics/ports';
 import type { EngineDatabase, ObservationRow } from './database.js';
 import { MarketplaceStore } from './marketplace.js';
 import { isSettled, type WorkStepRow } from './work.js';
 import type { OrderConfidence, OrderState } from './alphabets.js';
 import type { VenueOrderRow } from './orders.js';
+// The bound and the event a reprice's answer shares with Steam's price change in place.
+import { CSFLOAT_ANSWER_GUARD_MS, PRICE_ANSWER_CONTRADICTED } from '../kernel/price-answer.js';
 
 /**
  * CSFloat prices in US dollars, stored as Steam's `ECurrencyCode` (`CSFLOAT_CURRENCY`, from the one
@@ -11,6 +13,18 @@ import type { VenueOrderRow } from './orders.js';
  * needs one formatter rather than one per venue.
  */
 export { CSFLOAT_CURRENCY };
+
+/** The surface one CSFloat listing is observed on, by its own read and by a reprice's answer alike. */
+export const CSFLOAT_LISTING_SURFACE = 'csfloat-listing';
+
+/**
+ * Whether an observation of one listing is a reprice's answer and not a read of the listing
+ * (reprice settles on its answer plan D2): it is on the listing's surface, complete, and walked
+ * no page, because no read was made for it. A read of a listing walks one.
+ */
+export function isAnswerObservation(observation: Pick<ObservationRow, 'surface' | 'complete' | 'pages_walked'> | undefined): boolean {
+  return observation !== undefined && observation.surface === CSFLOAT_LISTING_SURFACE && observation.complete === 1 && observation.pages_walked === 0;
+}
 
 /** The CSFloat words for a listing that is no longer an advertisement, and no longer commits its item. */
 export const CSFLOAT_ENDED_WORDS = ['delisted', 'cancelled', 'refunded'] as const;
@@ -37,6 +51,15 @@ export type CsfloatTradeRow = { account_id: string; trade_id: string; listing_id
 export type StoredCsfloatTrade = Omit<CsfloatTrade, 'tradeToken'>;
 
 /** The command kind of a delivery, and its hops: the steps a sale to a CSFloat buyer is made of. */
+/**
+ * A sale the venue shows past its buyer, as SQL over a `csfloat_trade` row (aliased or not): the
+ * offer accepted on Steam (3) or the verification window open. Its unit left with the buyer.
+ */
+export function salePastItsBuyerSql(alias = ''): string {
+  const column = `${alias ? `${alias}.` : ''}data_json`;
+  return `(json_extract(${column},'$.offerState')=3 OR json_extract(${column},'$.verifySaleAt') IS NOT NULL)`;
+}
+
 export const CSFLOAT_DELIVER = 'CSFLOAT_DELIVER';
 export const CSFLOAT_DELIVERY_HOPS = ['CSFLOAT_ACCEPT', 'CSFLOAT_SEND', 'CSFLOAT_NOTIFY', 'CSFLOAT_CANNOT_DELIVER'] as const;
 export type CsfloatDeliveryHop = (typeof CSFLOAT_DELIVERY_HOPS)[number];
@@ -111,22 +134,44 @@ const IN_BOOK = 'v.first_seen_obs IS NOT NULL AND v.gone_obs IS NULL';
 /**
  * The CSFloat side of the one order table (consolidation plan D4): every advertisement and buy
  * order of the account as `venue_order` rows with `csfloat_order` beside them, written here and
- * nowhere else. A listing's row is written by whichever read last stated it — the stall walk, its
- * own read, or a trade that carries it — and the venue's word is kept beside the parent's state;
- * only the stall walk, the one complete book, says what is still on the book (`first_seen_obs`,
- * `last_seen_obs`, `gone_obs`). A buy order's row is the walk's alone.
+ * nowhere else. A listing's row is written by whichever observation last stated it — the stall
+ * walk, its own read, a trade that carries it, or the answer to a reprice of it (`recordAnswer`) —
+ * and the venue's word is kept beside the parent's state; only the stall walk, the one complete
+ * book, says what is still on the book (`first_seen_obs`, `last_seen_obs`, `gone_obs`). A buy
+ * order's row is the walk's alone.
  */
+/** A connection whose walks still count: connected, or throttled, which is the absence of an answer and never a verdict on the key (CSF-21). */
+function walksStand(status: string | undefined): boolean {
+  return status === 'CONNECTED' || status === 'THROTTLED';
+}
+
 export class CsfloatStore {
   constructor(readonly db: EngineDatabase) {}
   /** The duplicate-protection switch: this desktop's preference, held by the engine and persisted nowhere in the record (D13). */
   policy(): { preventDuplicates: boolean; version: number } { return this.db.marketplaceProtection(); }
   setPolicy(enabled: boolean): void { this.db.setMarketplaceProtection(enabled); }
+  /**
+   * The latest walk of a surface, if it is complete, of the current connection and inside its window.
+   * A connection that reads THROTTLED keeps its walks: a refused status read says nothing about a
+   * complete walk of the stall or the trades a minute old, and on 2026-11-12 it refused every
+   * delivery "Refresh CSFloat listings before using this item" for an hour (CSF-SEND-20).
+   */
   fresh(accountId: string, surface: string, now: string, maxAgeMs = 300_000): ObservationRow | undefined {
     const connection = new MarketplaceStore(this.db).connection(accountId,'csfloat');
     const obs = this.db.latestObservation(accountId,surface);
     const age = obs ? Date.parse(now)-Date.parse(obs.started_at) : NaN;
-    return connection?.status === 'CONNECTED' && obs?.complete && !obs.error && obs.generation === connection.generation
+    return connection !== undefined && walksStand(connection.status) && obs?.complete && !obs.error && obs.generation === connection.generation
       && age >= 0 && age <= maxAgeMs ? obs : undefined;
+  }
+  /**
+   * `fresh`, judged on the latest *complete* walk rather than the latest walk: a failed read after a
+   * complete one leaves what the complete one said standing, inside its window.
+   */
+  freshComplete(accountId: string, surface: string, now: string, maxAgeMs: number): ObservationRow | undefined {
+    const connection = new MarketplaceStore(this.db).connection(accountId,'csfloat');
+    const obs = this.db.latestCompleteObservation(accountId,surface);
+    const age = obs ? Date.parse(now)-Date.parse(obs.started_at) : NaN;
+    return connection !== undefined && walksStand(connection.status) && obs && obs.generation === connection.generation && age >= 0 && age <= maxAgeMs ? obs : undefined;
   }
   /**
    * Exact attributes establish identity; an asset id alone never repairs a contradictory tuple.
@@ -146,7 +191,7 @@ export class CsfloatStore {
    */
   associate(accountId: string, item: CsfloatListingItem): string | null {
     if (item.paintIndex !== undefined && item.floatValue !== undefined && item.paintSeed !== undefined && item.quality !== undefined) {
-      const rows = this.db.raw().prepare(`SELECT local_id, asset_id FROM item WHERE account_id=? AND def_index=? AND paint_index=? AND paint_wear=? AND paint_seed=? AND quality=?`)
+      const rows = this.db.statement(`SELECT local_id, asset_id FROM item WHERE account_id=? AND def_index=? AND paint_index=? AND paint_wear=? AND paint_seed=? AND quality=?`)
         .all(accountId,item.defIndex,item.paintIndex,item.floatValue,item.paintSeed,item.quality) as Array<{ local_id: string; asset_id: string | null }>;
       if (rows.length === 1) return rows[0]!.local_id;
       if (rows.length > 1) {
@@ -179,15 +224,115 @@ export class CsfloatStore {
   }
 
   /**
+   * The last answer that settled a reprice of this listing, and when it returned, whether or not it
+   * is still the newest word on the listing: a read that began before that moment may have read the
+   * listing before the change, whatever has been published since. Found from the listing's reprice
+   * hops (`work_step_target`): a hop its answer settled, done or ended by a sale in the same call,
+   * names the answer's observation. Undefined for a listing no answer has settled a reprice of.
+   * Asked for every listing a read shows up.
+   */
+  private lastAnswer(accountId: string, listingId: string): { observation_id: number; returned_at: string } | undefined {
+    return this.db.statement(`SELECT o.id AS observation_id, o.finished_at AS returned_at
+      FROM work_step w INDEXED BY work_step_target JOIN observation o ON o.id=w.observation_id
+      WHERE w.account_id=? AND w.kind='CSFLOAT_REPRICE' AND w.target_id=? AND o.surface='${CSFLOAT_LISTING_SURFACE}' AND o.complete=1 AND o.pages_walked=0
+      ORDER BY o.id DESC LIMIT 1`).get(accountId, listingId) as { observation_id: number; returned_at: string } | undefined;
+  }
+
+  /**
+   * What a reprice's answer last stated about a listing, while that answer is still the newest
+   * word on it: the answer's observation, and the price and state it stated. Undefined once any
+   * read has restated the listing, and for a listing no answer stated. One row by three primary
+   * keys, asked only of a listing an answer has settled a reprice of.
+   */
+  private answerStanding(accountId: string, listingId: string): { observation_id: number; price_cents: number; state: string } | undefined {
+    return this.db.statement(`SELECT o.id AS observation_id, v.price_cents, s.state_word AS state
+      FROM csfloat_order s JOIN observation o ON o.id=s.observation_id JOIN venue_order v ON v.account_id=s.account_id AND v.order_id=s.order_id
+      WHERE s.account_id=? AND s.order_id=? AND o.surface='${CSFLOAT_LISTING_SURFACE}' AND o.complete=1 AND o.pages_walked=0`)
+      .get(accountId, listingId) as { observation_id: number; price_cents: number; state: string } | undefined;
+  }
+
+  /**
+   * Whether a read's price is one a reprice of ours asked for after the answer was recorded: then
+   * the read is that reprice's proof, this app's own change, and no contradiction of the answer.
+   * The reprice is any of this listing's whose attempt began after the answer and was not refused:
+   * one whose answer was lost, or is still out, may have landed, and a refused one changed nothing.
+   * An attempt keeps the newest observation the record held when it began (`attemptWatermark`), so
+   * "after the answer" is read from the record's own order and not from a clock. Asked only when a
+   * read disagrees with a standing answer.
+   */
+  private repricedTo(accountId: string, listingId: string, priceCents: number, answerObservationId: number): boolean {
+    return this.db.statement(`SELECT 1 FROM work_step w INDEXED BY work_step_target JOIN attempt t ON t.action_id=w.action_id
+      WHERE w.account_id=? AND w.kind='CSFLOAT_REPRICE' AND w.target_id=? AND json_extract(w.params_json,'$.priceCents')=?
+        AND (t.outcome IS NULL OR t.outcome<>'DEFINITIVELY_REJECTED') AND CAST(json_extract(t.request_ref,'$.observationWatermark') AS INTEGER)>=? LIMIT 1`)
+      .get(accountId, listingId, priceCents, answerObservationId) !== undefined;
+  }
+
+  /**
+   * A reprice's answer recorded as an observation of its listing, the way the listing's own read
+   * is: an observation on the listing's surface and scope, and the listing published under it. It
+   * began when the request went out and finished when the answer returned, which are the bounds of
+   * the moment it describes, and it walked no page (`isAnswerObservation`).
+   *
+   * The answer states the listing's price and state. Its item, its type and when it was created
+   * are restated as the record already holds them: none of them changes with a price, and the
+   * record held them before the reprice was admitted. A listing the record does not hold is not
+   * recorded, and `null` says so. The caller's transaction holds both writes.
+   */
+  recordAnswer(accountId: string, stated: CsfloatStatedListing, generation: number, sentAt: string, returnedAt: string): number | null {
+    const held = this.contract(accountId, stated.listingId);
+    if (!held) return null;
+    const observationId = this.db.insertObservation({ accountId, surface: CSFLOAT_LISTING_SURFACE, scopeKind: 'item', scopeId: stated.listingId,
+      generation, startedAt: sentAt, finishedAt: returnedAt, complete: true, pagesWalked: 0 });
+    this.publishContract(accountId, { listingId: stated.listingId, createdAt: '', type: held.type, state: stated.state, priceCents: stated.priceCents,
+      item: JSON.parse(held.item_json) as CsfloatListingItem, raw: null }, observationId);
+    return observationId;
+  }
+
+  /**
    * One listing as a read stated it: the parent's binding re-derived from the venue's item, its
    * state from the venue's word, the venue's own body beside it. What is on the book is not this
    * read's to say unless it is the stall walk (`observeStall`).
+   *
+   * A reprice's answer states the listing too (`recordAnswer`), and two rules hold between it and
+   * the reads around it.
+   *
+   * A read that began at or before the moment the last answer that settled a reprice of the listing
+   * returned (`lastAnswer`) may have read the listing before the change, so when it shows the
+   * listing up it does not restate it: a stall walk in flight during a reprice would otherwise put
+   * the old price back, or show as up a listing the reprice sold. That moment counts whether or not
+   * the answer is still the newest word on the listing: a read is no newer for being published
+   * after a fresher one. A read that shows the listing sold, delisted or refunded is recorded
+   * whenever it began, because a listing the venue ended must never be left looking up, and a
+   * trade a walk brings back is recorded with it (`publishTrade`). The rule reaches back
+   * `CSFLOAT_ANSWER_GUARD_MS` and no further.
+   *
+   * The first read begun after the answer restates the listing as any read does, and when it shows
+   * the listing up at another price, or up at all after an answer that called it sold, it writes
+   * one `price-answer-contradicted` event: the count of those is how trusting the answer is judged,
+   * so it counts nothing this app did itself. A read that shows the price a later reprice of ours
+   * asked for is that reprice's proof, and writes none (`repricedTo`); the answer to a later reprice
+   * is neither stale nor a contradiction either: it is the newer word, and it replaces the earlier
+   * answer. Returns whether the listing was restated.
    */
-  publishContract(accountId: string, listing: CsfloatListing, observationId: number): void {
+  publishContract(accountId: string, listing: CsfloatListing, observationId: number): boolean {
+    const answer = listing.state === 'listed' ? this.lastAnswer(accountId, listing.listingId) : undefined;
+    const read = answer ? this.db.observation(accountId, observationId) : undefined;
+    if (answer && read && !isAnswerObservation(read)) {
+      // At or before: a read begun the instant the answer returned may have been answered from before the change.
+      const lead = Date.parse(answer.returned_at) - Date.parse(read.started_at);
+      if (lead >= 0 && lead <= CSFLOAT_ANSWER_GUARD_MS) return false;
+      const standing = this.answerStanding(accountId, listing.listingId);
+      if (standing && (standing.state !== 'listed' || standing.price_cents !== listing.priceCents)
+        && !this.repricedTo(accountId, listing.listingId, listing.priceCents, standing.observation_id)) {
+        this.db.addEvent(accountId, PRICE_ANSWER_CONTRADICTED, { venue: 'csfloat', listingId: listing.listingId,
+          statedCents: standing.price_cents, observedCents: listing.priceCents, statedState: standing.state, observedState: listing.state,
+          answerObservationId: standing.observation_id, observationId }, read.finished_at);
+      }
+    }
     const { state, confidence } = this.listingState(accountId, listing.listingId, listing.state);
     const localId = this.associate(accountId, listing.item);
     const ended = state.startsWith('ENDED_');
-    this.db.raw().prepare(`INSERT INTO venue_order(account_id, order_id, venue, side, local_id, asset_id, hash_name, venue_order_id, price_cents, currency,
+    this.db.statement(`INSERT INTO venue_order(account_id, order_id, venue, side, local_id, asset_id, hash_name, venue_order_id, price_cents, currency,
         state, confidence, opened_at, ended_at, end_reason, end_evidence)
       VALUES (?, ?, 'csfloat', 'SELL', ?, ?, ?, ?, ?, ${CSFLOAT_CURRENCY}, ?, ?, COALESCE(NULLIF(?, ''), (SELECT finished_at FROM observation WHERE id=?)), ?, ?, ?)
       ON CONFLICT(account_id, order_id) DO UPDATE SET local_id=COALESCE(excluded.local_id, venue_order.local_id), asset_id=excluded.asset_id,
@@ -196,15 +341,19 @@ export class CsfloatStore {
       .run(accountId, listing.listingId, localId, listing.item.assetId, listing.item.marketHashName, listing.listingId, listing.priceCents,
         state, confidence, listing.createdAt, observationId,
         ended ? this.db.observation(accountId, observationId)?.finished_at ?? null : null, ended ? `CSFloat reports the listing ${listing.state}` : null, ended ? observationId : null);
-    this.db.raw().prepare(`INSERT INTO csfloat_order(account_id, order_id, type, state_word, item_json, created_at, observation_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+    this.db.statement(`INSERT INTO csfloat_order(account_id, order_id, type, state_word, item_json, created_at, observation_id) VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(account_id, order_id) DO UPDATE SET type=excluded.type, state_word=excluded.state_word, item_json=excluded.item_json,
         created_at=COALESCE(excluded.created_at, csfloat_order.created_at), observation_id=excluded.observation_id`)
       .run(accountId, listing.listingId, listing.type, listing.state, JSON.stringify(listing.item), listing.createdAt || null, observationId);
     this.db.touch(accountId, 'venue_order');
+    return true;
   }
   /**
    * One complete stall walk: every listing it showed, stated and marked on the book, and every
    * listing it no longer shows marked gone, its state left to the read that explains it (rule 5).
+   * A listing whose statement is held back, because the walk began before the answer to a reprice
+   * of it returned (`publishContract`), keeps its marks on the book as they were: a walk that read
+   * the listing before the reprice sold it must not mark it freshly seen there.
    */
   observeStall(accountId: string, observationId: number, listings: readonly CsfloatListing[]): void {
     const seen = new Set(listings.map((listing) => listing.listingId));
@@ -213,7 +362,7 @@ export class CsfloatStore {
       if (!seen.has(row.venue_order_id)) this.db.raw().prepare('UPDATE venue_order SET gone_obs=? WHERE account_id=? AND order_id=?').run(observationId, accountId, row.order_id);
     }
     for (const listing of listings) {
-      this.publishContract(accountId, listing, observationId);
+      if (!this.publishContract(accountId, listing, observationId)) continue;
       this.db.raw().prepare(`UPDATE venue_order SET first_seen_obs=COALESCE(first_seen_obs, ?), last_seen_obs=?, gone_obs=NULL WHERE account_id=? AND order_id=?`)
         .run(observationId, observationId, accountId, listing.listingId);
     }
@@ -255,11 +404,23 @@ export class CsfloatStore {
   publishTrade(accountId: string, trade: CsfloatTrade, observationId: number): void {
     const { tradeToken: _token, listing, ...fields } = trade;
     const safe: StoredCsfloatTrade = { ...fields, listing: { ...listing, raw: null } };
-    this.db.raw().prepare(`INSERT INTO csfloat_trade(account_id,trade_id,listing_id,asset_id,local_id,state_word,seller_steam_id,data_json,observation_id,offer_id)
+    this.db.statement(`INSERT INTO csfloat_trade(account_id,trade_id,listing_id,asset_id,local_id,state_word,seller_steam_id,data_json,observation_id,offer_id)
       VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,trade_id) DO UPDATE SET local_id=COALESCE(excluded.local_id,csfloat_trade.local_id),
       state_word=excluded.state_word,data_json=excluded.data_json,observation_id=excluded.observation_id,offer_id=excluded.offer_id`)
       .run(accountId,trade.tradeId,trade.listingId,listing.item.assetId,this.associate(accountId,listing.item),trade.state,trade.sellerSteamId,JSON.stringify(safe),observationId,trade.offerId);
     if (this.db.account(accountId)?.steam_id64 === trade.sellerSteamId) this.publishContract(accountId,listing,observationId);
+  }
+  /**
+   * Names the create of ours that made a buy order on its row (`action_id`), so the book reads the
+   * command that placed it. Only a row no create has claimed; a later walk keeps the link. False when
+   * the row was claimed already.
+   */
+  linkBuyOrder(accountId: string, orderId: string, actionId: string): boolean {
+    const linked = this.db.raw().prepare(`UPDATE venue_order SET action_id=? WHERE account_id=? AND order_id=? AND venue='csfloat' AND side='BUY' AND action_id IS NULL`)
+      .run(actionId, accountId, orderId);
+    if (linked.changes !== 1) return false;
+    this.db.touch(accountId, 'venue_order');
+    return true;
   }
   /** A buy order the last complete walk of the book showed, by the venue's id. */
   buyOrder(accountId: string, orderId: string): CsfloatBuyOrderRow | undefined {
@@ -272,14 +433,15 @@ export class CsfloatStore {
       .all(accountId) as CsfloatBuyOrderRow[];
   }
   contract(accountId: string, listingId: string): CsfloatContract | undefined {
-    return this.db.raw().prepare(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND v.venue_order_id=?`)
+    return this.db.statement(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND v.venue_order_id=?`)
       .get(accountId,listingId) as CsfloatContract | undefined;
   }
   /**
-   * When this listing's price last changed on this app's word: the latest reprice of it a read
-   * proved (`CSFLOAT_REPRICE` hop `DONE`, by `work_step_target`), or `null` for a listing never
-   * repriced from here. Read by the price-change cadence (`kernel/price-cadence.ts`) and by the
-   * listings page; the same statement has a registered query plan.
+   * When this listing's price last changed on this app's word: the latest reprice of it that ended
+   * done, on its own answer or on a read (`CSFLOAT_REPRICE` hop `DONE`, by `work_step_target`), or
+   * `null` for a listing never repriced from here. Read by the price-change cadence
+   * (`kernel/price-cadence.ts`) and by the listings page; the same statement has a registered
+   * query plan.
    */
   lastPriceChangeAt(accountId: string, listingId: string): string | null {
     const row = this.db.raw().prepare(`SELECT MAX(w.updated_at) AS at FROM work_step w INDEXED BY work_step_target WHERE w.account_id=? AND w.kind='CSFLOAT_REPRICE' AND w.target_id=? AND w.state='DONE'`)
@@ -311,6 +473,22 @@ export class CsfloatStore {
     return this.db.raw().prepare(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND s.state_word NOT IN ${CSFLOAT_ENDED_SQL}
       AND (v.local_id=? OR v.asset_id=?${includeUnresolved ? ' OR v.local_id IS NULL' : ''})`).all(accountId, localId, assetId) as CsfloatContract[];
   }
+  /**
+   * The contracts `standingContracts` returns less every sold one its sale has settled: a trade of
+   * that listing the venue ended (verified, failed, cancelled), or, for a contract that names no
+   * unit of the record, a pending sale the venue shows past its buyer (`salePastItsBuyerSql`). One
+   * statement over `csfloat_trade_listing`. The claim check used to ask once per contract, a fresh
+   * statement and a scan of every trade each time: at the 6,200 sales of an account that sold for
+   * months before the record began, 38 million rows per CSFloat create, delivery and transfer it
+   * judged, and 87 % of a pass's CPU (measured 2026-11-03).
+   */
+  unsettledContracts(accountId: string, localId: string, assetId: string, includeUnresolved: boolean): CsfloatContract[] {
+    return this.db.statement(`${CONTRACT_SELECT} WHERE v.account_id=? AND v.venue='csfloat' AND v.side='SELL' AND s.state_word NOT IN ${CSFLOAT_ENDED_SQL}
+      AND (v.local_id=? OR v.asset_id=?${includeUnresolved ? ' OR v.local_id IS NULL' : ''})
+      AND NOT (s.state_word='sold' AND EXISTS (SELECT 1 FROM csfloat_trade t WHERE t.account_id=v.account_id AND t.listing_id=v.venue_order_id
+        AND (t.state_word IN ('verified','failed','cancelled') OR (v.local_id IS NULL AND t.state_word='pending' AND ${salePastItsBuyerSql('t')}))))`)
+      .all(accountId, localId, assetId) as CsfloatContract[];
+  }
   /** Whether the last complete stall walk showed this listing: the one book that confers authority over it. */
   inStall(accountId: string, listingId: string): boolean {
     return Boolean(this.db.raw().prepare(`SELECT 1 FROM venue_order v WHERE v.account_id=? AND v.venue='csfloat' AND v.venue_order_id=? AND ${IN_BOOK}`).get(accountId, listingId));
@@ -329,7 +507,7 @@ export class CsfloatStore {
       .all(accountId, limit) as Array<{ listing_id: string }>).map((row) => row.listing_id);
   }
   trade(accountId: string, tradeId: string): CsfloatTradeRow | undefined {
-    return this.db.raw().prepare('SELECT * FROM csfloat_trade WHERE account_id=? AND trade_id=?').get(accountId,tradeId) as CsfloatTradeRow | undefined;
+    return this.db.statement('SELECT * FROM csfloat_trade WHERE account_id=? AND trade_id=?').get(accountId,tradeId) as CsfloatTradeRow | undefined;
   }
   /**
    * How a sale ended, beyond the venue's word (delivery retries plan D10): `reversed` when CSFloat

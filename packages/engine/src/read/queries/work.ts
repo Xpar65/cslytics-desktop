@@ -3,6 +3,7 @@ import { MEMBER_HOP_JOINS, MEMBER_REASON_SQL, MEMBER_STATE_SQL, STEP_ACTION_SQL,
 import { OPEN_STEP_STATES_SQL } from '../../db/work.js';
 import type { CommandAuthority } from '../../db/alphabets.js';
 import { attemptLimit, RETRY_POLICY, retryPlan } from '../../kernel/retry-policy.js';
+import { readsPausedUntil } from '../../kernel/read-budget.js';
 import { assertAccountScope, bounded, queryPage, type ScopedPageRequest } from './paging.js';
 
 /**
@@ -25,6 +26,23 @@ import { assertAccountScope, bounded, queryPage, type ScopedPageRequest } from '
  *
  * `authority` is whose the command is: a person's, or a strategy's acting for one (strategy
  * authority plan D5). The panel labels a strategy's work; a person's needs no label.
+ *
+ * On a member `AWAITING_VENUE` — a CSFloat listing waiting for CSFloat's copy of the inventory to
+ * show its item (CSF-58) — `retryAt` is when it is sent again, `waitDeadline` when it gives up,
+ * and `readsPausedUntil` when the account's reads of that copy resume, while its daily budget is
+ * spent (`kernel/read-budget.ts`); the sends go on meanwhile. All three are `null` on other work.
+ *
+ * `retryCause` is why a member waits to be sent again, so the panel words it right: CSFloat's copy
+ * of the inventory lagging (`AWAITING_VENUE`), the venue refusing for its pace and naming when to
+ * ask again (a 429), a walk proving the last send did not land, or Steam's cooldown on a listing's
+ * price. `null` on work not waiting to be resent.
+ *
+ * A price change held for Steam's cooldown reads `AWAITING_VENUE` with `retryCause: 'cooldown'` and
+ * `retryAt` the moment the cooldown ends, which is when the change is sent: whether it has never
+ * been sent, was refused once for the cooldown, or is owed its one resend. `waitDeadline` and
+ * `readsPausedUntil` are `null` on it: nothing gives up on a cooldown, and no read is paused for one.
+ * A lower price Steam holds for its confirmation reads `AWAITING_CONFIRMATION` with `waitDeadline`
+ * the moment it is withdrawn unconfirmed; while its discard is out it reads `AWAITING_OBSERVATION`.
  */
 export type WorkRow = {
   accountId: string; commandId: string; commandKind: string; commandState: string; authority: CommandAuthority;
@@ -37,15 +55,32 @@ export type WorkRow = {
   matchKey: string;
   hashName: string | null;
   retryAt: string | null; attempt: number | null; attemptLimit: number | null;
+  waitDeadline: string | null; readsPausedUntil: string | null;
+  retryCause: RetryCause | null;
 };
+export type RetryCause = 'inventory-lag' | 'rate-limit' | 'not-applied' | 'cooldown';
 export type WorkPage = { rows: WorkRow[] };
 
 /** A source's row before the retry facts are added: what the carrying action's row says, when there is one. */
-type RawWorkRow = Omit<WorkRow, 'retryAt' | 'attempt' | 'attemptLimit'> & { actionResolution?: string | null; attempts?: number | null; retryAfter?: string | null };
+type RawWorkRow = Omit<WorkRow, 'retryAt' | 'attempt' | 'attemptLimit' | 'waitDeadline' | 'readsPausedUntil' | 'retryCause'>
+  & { actionResolution?: string | null; attempts?: number | null; retryAfter?: string | null; waitDeadline?: string | null; repriceReadyAt?: string | null };
 
-/** The columns a source joins from `action` and its attempts for `describeRetry`; `a` is the carrying action. */
-const RETRY_COLUMNS = `a.resolution AS actionResolution, (SELECT COUNT(*) FROM attempt t WHERE t.action_id=a.id) AS attempts,
+/**
+ * The columns a source joins from `action` and its attempts for `describeRetry`; `a` is the
+ * carrying action. A price change counts the sends that could have landed: one Steam refused for
+ * its cooldown sent nothing, and is not a try of the two a price change gets (`sendsThatCouldLand`).
+ */
+const RETRY_COLUMNS = `a.resolution AS actionResolution,
+    (SELECT COUNT(*) FROM attempt t WHERE t.action_id=a.id AND NOT (a.kind='UPDATE_SELL_LISTING_PRICE' AND IFNULL(t.outcome,'')='DEFINITIVELY_REJECTED')) AS attempts,
     (SELECT t.retry_after FROM attempt t WHERE t.action_id=a.id ORDER BY t.rowid DESC LIMIT 1) AS retryAfter`;
+
+/**
+ * When Steam's cooldown on the listing a price change is about ends, or `null`: asked of the
+ * listing the hop names, through `order_venue_id`. `s` is the hop.
+ */
+const REPRICE_READY_SQL = `CASE WHEN s.kind='EDIT_PRICE' THEN (
+      SELECT o.reprice_ready_at FROM venue_order v INDEXED BY order_venue_id JOIN steam_order o ON o.account_id=v.account_id AND o.order_id=v.order_id
+      WHERE v.account_id=s.account_id AND v.venue='steam' AND v.venue_order_id=s.target_id) END`;
 
 /**
  * Adds the retry facts to a row, from the same arithmetic the resender uses, so the panel's
@@ -54,8 +89,10 @@ const RETRY_COLUMNS = `a.resolution AS actionResolution, (SELECT COUNT(*) FROM a
  * instant the venue named, with no cap of ours (delivery retries plan D1); any other action sent
  * more than once reports which send it is on. Work whose policy allows one send says nothing.
  */
-function describeRetry(row: RawWorkRow): WorkRow {
-  const { actionResolution, attempts, retryAfter, ...rest } = row;
+function describeRetry(raw: RawWorkRow): Omit<WorkRow, 'waitDeadline' | 'readsPausedUntil' | 'retryCause'> & { waitDeadline: string | null } {
+  const { actionResolution, attempts, retryAfter, waitDeadline, repriceReadyAt: _repriceReadyAt, ...fields } = raw;
+  const rest = { ...fields, waitDeadline: waitDeadline ?? null };
+  const row = raw;
   const policy = row.actionKind ? RETRY_POLICY[row.actionKind] : undefined;
   const made = attempts ?? 0;
   if (row.actionState === 'FAILED' && retryAfter) return { ...rest, retryAt: retryAfter, attempt: made + 1, attemptLimit: null };
@@ -95,8 +132,8 @@ function recentCommandsSql(marks: string): string {
 }
 
 /**
- * Work asked for as a command with members: a Steam store, retrieve, listing, transfer, reprice or
- * delist-to-storage, and an account transfer. One row per member, carrying the member's current
+ * Work asked for as a command with members: a Steam store, retrieve, listing, transfer, reprice,
+ * relist or delist-to-storage, and an account transfer. One row per member, carrying the member's current
  * hop (`db/member-state.ts`): its earliest open hop, else its latest failed one, else its last
  * settled one. A member whose hops are not written yet reads `QUEUED`; one refused, stopped or
  * sold reads its own word, which no hop can say for it. A transfer's send hop is about every
@@ -117,7 +154,7 @@ function memberOpenWork(database: EngineDatabase, accounts: readonly string[]): 
   return database.raw().prepare(`
     SELECT m.account_id AS accountId, c.id AS commandId, c.kind AS commandKind, c.state AS commandState, c.authority AS authority,
       c.created_at AS submittedAt, m.local_id AS memberId,
-      ${MEMBER_STATE_SQL} AS memberState, ${RETRY_COLUMNS},
+      ${MEMBER_STATE_SQL} AS memberState, ${RETRY_COLUMNS}, s.deadline_at AS waitDeadline, ${REPRICE_READY_SQL} AS repriceReadyAt,
       m.quantity AS quantity,
       CASE WHEN i.local_id IS NOT NULL THEN m.local_id END AS localId,
       m.stack_key AS stackKey,
@@ -176,7 +213,7 @@ function stepOpenWork(database: EngineDatabase, accounts: readonly string[]): Ra
     SELECT * FROM (
       SELECT s.account_id AS accountId, s.command_id AS commandId, c.kind AS commandKind, c.state AS commandState, c.authority AS authority,
         c.created_at AS submittedAt, COALESCE(s.local_id, s.id) AS memberId,
-        ${STEP_STATE_SQL} AS memberState, ${RETRY_COLUMNS},
+        ${STEP_STATE_SQL} AS memberState, ${RETRY_COLUMNS}, s.deadline_at AS waitDeadline,
         1 AS quantity,
         s.local_id AS localId, NULL AS stackKey,
         COALESCE(i.def_index, 0) AS defIndex, i.paint_index AS paintIndex, COALESCE(i.quality, 0) AS quality, i.paint_wear AS paintWear,
@@ -249,10 +286,39 @@ function isSettled(row: WorkRow): boolean {
  * Command-state changes do not raise a `changed` notice. The renderer polls this while it
  * has open rows and re-reads on every observation notice.
  */
-export function pageOpenWork(database: EngineDatabase, request: { accountIds: readonly string[] }): WorkPage {
+export function pageOpenWork(database: EngineDatabase, request: { accountIds: readonly string[] }, now: string = new Date().toISOString()): WorkPage {
   const accounts = assertAccountScope(database, request.accountIds);
+  const paused = new Map<string, string | null>();
+  const pausedFor = (accountId: string): string | null => {
+    if (!paused.has(accountId)) paused.set(accountId, readsPausedUntil(database, accountId, 'csfloat-inventory', Date.parse(now)));
+    return paused.get(accountId) ?? null;
+  };
   const all = [...memberOpenWork(database, accounts), ...stepOpenWork(database, accounts)]
-    .map(describeRetry)
+    .map((raw): WorkRow => {
+      const row = describeRetry(raw);
+      if (row.actionKind === 'UPDATE_SELL_LISTING_PRICE') {
+        // A price change not out, on a listing whose cooldown the record says is still running: it
+        // waits on the venue until that moment, and is sent then (`CommandService.advancePriceEdit`).
+        const readyAt = raw.repriceReadyAt ?? null;
+        const unsent = row.memberState === 'QUEUED' || row.memberState === 'RETRYING';
+        if (unsent && readyAt !== null && readyAt > now) {
+          return { ...row, memberState: 'AWAITING_VENUE', retryAt: readyAt, attempt: null, attemptLimit: null,
+            waitDeadline: null, readsPausedUntil: null, retryCause: 'cooldown' };
+        }
+        // Not held: the time on a refusal already waited out, or on a failure, is nothing anyone waits for.
+        // A lower price waiting for its confirmation is withdrawn at its hop's deadline, which is what the person has until.
+        const resending = row.memberState === 'RETRYING';
+        return { ...row, retryAt: resending ? row.retryAt : null, waitDeadline: row.memberState === 'AWAITING_CONFIRMATION' ? row.waitDeadline : null,
+          readsPausedUntil: null, retryCause: resending ? 'not-applied' : null };
+      }
+      const waiting = row.memberState === 'AWAITING_VENUE';
+      // Each resend is a new action, so a send count read off the carrying action would always say two.
+      // A resend waiting on a refused action is the venue's named wait; one on a `READY` action, a walk's proof it did not land.
+      const retryCause: RetryCause | null = waiting ? 'inventory-lag'
+        : row.memberState !== 'RETRYING' ? null : row.actionState === 'FAILED' && row.retryAt ? 'rate-limit' : 'not-applied';
+      return { ...row, ...(waiting ? { attempt: null, attemptLimit: null } : {}),
+        waitDeadline: waiting ? row.waitDeadline : null, readsPausedUntil: waiting ? pausedFor(row.accountId) : null, retryCause };
+    })
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)
       || right.commandId.localeCompare(left.commandId)
       || right.memberId.localeCompare(left.memberId));

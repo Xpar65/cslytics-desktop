@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import type { AccountId } from '@cslytics/ports';
 import type { CommandAuthority, CommandMemberState } from './alphabets.js';
@@ -7,6 +7,9 @@ import { backupBeforeUpgrade } from './backup.js';
 import { WorkStore, isSettled } from './work.js';
 import { OrderStore } from './orders.js';
 import type { OrderVenue } from './alphabets.js';
+
+/** The most compiled statements `EngineDatabase.statement` keeps before it starts again. */
+const STATEMENT_CACHE_LIMIT = 2_000;
 
 export type AccountRow = {
   id: string;
@@ -128,7 +131,18 @@ export type ActionRow = {
   /** Step snapshot for this attempt. The standing goal lives on `desired_state`. */
   params_json: string | null;
   resolved_by_obs: number | null;
-  resolution: 'OBSERVED_APPLIED' | 'OBSERVED_NOT_APPLIED' | null;
+  /**
+   * What the latest observation said about the attempt, or what the venue's own answer said, for
+   * the two words that are an answer's. `AWAITING_CONFIRMATION`: a buy order Steam will place only
+   * after a phone tap, waiting `READY` for the same request to be sent again with the
+   * confirmation's id (standing buy orders plan D2), or a lower listing price Steam accepted and
+   * holds until it is confirmed, `AWAITING_OBSERVATION` for the walk that shows it applied.
+   * `STATED_APPLIED`: the answer named the listing's price as the price asked for, and the action is
+   * `DONE` on that answer with no observation (`resolved_by_obs` is null; in-place reprice plan D4).
+   * `DISCARD_SENT`: a waiting lower price being withdrawn, `AWAITING_OBSERVATION` for the walk
+   * begun after its discard returned (in-place reprice plan D15).
+   */
+  resolution: 'OBSERVED_APPLIED' | 'OBSERVED_NOT_APPLIED' | 'AWAITING_CONFIRMATION' | 'STATED_APPLIED' | 'DISCARD_SENT' | null;
   /** The hop of a command this action carries, when no standing intent does (consolidation plan D3). */
   step_id: string | null;
 };
@@ -220,8 +234,16 @@ export type CommandMemberView = CommandMemberRow & { action_id: string | null };
 
 const IN_FLIGHT_STATES = "('READY','RUNNING','AWAITING_OBSERVATION')";
 
+/**
+ * The error a `RUNNING` action is left with when the record opens after a process died during its
+ * call (rule 6): its attempt never finished, and the recovery is the last moment it was in flight.
+ */
+export const INTERRUPTED_BEFORE_OUTCOME = 'process-interrupted-before-outcome';
+
 /** What `enqueueAction` takes: the common fields and exactly one carrier. */
 export type EnqueueActionInput = {
+  /** The action's id, when its caller names it so that it can exist once only; a fresh one otherwise. */
+  id?: string;
   accountId: string;
   actionKind: string;
   targetId: string;
@@ -237,6 +259,18 @@ export type CheckpointRow = {
 
 export class EngineDatabase {
   private readonly sqlite: DatabaseSync;
+  /**
+   * Compiled statements by their SQL (after a profile of 2026-11-03). `prepare` compiles on every
+   * call, and the per-row readers (an observation, an account, a trade, a step) called it hundreds of
+   * thousands of times on an account of thousands of sales. A statement keeps nothing between its
+   * `get`, `all` and `run` calls, and nothing here iterates one, so one per SQL serves every caller.
+   * Bounded, because SQL built with values in it would otherwise grow it without end, and emptied
+   * whenever the schema changes, since a statement compiled before a change keeps the old columns.
+   * `raw()` stays the plain handle: a caller that wants its statement compiled once asks `statement`.
+   */
+  private readonly statements = new Map<string, StatementSync>();
+  private schemaVersionStatement: StatementSync | null = null;
+  private schemaSeen = -1;
 
   /**
    * `now` is the engine's clock, used for the two stamps written while the record opens: the
@@ -275,7 +309,26 @@ export class EngineDatabase {
     this.recoverInterruptedActions(now());
   }
 
+  /** The compiled statement for this SQL, compiled once while the schema stands. */
+  statement(sql: string): StatementSync {
+    this.schemaVersionStatement ??= this.sqlite.prepare('PRAGMA schema_version');
+    const version = (this.schemaVersionStatement.get() as { schema_version: number }).schema_version;
+    if (version !== this.schemaSeen) {
+      this.statements.clear();
+      this.schemaSeen = version;
+    }
+    let statement = this.statements.get(sql);
+    if (!statement) {
+      if (this.statements.size >= STATEMENT_CACHE_LIMIT) this.statements.clear();
+      statement = this.sqlite.prepare(sql);
+      this.statements.set(sql, statement);
+    }
+    return statement;
+  }
+
   close(): void {
+    this.statements.clear();
+    this.schemaVersionStatement = null;
     if (!this.sqlite.isOpen) return;
     try {
       this.sqlite.exec('PRAGMA optimize');
@@ -301,26 +354,26 @@ export class EngineDatabase {
   }
 
   addAccount(accountId: string, steamId64: string, accountName: string, now: string): void {
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO account(id, steam_id64, account_name, added_at) VALUES (?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET steam_id64=excluded.steam_id64, account_name=excluded.account_name
     `).run(accountId, steamId64, accountName, now);
   }
 
   account(accountId: string): AccountRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM account WHERE id=?`).get(accountId) as AccountRow | undefined;
+    return this.statement(`SELECT * FROM account WHERE id=?`).get(accountId) as AccountRow | undefined;
   }
 
   findAccountByName(username: string): AccountRow | undefined {
     const name = username.trim();
     if (!name) return undefined;
-    return this.sqlite.prepare(`
+    return this.statement(`
       SELECT * FROM account WHERE account_name = ? COLLATE NOCASE OR id = ? COLLATE NOCASE LIMIT 1
     `).get(name, name) as AccountRow | undefined;
   }
 
   listAccounts(): AccountRow[] {
-    return this.sqlite.prepare(`
+    return this.statement(`
       SELECT * FROM account ORDER BY account_name COLLATE NOCASE, id
     `).all() as AccountRow[];
   }
@@ -336,28 +389,28 @@ export class EngineDatabase {
 
     const existing = this.findAccountByName(name)
       ?? this.findAccountByName(id)
-      ?? (this.sqlite.prepare(`SELECT * FROM account WHERE steam_id64=?`).get(steamId64) as AccountRow | undefined);
+      ?? (this.statement(`SELECT * FROM account WHERE steam_id64=?`).get(steamId64) as AccountRow | undefined);
     if (existing) {
-      this.sqlite.prepare(`UPDATE account SET steam_id64=?, account_name=? WHERE id=?`)
+      this.statement(`UPDATE account SET steam_id64=?, account_name=? WHERE id=?`)
         .run(steamId64, name, existing.id);
       return existing.id;
     }
 
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO account(id, steam_id64, account_name, added_at) VALUES (?, ?, ?, ?)
     `).run(id, steamId64, name, now);
     return id;
   }
 
   addCredentialRef(accountId: string, kind: string, keychainKey: string): void {
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO credential_ref(account_id, kind, keychain_key) VALUES (?, ?, ?)
       ON CONFLICT(account_id, kind) DO UPDATE SET keychain_key=excluded.keychain_key
     `).run(accountId, kind, keychainKey);
   }
 
   insertObservation(observation: ObservationStart): number {
-    const result = this.sqlite.prepare(`
+    const result = this.statement(`
       INSERT INTO observation(account_id, surface, generation, started_at, finished_at, complete, pages_walked, total_expected, error, scope_kind, scope_id)
       VALUES (@accountId, @surface, @generation, @startedAt, @finishedAt, @complete, @pagesWalked, @totalExpected, @error, @scopeKind, @scopeId)
     `).run({
@@ -377,19 +430,42 @@ export class EngineDatabase {
   }
 
   latestObservation(accountId: string, surface: string): ObservationRow | undefined {
-    return this.sqlite.prepare(`
+    return this.statement(`
       SELECT * FROM observation
       WHERE account_id=? AND surface=? ORDER BY id DESC LIMIT 1
     `).get(accountId, surface) as ObservationRow | undefined;
   }
 
+  /**
+   * The latest complete, error-free walk of a surface: what the venue last said in full. A failed
+   * walk after it says nothing, so it must not hide it (rule 5).
+   */
+  latestCompleteObservation(accountId: string, surface: string): ObservationRow | undefined {
+    return this.statement(`
+      SELECT * FROM observation
+      WHERE account_id=? AND surface=? AND complete=1 AND error IS NULL ORDER BY id DESC LIMIT 1
+    `).get(accountId, surface) as ObservationRow | undefined;
+  }
+
+  /**
+   * How many walks of a surface began after `since`, complete or not, and when the first of them
+   * began: a venue counts calls, not answers (`kernel/read-budget.ts`).
+   */
+  observationsSince(accountId: string, surface: string, since: string): { count: number; first: string | null } {
+    const row = this.statement(`
+      SELECT COUNT(*) AS count, MIN(started_at) AS first FROM observation INDEXED BY observation_account_surface
+      WHERE account_id=? AND surface=? AND started_at>?
+    `).get(accountId, surface, since) as { count: number; first: string | null };
+    return { count: row.count, first: row.first };
+  }
+
   observation(accountId: string, id: number | null): ObservationRow | undefined {
     if (id === null) return undefined;
-    return this.sqlite.prepare(`SELECT * FROM observation WHERE account_id=? AND id=?`).get(accountId, id) as ObservationRow | undefined;
+    return this.statement(`SELECT * FROM observation WHERE account_id=? AND id=?`).get(accountId, id) as ObservationRow | undefined;
   }
 
   latestObservationForScope(accountId: string, kind: ScopeKind, id: string | null, surface?: string): ObservationRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM observation WHERE account_id=? AND scope_kind=? AND scope_id IS ?
+    return this.statement(`SELECT * FROM observation WHERE account_id=? AND scope_kind=? AND scope_id IS ?
       ${surface ? 'AND surface=?' : ''} ORDER BY id DESC LIMIT 1`)
       .get(accountId, kind, id, ...(surface ? [surface] : [])) as ObservationRow | undefined;
   }
@@ -400,7 +476,7 @@ export class EngineDatabase {
    * (plans/completed/delivery-step-3-plan.md §3.4).
    */
   latestCompleteObservationForScope(accountId: string, kind: ScopeKind, id: string | null, surface?: string): ObservationRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM observation WHERE account_id=? AND scope_kind=? AND scope_id IS ?
+    return this.statement(`SELECT * FROM observation WHERE account_id=? AND scope_kind=? AND scope_id IS ?
       ${surface ? 'AND surface=?' : ''} AND complete=1 AND error IS NULL ORDER BY id DESC LIMIT 1`)
       .get(accountId, kind, id, ...(surface ? [surface] : [])) as ObservationRow | undefined;
   }
@@ -410,7 +486,7 @@ export class EngineDatabase {
    * published one. `HoldingsStore.upsertUnit` is the writer that needs it.
    */
   reserveMainSlot(accountId: string, actionId: string): void {
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO reservation(account_id, ref_kind, ref_id, amount_cents, state)
       VALUES (?, 'MAIN_SLOT', ?, 1, 'ACTIVE')
       ON CONFLICT(account_id, ref_kind, ref_id) DO UPDATE SET state='ACTIVE', amount_cents=1
@@ -420,11 +496,11 @@ export class EngineDatabase {
   markSlotSubmitted(accountId: string, actionId: string): void {
     // Only a slot still held: a retrieve's own SO event can prove it, and consume the slot, before
     // its answer arrives, and the answer must not hold the slot again (L-10, 2026-10-16).
-    this.sqlite.prepare(`UPDATE reservation SET state='SUBMITTED_UNOBSERVED' WHERE account_id=? AND ref_kind='MAIN_SLOT' AND ref_id=? AND state='ACTIVE'`).run(accountId, actionId);
+    this.statement(`UPDATE reservation SET state='SUBMITTED_UNOBSERVED' WHERE account_id=? AND ref_kind='MAIN_SLOT' AND ref_id=? AND state='ACTIVE'`).run(accountId, actionId);
   }
 
   storageUnit(accountId: string, casketId: string): StorageUnitRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM storage_unit WHERE account_id=? AND casket_id=?`).get(accountId, casketId) as StorageUnitRow | undefined;
+    return this.statement(`SELECT * FROM storage_unit WHERE account_id=? AND casket_id=?`).get(accountId, casketId) as StorageUnitRow | undefined;
   }
 
   /**
@@ -434,23 +510,23 @@ export class EngineDatabase {
    * for a unit this account has not walked yet says nothing about ownership.
    */
   setStorageUnitLabel(accountId: string, casketId: string, label: string | null, observationId: number): void {
-    this.sqlite.prepare(`UPDATE storage_unit SET label=?, label_obs=? WHERE account_id=? AND casket_id=?`).run(label, observationId, accountId, casketId);
+    this.statement(`UPDATE storage_unit SET label=?, label_obs=? WHERE account_id=? AND casket_id=?`).run(label, observationId, accountId, casketId);
     this.touch(accountId, 'storage_unit');
   }
 
   releaseSlot(accountId: string, actionId: string, consumed: boolean): void {
-    this.sqlite.prepare(`UPDATE reservation SET state=? WHERE account_id=? AND ref_kind='MAIN_SLOT' AND ref_id=?`)
+    this.statement(`UPDATE reservation SET state=? WHERE account_id=? AND ref_kind='MAIN_SLOT' AND ref_id=?`)
       .run(consumed ? 'CONSUMED' : 'RELEASED', accountId, actionId);
   }
 
   reservedMainSlots(accountId: string): number {
-    const row = this.sqlite.prepare(`
+    const row = this.statement(`
       SELECT COALESCE(SUM(amount_cents),0) AS count FROM reservation
       WHERE account_id=? AND ref_kind='MAIN_SLOT' AND state IN ('ACTIVE','SUBMITTED_UNOBSERVED')
     `).get(accountId) as { count: number };
     // Every member of an open transfer toward this account holds one of its slots until the
     // delivery is proved or the offer ends.
-    const incoming = this.sqlite.prepare(`SELECT COALESCE(SUM(m.quantity),0) AS count
+    const incoming = this.statement(`SELECT COALESCE(SUM(m.quantity),0) AS count
       FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
       JOIN command_member m ON m.command_id=s.command_id AND m.account_id=s.account_id
       WHERE s.kind='SEND' AND d.destination_account_id=? AND s.state IN ('QUEUED','SENT','AWAITING_OBSERVATION','RETRYING')`).get(accountId) as { count: number };
@@ -458,7 +534,7 @@ export class EngineDatabase {
   }
 
   insertCommand(row: CommandRow): void {
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO command(id, correlation_id, kind, state, reject_reason, created_at, preparing, manifest_token, observed_completed, revision, filter_json, authority)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
@@ -478,15 +554,15 @@ export class EngineDatabase {
   }
 
   command(id: string): CommandRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM command WHERE id=?`).get(id) as CommandRow | undefined;
+    return this.statement(`SELECT * FROM command WHERE id=?`).get(id) as CommandRow | undefined;
   }
 
   setCommandState(id: string, state: CommandRow['state'], rejectReason: string | null = null): void {
-    this.sqlite.prepare(`UPDATE command SET state=?, reject_reason=COALESCE(?, reject_reason) WHERE id=?`).run(state, rejectReason, id);
+    this.statement(`UPDATE command SET state=?, reject_reason=COALESCE(?, reject_reason) WHERE id=?`).run(state, rejectReason, id);
   }
 
   insertCommandMember(row: CommandMemberRow): void {
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO command_member(command_id, account_id, local_id, stack_key, quantity, destination, price_receive_cents, state, input_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(row.command_id, row.account_id, row.local_id, row.stack_key, row.quantity, row.destination, row.price_receive_cents, row.state, row.input_json ?? null);
@@ -495,14 +571,14 @@ export class EngineDatabase {
 
   /** A command's members in the order they were written, each with the action its latest hop carries. */
   commandMembers(commandId: string): CommandMemberView[] {
-    return this.sqlite.prepare(`SELECT m.*, (
+    return this.statement(`SELECT m.*, (
         SELECT s.action_id FROM work_step s WHERE s.command_id=m.command_id AND s.account_id=m.account_id AND s.local_id=m.local_id AND s.action_id IS NOT NULL
         ORDER BY s.ordinal DESC LIMIT 1) AS action_id
       FROM command_member m WHERE m.command_id=? ORDER BY m.rowid`).all(commandId) as CommandMemberView[];
   }
 
   setCommandMember(commandId: string, accountId: string, memberId: string, patch: { state: CommandMemberState }): void {
-    this.sqlite.prepare(`UPDATE command_member SET state=? WHERE command_id=? AND account_id=? AND local_id=?`).run(patch.state, commandId, accountId, memberId);
+    this.statement(`UPDATE command_member SET state=? WHERE command_id=? AND account_id=? AND local_id=?`).run(patch.state, commandId, accountId, memberId);
     this.touch(accountId, 'command_member');
   }
 
@@ -518,10 +594,10 @@ export class EngineDatabase {
    * nothing else will ever carry it, and the same id coming back is the same holding (D1).
    */
   setItemLocation(accountId: string, localId: string, obsId: number, location: ItemRow['location'], casketId: string | null = null): void {
-    const item = this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? AND local_id=?`).get(accountId, localId) as ItemRow | undefined;
+    const item = this.statement(`SELECT * FROM item WHERE account_id=? AND local_id=?`).get(accountId, localId) as ItemRow | undefined;
     const obs = this.observation(accountId, obsId);
     if (!item || !obs || !this.canUpdateLocation(item, obs)) return;
-    this.sqlite.prepare(`UPDATE item SET location=?, casket_id=?, location_obs=?,
+    this.statement(`UPDATE item SET location=?, casket_id=?, location_obs=?,
       location_generation=COALESCE(?,location_generation),
       last_seen_obs=CASE WHEN ?='MISSING' THEN last_seen_obs ELSE ? END WHERE account_id=? AND local_id=?`)
       .run(location, casketId, obsId, obs.generation, location, obsId, accountId, localId);
@@ -530,25 +606,25 @@ export class EngineDatabase {
 
   /** Why a `MISSING` row ended, once evidence names it (holdings plan D8). Never overwrites a reason. */
   setEndReason(accountId: string, localId: string, reason: 'sold' | 'traded' | 'consumed' | 'unknown'): void {
-    this.sqlite.prepare(`UPDATE item SET end_reason=? WHERE account_id=? AND local_id=? AND location='MISSING' AND end_reason IS NULL`).run(reason, accountId, localId);
+    this.statement(`UPDATE item SET end_reason=? WHERE account_id=? AND local_id=? AND location='MISSING' AND end_reason IS NULL`).run(reason, accountId, localId);
     this.touch(accountId, 'item');
   }
 
   itemByLocalId(accountId: string, localId: string): ItemRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? AND local_id=?`).get(accountId, localId) as ItemRow | undefined;
+    return this.statement(`SELECT * FROM item WHERE account_id=? AND local_id=?`).get(accountId, localId) as ItemRow | undefined;
   }
 
   itemByAssetId(accountId: string, assetId: string): ItemRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? AND asset_id=?`).get(accountId, assetId) as ItemRow | undefined;
+    return this.statement(`SELECT * FROM item WHERE account_id=? AND asset_id=?`).get(accountId, assetId) as ItemRow | undefined;
   }
 
   items(accountId: string): ItemRow[] {
-    return this.sqlite.prepare(`SELECT * FROM item WHERE account_id=? ORDER BY local_id`).all(accountId) as ItemRow[];
+    return this.statement(`SELECT * FROM item WHERE account_id=? ORDER BY local_id`).all(accountId) as ItemRow[];
   }
 
   /** Units in main inventory, of either kind, by quantity. */
   countMainItems(accountId: string): number {
-    const row = this.sqlite.prepare(`SELECT COALESCE(SUM(quantity),0) AS count FROM item WHERE account_id=? AND location='MAIN'`).get(accountId) as { count: number };
+    const row = this.statement(`SELECT COALESCE(SUM(quantity),0) AS count FROM item WHERE account_id=? AND location='MAIN'`).get(accountId) as { count: number };
     return row.count;
   }
 
@@ -564,21 +640,21 @@ export class EngineDatabase {
     now: string;
   }): ActionRow {
     return this.transaction(() => {
-      const current = this.sqlite.prepare(`
+      const current = this.statement(`
         SELECT id, version FROM desired_state
         WHERE account_id=? AND target_kind=? AND target_id=? AND superseded_by IS NULL
       `).get(input.accountId, input.targetKind, input.targetId) as { id: string; version: number } | undefined;
       const desiredId = randomUUID();
       const version = (current?.version ?? 0) + 1;
-      if (current) this.sqlite.prepare(`UPDATE desired_state SET superseded_by=? WHERE id=?`).run(desiredId, current.id);
+      if (current) this.statement(`UPDATE desired_state SET superseded_by=? WHERE id=?`).run(desiredId, current.id);
       if (current) this.retireUnsent(current.id, input.now);
       if (input.resourceKey.startsWith('item:') && this.unresolvedInFlight(input.accountId, input.resourceKey)) throw new Error('Item has an unresolved in-flight action; declare a goal to supersede its intent');
-      this.sqlite.prepare(`
+      this.statement(`
         INSERT INTO desired_state(id, account_id, target_kind, target_id, version, intent, params_json, command_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(desiredId, input.accountId, input.targetKind, input.targetId, version, input.intent, JSON.stringify(input.params), input.commandId, input.now);
       const actionId = randomUUID();
-      this.sqlite.prepare(`
+      this.statement(`
         INSERT INTO action(id, account_id, kind, target_id, desired_version, desired_id, state, resource_key, created_at, updated_at, params_json)
         VALUES (?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?)
       `).run(
@@ -616,9 +692,9 @@ export class EngineDatabase {
       if (current && current.intent === input.intent && current.params_json === paramsJson) return current;
       const desiredId = randomUUID();
       const version = (current?.version ?? 0) + 1;
-      if (current) this.sqlite.prepare(`UPDATE desired_state SET superseded_by=? WHERE id=?`).run(desiredId, current.id);
+      if (current) this.statement(`UPDATE desired_state SET superseded_by=? WHERE id=?`).run(desiredId, current.id);
       if (current) this.retireUnsent(current.id, input.now);
-      this.sqlite.prepare(`
+      this.statement(`
         INSERT INTO desired_state(id, account_id, target_kind, target_id, version, intent, params_json, command_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(desiredId, input.accountId, input.targetKind, input.targetId, version, input.intent, paramsJson, input.commandId, input.now);
@@ -643,8 +719,8 @@ export class EngineDatabase {
       } else if (this.inFlight(input.accountId, input.resourceKey)) {
         throw new Error(`Resource ${input.resourceKey} already has an in-flight action`);
       }
-      const actionId = randomUUID();
-      this.sqlite.prepare(`
+      const actionId = input.id ?? randomUUID();
+      this.statement(`
         INSERT INTO action(id, account_id, kind, target_id, desired_version, desired_id, state, resource_key, created_at, updated_at, params_json, step_id)
         VALUES (?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?, ?, ?)
       `).run(
@@ -665,18 +741,18 @@ export class EngineDatabase {
   }
 
   desiredState(desiredId: string): DesiredStateRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM desired_state WHERE id=?`).get(desiredId) as DesiredStateRow | undefined;
+    return this.statement(`SELECT * FROM desired_state WHERE id=?`).get(desiredId) as DesiredStateRow | undefined;
   }
 
   currentDesiredState(accountId: string, targetKind: string, targetId: string): DesiredStateRow | undefined {
-    return this.sqlite.prepare(`
+    return this.statement(`
       SELECT * FROM desired_state
       WHERE account_id=? AND target_kind=? AND target_id=? AND superseded_by IS NULL
     `).get(accountId, targetKind, targetId) as DesiredStateRow | undefined;
   }
 
   currentGoals(accountId: string, targetKind: string, intent: string): DesiredStateRow[] {
-    return this.sqlite.prepare(`
+    return this.statement(`
       SELECT * FROM desired_state
       WHERE account_id=? AND target_kind=? AND intent=? AND superseded_by IS NULL
       ORDER BY created_at, id
@@ -684,7 +760,7 @@ export class EngineDatabase {
   }
 
   inFlight(accountId: string, resourceKey: string): boolean {
-    const row = this.sqlite.prepare(`
+    const row = this.statement(`
       SELECT 1 AS hit FROM action WHERE account_id=? AND resource_key=? AND state IN ${IN_FLIGHT_STATES}
     `).get(accountId, resourceKey) as { hit: number } | undefined;
     return Boolean(row);
@@ -692,7 +768,7 @@ export class EngineDatabase {
 
   /** Whether a store or retrieve of ours has gone out on this item and is not settled yet. Asked per GC item event. */
   casketMoveOut(accountId: string, localId: string): boolean {
-    return this.sqlite.prepare(`SELECT 1 FROM action WHERE account_id=? AND state IN ('RUNNING','AWAITING_OBSERVATION')
+    return this.statement(`SELECT 1 FROM action WHERE account_id=? AND state IN ('RUNNING','AWAITING_OBSERVATION')
       AND kind IN ('STORE_IN_CASKET','RETRIEVE_FROM_CASKET') AND target_id=? LIMIT 1`).get(accountId, localId) !== undefined;
   }
 
@@ -706,7 +782,7 @@ export class EngineDatabase {
    * ambiguous one is how an item gets acted on twice (rule 1).
    */
   unresolvedInFlight(accountId: string, resourceKey: string): boolean {
-    const row = this.sqlite.prepare(`
+    const row = this.statement(`
       SELECT 1 AS hit FROM action WHERE account_id=? AND resource_key=? AND state IN ${IN_FLIGHT_STATES} AND resolved_by_obs IS NULL
     `).get(accountId, resourceKey) as { hit: number } | undefined;
     return Boolean(row);
@@ -714,7 +790,7 @@ export class EngineDatabase {
 
   /** An attempt sent for the resource that no observation has explained yet: a mutation nobody can yet account for. */
   unexplainedAttempt(accountId: string, resourceKey: string): boolean {
-    const row = this.sqlite.prepare(`
+    const row = this.statement(`
       SELECT 1 AS hit FROM action WHERE account_id=? AND resource_key=? AND state IN ('RUNNING','AWAITING_OBSERVATION') AND resolved_by_obs IS NULL
     `).get(accountId, resourceKey) as { hit: number } | undefined;
     return Boolean(row);
@@ -722,7 +798,7 @@ export class EngineDatabase {
 
   /** Fails the unsent actions on a resource as superseded by a newer request, and the hops they carry with them. */
   private retireReady(accountId: string, resourceKey: string, now: string): void {
-    const ready = this.sqlite.prepare(`SELECT id FROM action WHERE account_id=? AND resource_key=? AND state='READY'`).all(accountId, resourceKey) as Array<{ id: string }>;
+    const ready = this.statement(`SELECT id FROM action WHERE account_id=? AND resource_key=? AND state='READY'`).all(accountId, resourceKey) as Array<{ id: string }>;
     if (!ready.length) return;
     const work = new WorkStore(this);
     for (const { id } of ready) {
@@ -733,7 +809,7 @@ export class EngineDatabase {
   }
 
   inFlightAction(accountId: string, resourceKey: string): ActionRow | undefined {
-    return this.sqlite.prepare(`
+    return this.statement(`
       SELECT * FROM action WHERE account_id=? AND resource_key=? AND state IN ${IN_FLIGHT_STATES}
       ORDER BY created_at, id LIMIT 1
     `).get(accountId, resourceKey) as ActionRow | undefined;
@@ -746,12 +822,12 @@ export class EngineDatabase {
   }
 
   action(actionId: string): ActionRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM action WHERE id=?`).get(actionId) as ActionRow | undefined;
+    return this.statement(`SELECT * FROM action WHERE id=?`).get(actionId) as ActionRow | undefined;
   }
 
   actions(accountId: string, state?: ActionRow['state']): ActionRow[] {
-    if (state) return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? AND state=? ORDER BY created_at, id`).all(accountId, state) as ActionRow[];
-    return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? ORDER BY created_at, id`).all(accountId) as ActionRow[];
+    if (state) return this.statement(`SELECT * FROM action WHERE account_id=? AND state=? ORDER BY created_at, id`).all(accountId, state) as ActionRow[];
+    return this.statement(`SELECT * FROM action WHERE account_id=? ORDER BY created_at, id`).all(accountId) as ActionRow[];
   }
 
   /**
@@ -765,7 +841,7 @@ export class EngineDatabase {
    */
   awaitingActionsBesideMoves(accountId: string, commandIds: readonly string[]): ActionRow[] {
     if (commandIds.length === 0) return this.actions(accountId, 'AWAITING_OBSERVATION');
-    return this.sqlite.prepare(`SELECT a.* FROM action a WHERE a.account_id=? AND a.state='AWAITING_OBSERVATION'
+    return this.statement(`SELECT a.* FROM action a WHERE a.account_id=? AND a.state='AWAITING_OBSERVATION'
       AND NOT EXISTS (SELECT 1 FROM work_step s WHERE s.id=a.step_id AND s.kind IN ('STORE','RETRIEVE') AND s.command_id IN (SELECT value FROM json_each(?)))
       ORDER BY a.created_at, a.id`).all(accountId, JSON.stringify(commandIds)) as ActionRow[];
   }
@@ -776,7 +852,7 @@ export class EngineDatabase {
    * settle of a bulk store a row per waiting move.
    */
   awaitingActionsOfKinds(accountId: string, kinds: readonly string[]): ActionRow[] {
-    return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? AND state='AWAITING_OBSERVATION'
+    return this.statement(`SELECT * FROM action WHERE account_id=? AND state='AWAITING_OBSERVATION'
       AND kind IN (SELECT value FROM json_each(?)) ORDER BY created_at, id`).all(accountId, JSON.stringify(kinds)) as ActionRow[];
   }
 
@@ -785,17 +861,17 @@ export class EngineDatabase {
    * oldest first: what an item event can settle. The key list is one JSON value, however long.
    */
   awaitingActionsAbout(accountId: string, targetIds: readonly string[]): ActionRow[] {
-    return this.sqlite.prepare(`SELECT * FROM action WHERE account_id=? AND state='AWAITING_OBSERVATION'
+    return this.statement(`SELECT * FROM action WHERE account_id=? AND state='AWAITING_OBSERVATION'
       AND (kind='RENAME_CASKET' OR target_id IN (SELECT value FROM json_each(?))) ORDER BY created_at, id`).all(accountId, JSON.stringify(targetIds)) as ActionRow[];
   }
 
   startAttempt(actionId: string, now: string): string {
     const attemptId = randomUUID();
     this.transaction(() => {
-      const changed = this.sqlite.prepare(`UPDATE action SET state='RUNNING', updated_at=?, error=NULL, resolved_by_obs=NULL, resolution=NULL WHERE id=? AND state='READY'`).run(now, actionId);
+      const changed = this.statement(`UPDATE action SET state='RUNNING', updated_at=?, error=NULL, resolved_by_obs=NULL, resolution=NULL WHERE id=? AND state='READY'`).run(now, actionId);
       if (changed.changes !== 1) throw new Error('Action is no longer READY');
-      const watermark = (this.sqlite.prepare(`SELECT COALESCE(MAX(id),0) AS id FROM observation WHERE account_id=(SELECT account_id FROM action WHERE id=?)`).get(actionId) as { id: number }).id;
-      this.sqlite.prepare(`INSERT INTO attempt(id, action_id, started_at, request_ref) VALUES (?, ?, ?, ?)`).run(attemptId, actionId, now, JSON.stringify({ observationWatermark: watermark }));
+      const watermark = (this.statement(`SELECT COALESCE(MAX(id),0) AS id FROM observation WHERE account_id=(SELECT account_id FROM action WHERE id=?)`).get(actionId) as { id: number }).id;
+      this.statement(`INSERT INTO attempt(id, action_id, started_at, request_ref) VALUES (?, ?, ?, ?)`).run(attemptId, actionId, now, JSON.stringify({ observationWatermark: watermark }));
       const action = this.action(actionId)!;
       if (action.kind === 'CREATE_SELL_LISTING') this.openOrder(action, 'steam', now);
     });
@@ -807,15 +883,19 @@ export class EngineDatabase {
       const action = this.action(actionId);
       if (!action) throw new Error(`Unknown action ${actionId}`);
       const desired = action.desired_id === null ? { superseded_by: null }
-        : this.sqlite.prepare(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null };
+        : this.statement(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null };
       const state = outcome === 'DEFINITIVELY_REJECTED' ? 'FAILED' : 'AWAITING_OBSERVATION';
-      this.sqlite.prepare(`UPDATE attempt SET finished_at=?, outcome=?, response_ref=?, retry_after=? WHERE id=?`).run(now, outcome, JSON.stringify(response), retryAfter, attemptId);
-      this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, desired.superseded_by ? 'superseded' : error ?? null, actionId);
+      this.statement(`UPDATE attempt SET finished_at=?, outcome=?, response_ref=?, retry_after=? WHERE id=?`).run(now, outcome, JSON.stringify(response), retryAfter, attemptId);
+      // A read proved the action applied while its answer was on the way back (CSF-47): the
+      // observation stands (rule 1), and the answer only finishes its attempt. Without this a
+      // reprice proved in the same turn as its send was left awaiting observation under a done hop.
+      if (action.state === 'DONE' && action.resolution === 'OBSERVED_APPLIED') return;
+      this.statement(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, desired.superseded_by ? 'superseded' : error ?? null, actionId);
     });
   }
 
   setActionState(actionId: string, state: ActionRow['state'], now: string, error?: string): void {
-    this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, error ?? null, actionId);
+    this.statement(`UPDATE action SET state=?, updated_at=?, error=? WHERE id=?`).run(state, now, error ?? null, actionId);
   }
 
   /** The goal a goal-carried action belongs to; a step-carried action has none, and this says so. */
@@ -826,18 +906,18 @@ export class EngineDatabase {
 
   currentDesired(action: ActionRow): boolean {
     if (action.desired_id === null) return true;
-    const row = this.sqlite.prepare(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null } | undefined;
+    const row = this.statement(`SELECT superseded_by FROM desired_state WHERE id=?`).get(action.desired_id) as { superseded_by: string | null } | undefined;
     return row?.superseded_by === null;
   }
 
   desiredParams(action: ActionRow): unknown {
     if (action.desired_id === null) return JSON.parse(action.params_json ?? 'null') as unknown;
-    const row = this.sqlite.prepare(`SELECT params_json FROM desired_state WHERE id=?`).get(action.desired_id) as { params_json: string };
+    const row = this.statement(`SELECT params_json FROM desired_state WHERE id=?`).get(action.desired_id) as { params_json: string };
     return JSON.parse(row.params_json);
   }
 
   addEvent(accountId: string, kind: string, payload: unknown, now: string): void {
-    this.sqlite.prepare(`INSERT INTO event(id, account_id, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
+    this.statement(`INSERT INTO event(id, account_id, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), accountId, kind, JSON.stringify(payload), now);
     this.touch(accountId, 'event');
   }
@@ -852,15 +932,15 @@ export class EngineDatabase {
    */
   addEventOnce(accountId: string, kind: string, payload: unknown, now: string): void {
     const json = JSON.stringify(payload);
-    const seen = this.sqlite.prepare(`SELECT 1 FROM event WHERE account_id=? AND kind=? AND payload_json=? LIMIT 1`).get(accountId, kind, json);
+    const seen = this.statement(`SELECT 1 FROM event WHERE account_id=? AND kind=? AND payload_json=? LIMIT 1`).get(accountId, kind, json);
     if (seen) return;
-    this.sqlite.prepare(`INSERT INTO event(id, account_id, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
+    this.statement(`INSERT INTO event(id, account_id, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)`)
       .run(randomUUID(), accountId, kind, json, now);
     this.touch(accountId, 'event');
   }
 
   events(accountId: string): Array<{ id: string; kind: string; payload_json: string; at: string }> {
-    return this.sqlite.prepare(`SELECT id, kind, payload_json, at FROM event WHERE account_id=? ORDER BY at, id`).all(accountId) as Array<{ id: string; kind: string; payload_json: string; at: string }>;
+    return this.statement(`SELECT id, kind, payload_json, at FROM event WHERE account_id=? ORDER BY at, id`).all(accountId) as Array<{ id: string; kind: string; payload_json: string; at: string }>;
   }
 
   raw(): DatabaseSync {
@@ -868,7 +948,7 @@ export class EngineDatabase {
   }
 
   latestAttempt(actionId: string): AttemptRow | undefined {
-    return this.sqlite.prepare(`SELECT * FROM attempt WHERE action_id=? ORDER BY rowid DESC LIMIT 1`).get(actionId) as AttemptRow | undefined;
+    return this.statement(`SELECT * FROM attempt WHERE action_id=? ORDER BY rowid DESC LIMIT 1`).get(actionId) as AttemptRow | undefined;
   }
 
   /** Our own sell order, opened as the create attempt starts (`OrderStore.open`). */
@@ -879,13 +959,85 @@ export class EngineDatabase {
   resolveAction(action: ActionRow, observationId: number, applied: boolean, now: string): void {
     if (!this.observation(action.account_id, observationId)) throw new Error('Resolution observation belongs to another account');
     const state = applied ? 'DONE' : this.currentDesired(action) ? 'READY' : 'FAILED';
-    this.sqlite.prepare(`UPDATE action SET state=?, updated_at=?, resolved_by_obs=?, resolution=?, error=? WHERE id=?`)
+    this.statement(`UPDATE action SET state=?, updated_at=?, resolved_by_obs=?, resolution=?, error=? WHERE id=?`)
       .run(state, now, observationId, applied ? 'OBSERVED_APPLIED' : 'OBSERVED_NOT_APPLIED', applied ? null : 'complete-observation-proved-not-applied', action.id);
     if (!applied) new OrderStore(this).endNotApplied(action, observationId, now);
   }
 
+  /**
+   * Settles an action on the venue's own answer, for the one kind of answer that states its
+   * effect: the call that changed a listing's price named that price back. `DONE` with
+   * `STATED_APPLIED` and no observation, because none was made; every other answer is evidence
+   * about an attempt and waits for a walk (rule 1, in-place reprice plan D4). Only from the
+   * attempt that just returned.
+   */
+  resolveActionOnAnswer(actionId: string, now: string): void {
+    this.statement(`UPDATE action SET state='DONE', updated_at=?, resolved_by_obs=NULL, resolution='STATED_APPLIED', error=NULL WHERE id=? AND state='AWAITING_OBSERVATION'`)
+      .run(now, actionId);
+  }
+
+  /**
+   * Marks an action whose answer said the venue holds the change until it is confirmed. It stays
+   * `AWAITING_OBSERVATION`: a walk that shows the effect settles it, and until then it waits on
+   * a person and asks for no walk.
+   */
+  awaitConfirmationOf(actionId: string, now: string): void {
+    this.statement(`UPDATE action SET resolution='AWAITING_CONFIRMATION', updated_at=? WHERE id=? AND state='AWAITING_OBSERVATION'`).run(now, actionId);
+  }
+
+  /**
+   * Marks a price change whose waiting lower price is being withdrawn (`PRICE_CHANGE_DISCARD_SENT`,
+   * in-place reprice plan D15). It stays `AWAITING_OBSERVATION`: a walk begun after the discard
+   * returns decides how it ends, and its proof need is counted from `now`.
+   */
+  markDiscardSent(actionId: string, now: string): void {
+    this.statement(`UPDATE action SET resolution='DISCARD_SENT', updated_at=? WHERE id=? AND state='AWAITING_OBSERVATION'`).run(now, actionId);
+  }
+
+  /**
+   * Fails an action a walk decided against, keeping the walk that showed why. Unlike
+   * `resolveAction(…, false)` it claims no proof that the request never landed: a lower price whose
+   * answer was lost may be held by the venue, and the book would look the same.
+   */
+  failActionOnObservation(actionId: string, observationId: number | null, reason: string, now: string): void {
+    this.statement(`UPDATE action SET state='FAILED', updated_at=?, resolved_by_obs=?, error=? WHERE id=? AND state='AWAITING_OBSERVATION'`)
+      .run(now, observationId, reason, actionId);
+  }
+
+  /**
+   * Puts a discard Steam never heard back to `READY`, to be sent again: a discard of a change Steam
+   * no longer holds changes nothing (in-place reprice plan D19, D27). The one kind whose ambiguous
+   * answer is sent again blind, because the one kind for which a second send cannot do harm; every
+   * other ambiguous answer waits for a walk (rule 1). Only from the answer that just returned, which
+   * left it waiting for observation, or failed when the port refused it before any request.
+   */
+  reviveUnheardDiscard(actionId: string, now: string): void {
+    this.statement(`UPDATE action SET state='READY', updated_at=?, error=NULL, resolved_by_obs=NULL, resolution=NULL WHERE id=? AND state IN ('AWAITING_OBSERVATION','FAILED') AND kind='DISCARD_SELL_LISTING_PRICE_CHANGE'`).run(now, actionId);
+  }
+
+  /** How many of an action's attempts the venue definitely refused: each sent nothing that can still land. */
+  definiteRefusals(actionId: string): number {
+    return (this.statement(`SELECT COUNT(*) AS n FROM attempt WHERE action_id=? AND outcome='DEFINITIVELY_REJECTED'`).get(actionId) as { n: number }).n;
+  }
+
+  /**
+   * Puts an action the venue refused for the moment back to `READY`, for the same request to be
+   * made again when the venue said it may be: a refusal that names its own wait changed nothing
+   * and left nothing in flight. Only from the refusal that just returned.
+   */
+  reviveRefusedAction(actionId: string, now: string): void {
+    this.statement(`UPDATE action SET state='READY', updated_at=?, error=NULL, resolved_by_obs=NULL, resolution=NULL WHERE id=? AND state='FAILED'`).run(now, actionId);
+  }
+
+  /** The complete walk of an account's surface before this one, if the record still holds one. Asked once per walk. */
+  previousCompleteObservation(accountId: string, surface: string, beforeId: number): ObservationRow | undefined {
+    return this.statement(`SELECT * FROM observation INDEXED BY observation_account_surface
+      WHERE account_id=? AND surface=? AND id<? AND complete=1 AND error IS NULL ORDER BY id DESC LIMIT 1`)
+      .get(accountId, surface, beforeId) as ObservationRow | undefined;
+  }
+
   suspendGoal(accountId: string, desiredId: string, reason: string, now: string, blockedUntil: string | null = null): void {
-    this.sqlite.prepare(`UPDATE desired_state SET suspended_reason=?, suspended_at=COALESCE(suspended_at,?), blocked_until=?
+    this.statement(`UPDATE desired_state SET suspended_reason=?, suspended_at=COALESCE(suspended_at,?), blocked_until=?
       WHERE account_id=? AND id=? AND superseded_by IS NULL`).run(reason, now, blockedUntil, accountId, desiredId);
     this.retireUnsent(desiredId, now);
   }
@@ -895,9 +1047,9 @@ export class EngineDatabase {
       const goal = this.desiredState(desiredId);
       if (!goal || goal.account_id !== accountId || goal.superseded_by || !goal.suspended_reason) throw new Error('No current suspended goal for this account');
       const id = randomUUID();
-      this.sqlite.prepare(`UPDATE desired_state SET superseded_by=? WHERE account_id=? AND id=?`).run(id, accountId, desiredId);
+      this.statement(`UPDATE desired_state SET superseded_by=? WHERE account_id=? AND id=?`).run(id, accountId, desiredId);
       this.retireUnsent(desiredId, now);
-      this.sqlite.prepare(`INSERT INTO desired_state(id,account_id,target_kind,target_id,version,intent,params_json,command_id,created_at,authority,expires_at)
+      this.statement(`INSERT INTO desired_state(id,account_id,target_kind,target_id,version,intent,params_json,command_id,created_at,authority,expires_at)
         VALUES (?,?,?,?,?,?,?,?,?,'HUMAN',?)`).run(id, accountId, goal.target_kind, goal.target_id, goal.version + 1,
           resolution === 'resume' ? goal.intent : 'NONE', goal.params_json, null, now, new Date(Date.parse(now) + 7 * 86400_000).toISOString());
       return this.desiredState(id)!;
@@ -931,25 +1083,25 @@ export class EngineDatabase {
   /** A draft's members in account and member order: one page after a key, or all of them. */
   draftMembers(token: string, page?: { after: readonly [string, string]; limit: number }): DraftMemberRow[] {
     const rows = (page
-      ? this.sqlite.prepare(`SELECT account_id, local_id, input_json FROM command_member WHERE command_id=? AND state='DRAFT' AND (account_id, local_id)>(?, ?)
+      ? this.statement(`SELECT account_id, local_id, input_json FROM command_member WHERE command_id=? AND state='DRAFT' AND (account_id, local_id)>(?, ?)
           ORDER BY account_id, local_id LIMIT ?`).all(token, page.after[0], page.after[1], page.limit)
-      : this.sqlite.prepare(`SELECT account_id, local_id, input_json FROM command_member WHERE command_id=? AND state='DRAFT' ORDER BY account_id, local_id`).all(token)
+      : this.statement(`SELECT account_id, local_id, input_json FROM command_member WHERE command_id=? AND state='DRAFT' ORDER BY account_id, local_id`).all(token)
     ) as Array<{ account_id: string; local_id: string; input_json: string | null }>;
     return rows.map((row) => ({ ...(JSON.parse(row.input_json ?? '{}') as DraftMember), accountId: row.account_id, memberId: row.local_id }));
   }
 
   draftCounts(token: string): { handles: number; quantity: number } {
-    return this.sqlite.prepare(`SELECT COUNT(*) AS handles, COALESCE(SUM(quantity),0) AS quantity FROM command_member WHERE command_id=? AND state='DRAFT'`)
+    return this.statement(`SELECT COUNT(*) AS handles, COALESCE(SUM(quantity),0) AS quantity FROM command_member WHERE command_id=? AND state='DRAFT'`)
       .get(token) as { handles: number; quantity: number };
   }
 
   /** Drops members from a draft and counts a new revision, so the token submitted with the old one is refused as stale. */
   excludeDraftMembers(token: string, exclude: ReadonlyArray<{ accountId: string; memberId: string }>): void {
     this.transaction(() => {
-      const remove = this.sqlite.prepare(`DELETE FROM command_member WHERE command_id=? AND account_id=? AND local_id=? AND state='DRAFT'`);
+      const remove = this.statement(`DELETE FROM command_member WHERE command_id=? AND account_id=? AND local_id=? AND state='DRAFT'`);
       for (const member of exclude) remove.run(token, member.accountId, member.memberId);
       for (const accountId of new Set(exclude.map((member) => member.accountId))) this.touch(accountId, 'command_member');
-      this.sqlite.prepare('UPDATE command SET revision=revision+1 WHERE id=?').run(token);
+      this.statement('UPDATE command SET revision=revision+1 WHERE id=?').run(token);
     });
   }
 
@@ -969,7 +1121,7 @@ export class EngineDatabase {
         ${filter?.location ? 'AND location=?' : ''}
       `;
       const itemParams: Array<string | number> = [accountId, ...(filter?.location ? [filter.location] : [])];
-      for (const row of this.sqlite.prepare(itemSql).all(...itemParams) as Array<{ local_id: string; location: string; casket_id: string | null; quantity: number }>) {
+      for (const row of this.statement(itemSql).all(...itemParams) as Array<{ local_id: string; location: string; casket_id: string | null; quantity: number }>) {
         this.insertDraftMember(token, { accountId, localId: row.local_id, quantity: row.quantity, location: row.location, casketId: row.casket_id });
         handles += 1;
         quantity += row.quantity;
@@ -981,7 +1133,7 @@ export class EngineDatabase {
   // --- Observation coverage -----------------------------------------------
 
   checkpoint(accountId: string, surface: string, scopeId = ''): CheckpointRow | undefined {
-    return this.sqlite.prepare(`SELECT account_id, surface, scope_id, cursor_json, covered_through, observation_id, updated_at
+    return this.statement(`SELECT account_id, surface, scope_id, cursor_json, covered_through, observation_id, updated_at
       FROM surface_state WHERE account_id=? AND surface=? AND scope_id=? AND cursor_json IS NOT NULL`)
       .get(accountId, surface, scopeId) as CheckpointRow | undefined;
   }
@@ -993,7 +1145,7 @@ export class EngineDatabase {
    * `tests/unit/revision-sites.test.ts` holds every write site to this call.
    */
   touch(accountId: string, surface: string): void {
-    this.sqlite.prepare(`INSERT INTO surface_state(account_id, surface, scope_id, revision) VALUES (?, ?, '', 1)
+    this.statement(`INSERT INTO surface_state(account_id, surface, scope_id, revision) VALUES (?, ?, '', 1)
       ON CONFLICT(account_id, surface, scope_id) DO UPDATE SET revision=revision+1`).run(accountId, surface);
   }
 
@@ -1012,7 +1164,7 @@ export class EngineDatabase {
 
   /** Every surface written at least once for the accounts, with its count: what a cursor is bound to. */
   revisionMarks(accounts: readonly string[]): Array<{ account_id: string; surface: string; revision: number }> {
-    return this.sqlite.prepare(`SELECT account_id, surface, revision FROM surface_state WHERE account_id IN (${accounts.map(() => '?').join(',')}) AND revision>0
+    return this.statement(`SELECT account_id, surface, revision FROM surface_state WHERE account_id IN (${accounts.map(() => '?').join(',')}) AND revision>0
       ORDER BY account_id, surface`).all(...accounts) as Array<{ account_id: string; surface: string; revision: number }>;
   }
 
@@ -1027,7 +1179,7 @@ export class EngineDatabase {
     accountId: string; surface: string; scopeId?: string; cursor: unknown;
     coveredThrough: string | null; observationId: number; now: string;
   }): void {
-    this.sqlite.prepare(`
+    this.statement(`
       INSERT INTO surface_state(account_id, surface, scope_id, cursor_json, covered_through, observation_id, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(account_id, surface, scope_id) DO UPDATE SET cursor_json=excluded.cursor_json,
@@ -1042,15 +1194,15 @@ export class EngineDatabase {
   }
 
   private retireUnsent(desiredId: string, now: string): void {
-    this.sqlite.prepare(`UPDATE action SET state='FAILED', error='superseded-or-suspended', updated_at=?
+    this.statement(`UPDATE action SET state='FAILED', error='superseded-or-suspended', updated_at=?
       WHERE desired_id=? AND state='READY'`).run(now, desiredId);
   }
 
   private recoverInterruptedActions(now: string): void {
-    this.sqlite.prepare("UPDATE command SET state='REJECTED',reject_reason='Preparation interrupted before admission',preparing=0 WHERE preparing=1").run();
-    this.sqlite.prepare(`
-      UPDATE action SET state='AWAITING_OBSERVATION', error='process-interrupted-before-outcome', updated_at=?
+    this.statement("UPDATE command SET state='REJECTED',reject_reason='Preparation interrupted before admission',preparing=0 WHERE preparing=1").run();
+    this.statement(`
+      UPDATE action SET state='AWAITING_OBSERVATION', error=?, updated_at=?
       WHERE state='RUNNING'
-    `).run(now);
+    `).run(INTERRUPTED_BEFORE_OUTCOME, now);
   }
 }

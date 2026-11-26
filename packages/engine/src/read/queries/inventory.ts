@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { wearBandSql } from '@cslytics/ports';
+import { kindKeySql, wearBandSql } from '@cslytics/ports';
 import type { EngineDatabase } from '../../db/database.js';
 import { inventoryQuery, inventoryTotals, type InventoryFilter } from '../../db/inventory-query.js';
 import { assertAccountScope, boundPageSize, bounded, decode, hash, queryPage, readRevision, type PageEnvelope, type Param, type ScopedPageRequest } from './paging.js';
@@ -12,16 +12,19 @@ import { assertAccountScope, boundPageSize, bounded, decode, hash, queryPage, re
  * `'keys'` is how the host pages every handle in name order all the same, without a name crossing
  * into the engine: it sorts the group summary by name itself and hands back the identity keys in
  * that order as `keyOrder`, exactly as a name filter comes back as `matchKeys`. The engine pages
- * handles in the order of their keys, least worn first within a key. `'float'` orders by wear
+ * handles in the order of their keys, least worn first within a key. `'kinds'` is the same with
+ * a finer key: a market kind, the identity key and its wear tier (`kindKey` in ports), which is
+ * what a market name and so a price belongs to. The host orders the kinds by the price it holds for
+ * each and hands them back as `keyOrder`; no price enters the engine. `'float'` orders by wear
  * alone. `'seen'` orders by when the holding was first detected: the finished time of
  * `first_seen_obs`. Steam does not say when an item was acquired, so a holding that arrived later
  * — a trade, a purchase — is dated by the walk that first showed it, which is when it was received.
- * All three honour `direction`; the two older sorts ascend only.
+ * All four honour `direction`; the two older sorts ascend only.
  */
-export type InventorySort = 'localId' | 'defIndex' | 'keys' | 'float' | 'seen';
+export type InventorySort = 'localId' | 'defIndex' | 'keys' | 'kinds' | 'float' | 'seen';
 export type InventoryPageRequest = Omit<ScopedPageRequest, 'filter'> & {
   sort?: InventorySort;
-  /** With `'keys'`: identity keys in the order to page their handles. A key it omits sorts last. */
+  /** With `'keys'`: identity keys in the order to page their handles; with `'kinds'`, kind keys. A key it omits sorts last. */
   keyOrder?: readonly string[];
   direction?: 'asc' | 'desc';
   filter?: InventoryFilter;
@@ -47,6 +50,12 @@ export type InventoryPageRow = {
    * row is `MAIN` and listed at once (`db/commitment.ts`).
    */
   steamListed: number;
+  /**
+   * `1` when a CSFloat listing the last complete stall walk showed names this holding, else `0`:
+   * the row the Listings page shows for it. CSFloat leaves a listed item in the Steam inventory
+   * too, so this is beside `location` in the same way.
+   */
+  csfloatListed: number;
   /**
    * Steam's `marketable` flag from the last Community read of the asset (holdings plan D7):
    * `1`, `0`, or `null` when no read has named it. Unknown never blocks; the host and the
@@ -89,7 +98,7 @@ export type GroupEnvelope = PageEnvelope<InventoryGroupRow> | { kind: 'needs-fil
 export type StoragePageRow = { accountId: string; casketId: string; localId: string | null; label: string | null; reportedCount: number; knownQuantity: number; complete: boolean };
 
 export function pageInventory(database: EngineDatabase, request: InventoryPageRequest, now: string): PageEnvelope<InventoryPageRow> {
-  if (request.sort === 'keys' || request.sort === 'float' || request.sort === 'seen') return pageInventoryOrdered(database, request, now);
+  if (request.sort === 'keys' || request.sort === 'kinds' || request.sort === 'float' || request.sort === 'seen') return pageInventoryOrdered(database, request, now);
   const accounts = assertAccountScope(database, request.accountIds);
   const size = boundPageSize(request.pageSize);
   const keys = request.sort === 'defIndex' ? ['accountId', 'defIndex', 'rowKey'] : ['accountId', 'rowKey'];
@@ -131,9 +140,10 @@ export function pageInventory(database: EngineDatabase, request: InventoryPageRe
     hasNext, total: { handles: total.quantity, quantity: total.quantity, groups: total.groups, rows: total.rows } });
 }
 /**
- * Handles in an order the caller chose: the host's order of identity keys, wear, or first detection.
+ * Handles in an order the caller chose: the host's order of identity keys or of market kinds, wear,
+ * or first detection.
  *
- * All three go through `queryPage`, so the cursor is one row-value comparison over every key and
+ * All four go through `queryPage`, so the cursor is one row-value comparison over every key and
  * runs one way for all of them. None of these orders has an index behind it, so the filtered set
  * is sorted for each page. That is the price of an order the engine cannot store, and it is the
  * same full pass the totals already make.
@@ -148,7 +158,9 @@ function pageInventoryOrdered(database: EngineDatabase, request: InventoryPageRe
   const accounts = assertAccountScope(database, request.accountIds);
   const filter = request.filter ?? {};
   const descending = request.direction === 'desc';
-  const byKeys = request.sort === 'keys';
+  // A kind order is a key order over a finer key: the same join, on the kind instead of the match key.
+  const byKinds = request.sort === 'kinds';
+  const byKeys = request.sort === 'keys' || byKinds;
   const bySeen = request.sort === 'seen';
   // A repeated key would join its handles twice. Its first mention is its place.
   const order = byKeys ? [...new Set(request.keyOrder ?? [])] : [];
@@ -159,7 +171,7 @@ function pageInventoryOrdered(database: EngineDatabase, request: InventoryPageRe
   const seen = `IFNULL(q.firstSeenAt, '${descending ? '' : '~'}')`;
   const sql = byKeys
     ? `SELECT q.*, IFNULL(o.rank, ${descending ? -1 : order.length}) AS sortRank, ${wear} AS sortWear FROM (${query.sql}) q
-       LEFT JOIN (SELECT value AS matchKey, CAST(key AS INTEGER) AS rank FROM json_each(?)) o ON o.matchKey = q.matchKey`
+       LEFT JOIN (SELECT value AS orderKey, CAST(key AS INTEGER) AS rank FROM json_each(?)) o ON o.orderKey = ${byKinds ? kindKeySql('q.matchKey', 'q.paintWear') : 'q.matchKey'}`
     : bySeen
       ? `SELECT q.*, ${seen} AS sortSeen FROM (${query.sql}) q`
       : `SELECT q.*, ${wear} AS sortWear FROM (${query.sql}) q`;

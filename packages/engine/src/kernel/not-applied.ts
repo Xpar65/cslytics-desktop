@@ -8,6 +8,15 @@ export function attemptsMade(database: EngineDatabase, actionId: string): number
 }
 
 /**
+ * How many of an action's attempts could have landed: every one but those the venue definitely
+ * refused, which sent nothing. The count a cap on resends is held against for a kind whose
+ * refusal of the moment puts the same request back to wait (a price change inside Steam's cooldown).
+ */
+export function sendsThatCouldLand(database: EngineDatabase, actionId: string): number {
+  return attemptsMade(database, actionId) - database.definiteRefusals(actionId);
+}
+
+/**
  * Settles an action a complete observation proved not applied, the one way.
  *
  * The record is `resolveAction(…, false)`: resolution `OBSERVED_NOT_APPLIED`, and `READY` again
@@ -21,20 +30,21 @@ export function attemptsMade(database: EngineDatabase, actionId: string): number
  * `what` is the proof in the reconciler's words ("Steam still shows the listing"), so the reason
  * names what was seen rather than what was hoped. `exhaustedReason` replaces the built sentence
  * for a kind whose words are already a contract. `policy` is a seam for a saboteur, never a
- * production choice: the table is the policy.
+ * production choice: the table is the policy. `attempts` is the count the cap is held against,
+ * for a kind where not every attempt was a send that could have landed (`sendsThatCouldLand`).
  */
 export function settleNotApplied(
   context: EngineContext,
   action: ActionRow,
   observationId: number,
   what: string,
-  options: { exhaustedReason?: string; policy?: RetryPolicy } = {}
+  options: { exhaustedReason?: string; policy?: RetryPolicy; attempts?: number } = {}
 ): RetryPlan {
   const { database } = context;
   const now = context.now();
   const policy = options.policy ?? RETRY_POLICY[action.kind] ?? NEVER_RETRY;
   database.resolveAction(action, observationId, false, now);
-  const attempts = attemptsMade(database, action.id);
+  const attempts = options.attempts ?? attemptsMade(database, action.id);
   const plan = retryPlan(policy, attempts, now);
   if (plan.kind === 'exhausted' && database.action(action.id)?.state === 'READY') {
     const reason = options.exhaustedReason ?? (attempts > 1 ? `${what} after ${attempts} attempts` : what);

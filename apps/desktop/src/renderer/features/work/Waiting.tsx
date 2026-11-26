@@ -5,8 +5,9 @@ import { VenueMark } from '../../components/VenueMark.js';
 import { Avatar } from '../../components/Avatar.js';
 import { engine } from '../../lib/engine.js';
 import { currencyCodeOf, formatAmount } from '../../lib/money.js';
-import { formatDateTime, formatRelative, plural, surfaceLabel } from '../../lib/labels.js';
+import { formatDateTime, formatRelative, plural, surfaceLabel, waitingKindLabel } from '../../lib/labels.js';
 import { isOverdue, type WaitingRow, type WaitingState } from './use-waiting.js';
+import { priceChangeTerms, waitingBadge, waitingNotice, waitingPillSentence } from './waiting-words.js';
 
 /**
  * The count of things only the person can do, in the topbar beside the work indicator.
@@ -26,9 +27,7 @@ export function WaitingPill({ waiting, onOpen }: { waiting: WaitingState; onOpen
   const rows = waiting.rows;
   if (rows.length === 0) return null;
   const overdue = rows.filter((row) => isOverdue(row)).length;
-  const sentence = `${plural(rows.length, 'thing')} waiting for you to confirm on your phone`
-    + (overdue > 0 ? ` · ${overdue} waiting more than an hour` : '')
-    + (waiting.complete ? '' : ' · at least this many; a walk did not finish');
+  const sentence = waitingPillSentence(rows, overdue, waiting.complete);
 
   return (
     <button
@@ -52,8 +51,9 @@ export function WaitingPill({ waiting, onOpen }: { waiting: WaitingState; onOpen
  *
  * Deliberately *not* a list of buttons. There is no action this window can offer that discharges
  * one of these rows — the tap happens in Steam Mobile, on a secret this product refuses to hold
- * (rule 2) — so offering a `Confirm` button would be a lie the first time it was pressed. What it
- * offers instead is the one honest action: go and look again.
+ * (rule 2), or on a link Steam e-mailed for a lower price — so offering a `Confirm` button would be
+ * a lie the first time it was pressed. What it offers instead is the one honest action: go and
+ * look again. A lower price waiting here is cancelled from the work panel, by its command's Stop.
  *
  * That re-read is why the copy dwells on the lag. A person taps six confirmations, comes back,
  * and the list is still six long until the next complete walk observes the change. Without a
@@ -92,11 +92,10 @@ export function WaitingList({ waiting, accountIds, accounts = [], onOpenListings
       {error ? <div className="caption" data-tone="warn" role="alert">{error}</div> : null}
 
       {waiting.rows.length > 0 ? (
+        // Its sentences follow what is in the list (`waitingNotice`): a lower price is on sale at
+        // its current price meanwhile, and may be confirmed by e-mail rather than on the phone.
         <Notice tone="warn" role="status" title="These are not done until you confirm them">
-          Open the Steam Mobile app and go to <strong>Confirmations</strong>. A sell listing that is
-          never confirmed is never listed: it earns nothing and no amount of waiting here will change
-          that. After you confirm, this list clears on the next complete walk, not immediately —
-          nothing is concluded from a tap this app did not see.
+          {waitingNotice(waiting.rows).join(' ')}
         </Notice>
       ) : null}
 
@@ -123,7 +122,7 @@ export function WaitingList({ waiting, accountIds, accounts = [], onOpenListings
 
       {unwalked.length > 0 || incomplete.length > 0 ? (
         <Caption icon="alert-triangle" tone="warn">
-          Not everything has been looked at — {[
+          Not everything has been looked at: {[
             ...unwalked.map((row) => `${surfaceLabel(row.surface)} for ${nameOf(row.accountId)} has never run`),
             ...incomplete.map((row) => `${surfaceLabel(row.surface)} for ${nameOf(row.accountId)} last finished ${formatRelative(row.observedAt)} without completing`)
           ].join('; ')}. This list is a floor, not a total: something waiting on you may not be in it.
@@ -153,6 +152,14 @@ export function WaitingList({ waiting, accountIds, accounts = [], onOpenListings
 function WaitingLine({ row }: { row: WaitingRow }): React.JSX.Element {
   const overdue = isOverdue(row);
   const listing = row.kind === 'SELL_LISTING';
+  // A buy order Steam will place only after a tap: no item yet, a name and a limit.
+  const buyOrder = row.kind === 'BUY_ORDER';
+  // A lower price on a listing still on sale at its current one: both prices, and when it is dropped.
+  const change = priceChangeTerms(row);
+  const badge = waitingBadge(row, overdue);
+  // Everything owed but an offer is owed on the market: a listing, a buy order, or a lower price
+  // on a listing that stays on sale at its old one until the tap.
+  const onMarket = row.kind !== 'TRADE_OFFER';
   // Named by the catalogue from the item the walk matched, or by the venue's own string. A row
   // with neither — an offer whose first line no single local item carried — says what it is
   // rather than wearing the identity `enrich` falls back to, which is nobody's item.
@@ -173,21 +180,29 @@ function WaitingLine({ row }: { row: WaitingRow }): React.JSX.Element {
           {others ? <span className={row.distinctItems > 1 ? 'quiet' : 'num'}>{others}</span> : null}
         </span>
         <span className="waiting-row-meta quiet">
-          {listing ? <VenueMark venue="steam" size={11} /> : <Icon name="arrow-left-right" size={11} />}
-          <span>{listing ? 'Sell listing' : 'Trade offer'}</span>
+          {onMarket ? <VenueMark venue="steam" size={11} /> : <Icon name="arrow-left-right" size={11} />}
+          <span>{waitingKindLabel(row.kind)}</span>
           <span className="sep">·</span>
           {/* "Waiting since" rather than "created": what is known is when a walk first saw it. */}
           <span>{row.waitingSince ? `waiting ${formatRelative(row.waitingSince)}` : 'waiting since a walk that did not date it'}</span>
           {listing && row.receiveCents !== null ? (
             <><span className="sep">·</span><span>you receive {formatAmount(row.receiveCents, row.currency)} {currencyCodeOf(row.currency)}</span></>
           ) : null}
-          {row.expiresAt ? (
+          {buyOrder && row.buyerPriceCents !== null ? (
+            <><span className="sep">·</span><span>up to {formatAmount(row.buyerPriceCents, row.currency)} {currencyCodeOf(row.currency)} each</span></>
+          ) : null}
+          {change?.prices ? (
+            <><span className="sep">·</span><span data-testid="waiting-price-change" title={change.title ?? undefined}>{change.prices}</span></>
+          ) : null}
+          {change ? (
+            change.dropped ? <><span className="sep">·</span><span data-testid="waiting-price-deadline"><Icon name="clock" size={11} /> {change.dropped}</span></> : null
+          ) : row.expiresAt ? (
             <><span className="sep">·</span><span><Icon name="clock" size={11} /> expires {formatDateTime(row.expiresAt)}</span></>
           ) : null}
         </span>
       </span>
-      <Badge tone={overdue ? 'warn' : 'accent'} icon="smartphone">
-        {overdue ? 'Still not confirmed' : 'Confirm on phone'}
+      <Badge tone={overdue ? 'warn' : 'accent'} icon={badge.icon}>
+        {badge.label}
       </Badge>
     </div>
   );

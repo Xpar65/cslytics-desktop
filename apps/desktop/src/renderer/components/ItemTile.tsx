@@ -3,6 +3,8 @@ import { Thumbnail } from './ui.js';
 import { Avatar } from './Avatar.js';
 import { Icon } from './Icon.js';
 import { formatFloat, wearTier } from '../lib/format.js';
+import type { NamedAccessory } from '../../shared/accessories.js';
+import { CompactAccessories } from './AccessoryStrip.js';
 
 /**
  * One tile, whatever is being tiled.
@@ -26,7 +28,7 @@ import { formatFloat, wearTier } from '../lib/format.js';
  * rest of the selection, as Ctrl is on the tile; it is out of the Tab order, because Ctrl+Space
  * on the tile is the keyboard's way to the same thing.
  */
-export function ItemTile({ name, imageUrl, rarity, selected = false, focused, tabbable, busy = false, unresolved, badges, sub, footer, onActivate, onCheck, onOpen, onDismiss, onDetail }: {
+export function ItemTile({ name, imageUrl, rarity, selected = false, focused, tabbable, busy = false, unresolved, accessories, badges, sub, footer, onActivate, onCheck, onOpen, onDismiss, onDetail }: {
   name: string;
   imageUrl: string | null;
   rarity: { name: string; colour: string } | null;
@@ -38,6 +40,11 @@ export function ItemTile({ name, imageUrl, rarity, selected = false, focused, ta
   tabbable: boolean;
   busy?: boolean | undefined;
   unresolved?: string | null | undefined;
+  /**
+   * What is applied to the item, laid along the foot of the picture between the bottom corners'
+   * badges, as CSFloat lays a skin's stickers on its card.
+   */
+  accessories?: readonly NamedAccessory[] | undefined;
   /** `TileBadge`s, laid over the picture. */
   badges?: React.ReactNode;
   /** The line under the name. `TileWear` is the usual one. */
@@ -78,6 +85,7 @@ export function ItemTile({ name, imageUrl, rarity, selected = false, focused, ta
     >
       <div className="tile-image">
         <Thumbnail url={imageUrl} name={name} size={88} />
+        {accessories && accessories.length > 0 ? <div className="tile-accessories"><CompactAccessories accessories={accessories} /></div> : null}
         {badges}
         {onCheck ? (
           <button
@@ -110,16 +118,18 @@ export function TileBusy(): React.JSX.Element {
   return <span className="tile-busy" title="An open command names this item">Busy</span>;
 }
 
-/** A glyph in one corner of the picture. `lock` is top left, `where` top right, `account` bottom right. */
-export function TileBadge({ corner, title, lock, size, children }: {
-  corner: 'lock' | 'where' | 'account';
+/** A glyph in one corner of the picture. `lock` is top left, `where` top right, `account` bottom right, `tag` bottom left (an extension's; the busy pill outranks it). */
+export function TileBadge({ corner, title, lock, size, shape, children }: {
+  corner: 'lock' | 'where' | 'account' | 'tag';
   title: string;
   lock?: 'market' | 'trade' | undefined;
   /** `lg` where the badge is the tile's answer to "which one", as a listing's venue and account are. */
   size?: 'lg' | undefined;
+  /** `tag` is a `ListingMarks`, which draws its own outline in place of the badge's circle. */
+  shape?: 'tag' | undefined;
   children: React.ReactNode;
 }): React.JSX.Element {
-  return <span className={`tile-badge tile-badge-${corner}`} data-lock={lock} data-size={size} title={title}>{children}</span>;
+  return <span className={`tile-badge tile-badge-${corner}`} data-lock={lock} data-size={size} data-shape={shape} title={title}>{children}</span>;
 }
 
 /** Whose it is, for a grid that holds more than one account's. */

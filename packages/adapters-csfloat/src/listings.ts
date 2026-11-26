@@ -1,12 +1,16 @@
-import type {
-  AccountId,
-  CredentialVault,
-  CsfloatCredentialRef,
-  CsfloatListing,
-  CsfloatListingItem,
-  CsfloatListingPort,
-  CsfloatStallPage,
-  CsfloatStallResult
+import {
+  CSFLOAT_LISTING_RETURNED,
+  type AccountId,
+  type CredentialVault,
+  type CsfloatCredentialRef,
+  type CsfloatListing,
+  type CsfloatListingItem,
+  type CsfloatListingPort,
+  type CsfloatRepriceAnswer,
+  type CsfloatStallPage,
+  type CsfloatStatedListing,
+  type CsfloatStallResult,
+  type MutationOutcome
 } from '@cslytics/ports';
 import { CsfloatTransport, requireKey, type CsfloatResponse, type CsfloatTransportResult } from './transport.js';
 import { mutationResult, readResult, record } from './outcome.js';
@@ -38,9 +42,8 @@ export class CsfloatListingAdapter implements CsfloatListingPort {
   }
 
   async reprice(accountId: AccountId, credential: CsfloatCredentialRef, listingId: string, priceCents: number) {
-    return mutationResult(await this.transport.send({ accountId, method: 'PATCH', path: `/listings/${encodeURIComponent(listingId)}`,
-      key: await requireKey(this.vault, credential), body: { price: priceCents } }),
-    body => record(body)?.['id'] === listingId && record(body)?.['price'] === priceCents);
+    return repriceResult(await this.transport.send({ accountId, method: 'PATCH', path: `/listings/${encodeURIComponent(listingId)}`,
+      key: await requireKey(this.vault, credential), body: { price: priceCents } }), listingId, priceCents);
   }
 
   async cancel(accountId: AccountId, credential: CsfloatCredentialRef, listingId: string) {
@@ -68,6 +71,35 @@ export class CsfloatListingAdapter implements CsfloatListingPort {
     });
     return classifyStall(result);
   }
+}
+
+/**
+ * What the venue's answer to a reprice says (`CsfloatListingPort.reprice` fixes the vocabulary).
+ *
+ * The venue answers `PATCH /listings/{id}` with the listing as it now is. An answer that echoes
+ * the id and the price sent is the venue accepting the change, as it always was here; when it
+ * names the listing's state too it is `SUBMITTED` with the evidence `CSFLOAT_LISTING_RETURNED`,
+ * and the id, the price and the state are kept in `raw`, so a caller can take them as the listing
+ * after the change: `listed`, or `sold` when the new price met a resting buy order. Nothing else
+ * of the body is kept, whatever it carries: those three are the fields the venue is known to
+ * answer with, and the rest of a listing does not change with its price. An answer that names
+ * another id or another price is `AMBIGUOUS` with what it named kept, and a refusal or a lost
+ * answer is whatever `mutationResult` makes of it.
+ */
+export function repriceResult(result: CsfloatTransportResult, listingId: string, priceCents: number): MutationOutcome {
+  const outcome = mutationResult(result, body => record(body)?.['id'] === listingId && record(body)?.['price'] === priceCents);
+  if (result.kind === 'failure' || !result.ok || outcome.kind === 'DEFINITIVELY_REJECTED') return outcome;
+  const stated = readStatedListing(result.body);
+  if (!stated) return outcome;
+  const raw: CsfloatRepriceAnswer = { status: result.status, id: stated.listingId, listing: stated };
+  return outcome.kind === 'SUBMITTED' ? { kind: 'SUBMITTED', evidence: CSFLOAT_LISTING_RETURNED, raw } : { ...outcome, raw };
+}
+
+/** The id, the price and the state a reprice's answer names, or null when it does not name all three. */
+export function readStatedListing(body: unknown): CsfloatStatedListing | null {
+  if (!isRecord(body)) return null;
+  const id = text(body['id']), price = nonNegativeInteger(body['price']), state = text(body['state']);
+  return id && price !== null && state ? { listingId: id, priceCents: price, state } : null;
 }
 
 export function classifyStall(result: CsfloatTransportResult): CsfloatStallResult {

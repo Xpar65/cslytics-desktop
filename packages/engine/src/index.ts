@@ -6,11 +6,11 @@ export type { AccountRow, ActionRow, ItemRow, ObservationStart, StorageUnitRow }
 export { CASKET_NAME_MAX_LENGTH, validateCasketName } from './policy/casket-name.js';
 export { canonicalAccountId } from './db/database.js';
 export { TradingEngine } from './engine.js';
-export type { MarketSyncResult, ServiceOverrides } from './engine.js';
+export type { EngineOptions, MarketSyncResult, ServiceOverrides } from './engine.js';
 export { SessionService, classifyConnection } from './surfaces/session.js';
 export type { ConnectionPhase, AccountConnection, AuthedAccount, LoginOutcome } from './surfaces/session.js';
-export { createContext, executeMutation } from './kernel/context.js';
-export type { EngineContext } from './kernel/context.js';
+export { AMBIGUOUS_IS_FAILURE, createContext, executeMutation } from './kernel/context.js';
+export type { BreakerVerdict, EngineContext } from './kernel/context.js';
 export {
   attributeValue,
   accessorySignature,
@@ -33,14 +33,14 @@ export {
   UNTRADABLE_RESTRICTION,
   variantToken
 } from './kernel/identity.js';
-export { accessorySlots, ATTRIBUTES_JSON_VERSION, encodeAttributes, storedCannotTrade } from './kernel/attributes.js';
+export { accessorySlots, ATTRIBUTE_CHARM_STICKER, ATTRIBUTES_JSON_VERSION, encodeAttributes, storedCannotTrade } from './kernel/attributes.js';
 export { HoldingsStore } from './db/holdings.js';
 export { AccountPurgeError, AccountPurgeRefused, AccountPurgeStore, ACCOUNTLESS_TABLES } from './db/account-purge.js';
 export { RetentionError, RetentionStore, RETENTION_DAYS } from './db/retention.js';
 export type { SweepResult } from './db/retention.js';
 export type { PurgeMode, PurgeResult, PurgeRun } from './db/account-purge.js';
 export type { AccessorySlot, EncodedAttributes } from './kernel/attributes.js';
-export { AccountEndpointGovernors, BREAKER_FAILURE_THRESHOLD, BREAKER_RESET_MS, CircuitBreaker, MARKET_HISTORY_SHARED_BUDGET, MUTATION_BUDGET, TRADE_HISTORY_PAGE_BUDGET, TRANSPORT_BUDGET, TRANSPORTS, TokenBucket, laneOf } from './kernel/governor.js';
+export { AccountEndpointGovernors, BREAKER_FAILURE_THRESHOLD, BREAKER_RESET_MS, CircuitBreaker, LISTING_TIMES_PAGE_BUDGET, LISTING_TIMES_SHARED_BUDGET, MARKET_HISTORY_SHARED_BUDGET, MUTATION_BUDGET, TRADE_HISTORY_PAGE_BUDGET, TRANSPORT_BUDGET, TRANSPORTS, TokenBucket, laneOf } from './kernel/governor.js';
 export type { BucketSpec, ScopeBudget, Transport, TransportBudget } from './kernel/governor.js';
 export { DiagnosticExporter, redact } from './kernel/diagnostics.js';
 export { classifyAmbiguity, MalformedResponse, TransportFailure } from './kernel/outcome.js';
@@ -49,26 +49,39 @@ export { AccountLock, errorMessage, required } from './kernel/support.js';
 export { InventoryService } from './surfaces/inventory.js';
 export { StorageService, MAIN_INVENTORY_HARD_CAP, LABEL_CHANGED_EXTERNALLY, RENAME_NOT_TAKEN } from './surfaces/storage.js';
 export type { CasketWalk, RenameParams } from './surfaces/storage.js';
-export { MarketService } from './surfaces/market.js';
-export { BuyOrderService } from './surfaces/buy-orders.js';
+export { COMMAND_STOPPED, DISCARD_NOT_NEEDED, MarketService } from './surfaces/market.js';
+export { PRICE_CHANGE_CONFIRM_DEADLINE_MS, PRICE_DISCARD_BACKOFF_MS, PRICE_DISCARD_LANDING_MARGIN_MS, PRICE_DISCARD_LATE_LANDING_MS, priceChangeDeadline, priceDiscardBackoffMs } from './policy/price-change.js';
+export type { PriceUpdateParams } from './surfaces/market.js';
+export type { PriceDiscardParams, PriceDiscardReason } from './kernel/listing-price.js';
+export { DISCARD_SELL_LISTING_PRICE_CHANGE, PRICE_CHANGE_DISCARD_SENT, PRICE_DISCARD_SENDS, PRICE_DISCARD_UNAVAILABLE, PRICE_DISCARD_UNHEARD, priceDiscardId, PRICE_CHANGE_NOT_CONFIRMED, PRICE_CHANGE_UNANSWERED, PRICE_WITHDRAWAL_UNHEARD, discardHeard, PRICE_COOLDOWN_REFUSALS, PRICE_COOLDOWN_REFUSED,
+  PRICE_EDIT_UNAVAILABLE, UPDATE_SELL_LISTING_PRICE, priceChangeConfirmer, priceChangeVenueCode,
+  PRICE_CHANGE_LISTING_GONE, PRICE_CHANGE_LISTING_NOT_LIVE, PRICE_CHANGE_LISTING_OFF_MARKET, isNeitherPrice, isPriceAlreadyThere, isPriceMovedSinceAdmission, neitherPrice, priceAlreadyThere, strategyPriceMoved } from './kernel/listing-price.js';
+export { BuyOrderService, BUY_ORDER_CONFIRMATION_ROUNDS, BUY_ORDER_CONFIRMATION_WAIT_MS } from './surfaces/buy-orders.js';
+export type { BuyOrderCommandOptions, BuyOrderCreated } from './surfaces/buy-orders.js';
 export { TradeService, HISTORY_OVERLAP_MS, TRADE_HISTORY_PAGES_PER_WALK, TRADE_HISTORY_SURFACE, TRADE_OFFERS_SURFACE } from './surfaces/trades.js';
 export type { HistoryWalkOptions, TradeSyncResult } from './surfaces/trades.js';
 export { CsfloatAccountService, CSFLOAT_VENUE, CSFLOAT_STATUS_SURFACE, CSFLOAT_STANDING_SURFACE, credentialRefFor } from './surfaces/csfloat-account.js';
 export type { ConnectResult, MarketplaceStatus } from './surfaces/csfloat-account.js';
 export { CsfloatListingService, CSFLOAT_STALL_SURFACE, MAX_STALL_PAGES } from './surfaces/csfloat-listings.js';
 export type { StallSyncResult } from './surfaces/csfloat-listings.js';
-export { CsfloatInventoryService } from './surfaces/csfloat-inventory.js';
-export { CsfloatTradeService } from './surfaces/csfloat-trades.js';
+export { CSFLOAT_THROTTLED, CsfloatInventoryService } from './surfaces/csfloat-inventory.js';
+export type { CsfloatInventoryWalk } from './surfaces/csfloat-inventory.js';
+export { CSFLOAT_TRADE_HISTORY_EVERY_MS, CsfloatTradeService } from './surfaces/csfloat-trades.js';
 export { CsfloatBuyOrderService, CSFLOAT_BUY_ORDER_SURFACE, BUY_ORDER_PAGE_LIMIT, MAX_BUY_ORDER_PAGES } from './surfaces/csfloat-buy-orders.js';
 export type { BuyOrderBookSyncResult } from './surfaces/csfloat-buy-orders.js';
-export { CsfloatBuyingService, BUY_ORDER_EDIT, BUY_ORDER_CANCEL, BUY_ORDER_OPERATION_KINDS, BUY_ORDER_BOOK_WINDOW_MS, BUY_ORDER_NOT_APPLIED, BUY_ORDER_MIN_PRICE_CENTS } from './orchestrate/csfloat-buying.js';
-export type { CsfloatBuyingServices, CsfloatBuyOrderTerms } from './orchestrate/csfloat-buying.js';
-export { BUY_ORDER_CONSTRAINT_KEYS, csfloatBuyOrderFilters, describeBuyOrderConstraints, preservableConstraints, readBuyOrderConstraints, sameBuyOrderConstraints, validateBuyOrderConstraints } from './kernel/csfloat-buy-orders.js';
+export { CsfloatBuyingService, BUY_ORDER_CREATE, BUY_ORDER_EDIT, BUY_ORDER_CANCEL, BUY_ORDER_OPERATION_KINDS, BUY_ORDER_BOOK_WINDOW_MS, BUY_ORDER_NOT_APPLIED, BUY_ORDER_MIN_PRICE_CENTS, BUY_ORDER_MAX_QUANTITY, BUY_ORDER_LEFT_THE_BOOK } from './orchestrate/csfloat-buying.js';
+export type { BuyOrderCreateParams, BuyOrderStepParams, CsfloatBuyingServices, CsfloatBuyOrderCreateTerms, CsfloatBuyOrderTerms } from './orchestrate/csfloat-buying.js';
+export { BUY_ORDER_CONSTRAINT_KEYS, csfloatBuyOrderFilters, csfloatPriceIncrement, describeBuyOrderConstraints, onCsfloatPriceIncrement, preservableConstraints, readBuyOrderConstraints, sameBuyOrderConstraints, validateBuyOrderConstraints } from './kernel/csfloat-buy-orders.js';
 export type { BuyOrderConstraintReading } from './kernel/csfloat-buy-orders.js';
 export { CsfloatSellingService, CSFLOAT_CREATE, CSFLOAT_REPRICE, CSFLOAT_CANCEL, CSFLOAT_LISTING_KINDS, listingHopId } from './orchestrate/csfloat-selling.js';
 export type { CsfloatListingKind, CsfloatListingStepParams } from './orchestrate/csfloat-selling.js';
-export { CSFLOAT_LIST_EVIDENCE, CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, VISIBILITY_DEADLINE_MS, VISIBILITY_READ_OFFSETS_MS } from './policy/csfloat-selling.js';
-export type { CsfloatSellRequest, CsfloatSellMember, CsfloatSellGroupMember } from './policy/csfloat-selling.js';
+export {
+  CSFLOAT_INVENTORY_WAIT_REASON, CSFLOAT_LIST_EVIDENCE, CSFLOAT_PERSON_LIST_EVIDENCE, CSFLOAT_VISIBILITY_TIMEOUT_REASON, CsfloatSellingPolicy, INVENTORY_LAG_GRACE_MS,
+  INVENTORY_WAIT, isInventoryLag
+} from './policy/csfloat-selling.js';
+export { AUTOMATION_BUDGET_SPENT_REASON, READ_BUDGETS, READ_BUDGET_SPENT_REASON, READ_BUDGET_WINDOW_MS, readBudget, readsPausedUntil } from './kernel/read-budget.js';
+export type { BudgetVerdict, ReadBudget } from './kernel/read-budget.js';
+export type { CsfloatSellRequest, CsfloatSellMember, CsfloatSellGroupMember, InventoryWait } from './policy/csfloat-selling.js';
 export { WorkStore, isSettled, OPEN_STEP_STATES_SQL, SETTLED_STEP_STATES_SQL } from './db/work.js';
 export type { WorkStepRow, TransferDetailRow, StoreLineRow, StepInput } from './db/work.js';
 export { HOP_NOT_REACHED } from './db/work.js';
@@ -80,14 +93,17 @@ export { ONLY_A_PERSON_FORCES, STRATEGY_NAMES_EACH_ITEM, claimForPerson, heldByP
 export type { AuthorityMember } from './policy/authority.js';
 export { readAuthority } from './read/queries/authority.js';
 export type { AuthorityPage } from './read/queries/authority.js';
-export { OrderStore, STEAM_BUCKET_STATE } from './db/orders.js';
-export type { VenueOrderRow, SteamOrderRow, SteamListingRow, SeenSteamListing, OrderEnding } from './db/orders.js';
+export { ACCESSORY_READ_LIMIT, readAccessories } from './read/queries/accessories.js';
+export type { AppliedAccessory, HoldingAccessories } from './read/queries/accessories.js';
+export { OrderStore, STEAM_BUCKET_STATE, BUY_ORDER_STATUS_SURFACE, UNEXPLAINED_BUY_ORDER_MS } from './db/orders.js';
+export type { VenueOrderRow, SteamOrderRow, SteamListingRow, SeenSteamListing, OrderEnding, PriceContradiction, SteamWalkTimes } from './db/orders.js';
 export { committedSql, steamListedSql, COMMITTED_SQL, STEAM_LISTED_SQL } from './db/commitment.js';
 export type { EnqueueActionInput } from './db/database.js';
 export { CsfloatStore, csfloatDeliveryView, CSFLOAT_DELIVER, CSFLOAT_DELIVERY_HOPS } from './db/csfloat.js';
 export type { CsfloatBuyOrderRow, CsfloatContract, CsfloatDeliveryView, CsfloatDeliveryHop, CsfloatDeliveryStepParams } from './db/csfloat.js';
-export { CSFLOAT_ENDED_WORDS } from './db/csfloat.js';
-export { CsfloatDeliveryService, PRESS_PROVED_KINDS, SEND_ABSENCE_GRACE_MS, compareTradeIds, csfloatOfferMessage, deliveryHopId } from './orchestrate/csfloat-delivery.js';
+export { CSFLOAT_ENDED_WORDS, CSFLOAT_LISTING_SURFACE, isAnswerObservation } from './db/csfloat.js';
+export { CSFLOAT_ANSWER_GUARD_MS, PRICE_ANSWER_CONTRADICTED, PRICE_ANSWER_GUARD_MS } from './kernel/price-answer.js';
+export { CSFLOAT_BUDGET_HOLD, CsfloatDeliveryService, PRESS_PROVED_KINDS, deliverable, SEND_ABSENCE_GRACE_MS, compareTradeIds, csfloatOfferMessage, deliveryHopId } from './orchestrate/csfloat-delivery.js';
 export type { CsfloatBook, CsfloatPage, CsfloatPageRow } from './read/queries/csfloat.js';
 export type CsfloatOverview = ReturnType<import('./read/views.js').EngineViews['csfloatOverview']>;
 export { MarketplaceStore, csfloatRestriction, csfloatStall, parseRestrictions } from './db/marketplace.js';
@@ -115,18 +131,24 @@ export { BackoffLedger, BACKOFF_CEILING_MS, BLOCKED_ELSEWHERE_RETRY_MS, RATE_LIM
 export { CADENCE, HISTORY_BACKFILL_EVERY_MS, SURFACE_ORDER, WALLET_QUIET_MS, baseIntervalMs, hasOpenCommitment, isDue, latestFor } from './policy/cadence.js';
 export type { BackoffState, CadenceRule, DueInput, DueVerdict, Tier } from './policy/cadence.js';
 export type { PrecheckLine, PrecheckSurface, StorePrecheck, StorePrecheckRequest } from './orchestrate/store-precheck.js';
-export { CommandService, COMMAND_KINDS, commandHopId, GC_NOT_ANSWERING, GC_NOT_CONNECTED, gcRefusal, SOLD_BEFORE_CANCEL, SOLD_BEFORE_REACHED } from './orchestrate/command.js';
+export { CommandService, COMMAND_KINDS, commandHopId, GC_NOT_ANSWERING, GC_NOT_CONNECTED, gcRefusal, PRICE_EDIT_NOT_AVAILABLE_HERE, SOLD_BEFORE_CANCEL,
+  SOLD_DURING_PRICE_CHANGE, SOLD_BEFORE_REACHED } from './orchestrate/command.js';
 export type { CommandKind, CommandHopParams, CommandMemberInput, CommandProgress, CommandRequest, CommandServices, SelectionCaptureRequest, SelectionSnapshot } from './orchestrate/command.js';
 export { MEMBER_HOP_JOINS, MEMBER_HOP_SQL, MEMBER_REASON_SQL, MEMBER_STATE_SQL, STEP_ACTION_SQL, STEP_REASON_SQL, STEP_STATE_SQL } from './db/member-state.js';
 export type { PageEnvelope, ScopedPageRequest } from './read/queries/paging.js';
 export type { InventoryPageRequest, GroupEnvelope, InventoryPageRow, InventoryGroupRow, InventoryPositionRow, InventoryPositionsRequest, PositionsEnvelope, StoragePageRow } from './read/queries/inventory.js';
-export type { HistoryPageRequest, HistoryPageRow, OrderPageRow, ActivityPageRow, TradePageRow, LedgerPageRow } from './read/queries/records.js';
+export type { HistoryPageRequest, HistoryPageRow, HistoryTimeRow, HistoryTimesPageRequest, OrderPageRow, ActivityPageRow, TradePageRow, LedgerPageRow } from './read/queries/records.js';
+export { pageHistoryTimes } from './read/queries/records.js';
+export { LISTING_TIMES_DRY_PAGES, LISTING_TIMES_PAGE, LISTING_TIMES_PAGES_PER_WALK, LISTING_TIMES_SURFACE, LISTING_TIMES_TOP_PAGE, ListingTimesService } from './surfaces/listing-times.js';
+export type { ListingTimesCoverage, ListingTimesOptions, ListingTimesStop, ListingTimesSyncResult } from './surfaces/listing-times.js';
+export { ListingTimesStore, actionMoney } from './db/listing-times.js';
+export type { ListingTimesTally } from './db/listing-times.js';
 export { GROUP_SUMMARY_CAP } from './read/queries/inventory.js';
 export { pageListings, summariseListings, CSFLOAT_CURRENCY } from './read/queries/listings.js';
-export type { ListingVenue, ListingSort, ListingSortDirection, ListingFilter, ListingPageRequest, ListingPageRow, ListingMoneyBucket, ListingStateBucket, ListingCoverageRow, ListingsSummary } from './read/queries/listings.js';
+export type { ListingVenue, ListingSort, ListingSortDirection, ListingFilter, ListingHolding, ListingPageRequest, ListingPageRow, ListingMoneyBucket, ListingStateBucket, ListingCoverageRow, ListingsSummary } from './read/queries/listings.js';
 export { bounded } from './read/queries/paging.js';
 export { pageCommandMembers, pageOpenWork } from './read/queries/work.js';
-export type { WorkRow, WorkPage } from './read/queries/work.js';
+export type { RetryCause, WorkRow, WorkPage } from './read/queries/work.js';
 export { FACT_KINDS, FACTS_PAGE_LIMIT, factsSince } from './read/queries/facts.js';
 export type { FactCursor, FactKind, FactRow, FactsPage, FactsRequest } from './read/queries/facts.js';
 export { readDetail } from './read/queries/records.js';
@@ -139,9 +161,9 @@ export { csfloatEligibility, csfloatGroupEligibility, csfloatOperationAccount, C
 export { selectionMembers, selectionAccounts } from './read/queries/selection.js';
 export type { SelectionMemberView } from './read/queries/selection.js';
 export type { CsfloatEligibility, CsfloatEligibilityState, CsfloatGroupEligibility } from './read/queries/csfloat.js';
-export { IDENTITY_MATCH_SQL } from './db/inventory-query.js';
-export type { InventoryFilter, WearBand, LockKind } from './db/inventory-query.js';
-export { SELECTION_KIND } from './db/database.js';
+export { IDENTITY_MATCH_SQL, appliedPredicates } from './db/inventory-query.js';
+export type { InventoryFilter, WearBand, LockKind, AppliedKit, AppliedRequirement, AppliedSlot } from './db/inventory-query.js';
+export { INTERRUPTED_BEFORE_OUTCOME, SELECTION_KIND } from './db/database.js';
 export type { DraftMember, DraftMemberRow } from './db/database.js';
 export type { CommandRow, CommandMemberRow, CommandMemberView, CommodityStackRow, CheckpointRow, ItemAccessoryRow, ItemLineageRow } from './db/database.js';
 export { TradeStore } from './db/trades.js';
@@ -154,14 +176,15 @@ export { PROOF_BOUND_MS, PROOF_INTERVALS, proofDemand, proofDueAtMs } from './po
 export type { ProofDemand, ProofOwner, StandingProofOwner } from './policy/proof.js';
 export { CANCEL_RETRY_DELAYS_MS, CASKET_ROUND_DELAYS_MS, CONFIRM_RETRY_DELAYS_MS, NEVER_RETRY, RETRY_POLICY, attemptLimit, retryPlan } from './kernel/retry-policy.js';
 export type { RetryPlan, RetryPolicy } from './kernel/retry-policy.js';
-export { PRICE_CHANGE, nextPriceChangeAt, priceChangeRefusal, priceDriftPct } from './kernel/price-cadence.js';
+export { PRICE_CHANGE, boundByVenueAlone, nextPriceChangeAt, priceChangeRefusal, priceDriftPct } from './kernel/price-cadence.js';
 export type { PriceChangeAsk, PriceChangeRule } from './kernel/price-cadence.js';
 export { RetryService } from './orchestrate/retry.js';
 export { ConfirmationService, CONFIRM_BATCH_LIMIT, CONFIRM_PRESS_GAP_MS } from './orchestrate/confirmation.js';
-export { CONFIRM, ConfirmationStore } from './db/confirmations.js';
-export type { ConfirmStepParams, OwedConfirmation, TargetSighting } from './db/confirmations.js';
+export type { ConfirmationServices } from './orchestrate/confirmation.js';
+export { CONFIRM, ConfirmationStore, PRICE_CHANGE_CONFIRMATION } from './db/confirmations.js';
+export type { BuyOrderConfirmationSighting, ConfirmStepParams, OwedConfirmation, TargetSighting } from './db/confirmations.js';
 export type { RetrySender, RetrySenders } from './orchestrate/retry.js';
-export { attemptsMade, settleNotApplied } from './kernel/not-applied.js';
+export { attemptsMade, sendsThatCouldLand, settleNotApplied } from './kernel/not-applied.js';
 export type { DesiredStateRow, ObservationRow, ScopeKind } from './db/database.js';
 export { OrderService, STEAM_PROFILE, HISTORY_PAGES_PER_WALK } from './surfaces/orders.js';
 export type { VenueProfile, OrderClassification, HistoryCoverage } from './surfaces/orders.js';
@@ -185,5 +208,5 @@ export { InGameStoreStore, STORE_PURCHASE_OPEN_STATES, STORE_PURCHASE, STORE_HOP
 export type { StorePurchaseRow, StorePurchaseLineRow, StorePurchaseState, StoreSheetRow, StoreEntryRow, StoreHop, StorePurchaseParams } from './db/in-game-store.js';
 export { pageStorePurchases, readStorePurchase, readStoreSheet } from './read/queries/in-game-store.js';
 export type { StoreSheetView, StoreSheetEntryView, StorePurchaseView, StorePurchaseLineView, StorePurchasePage } from './read/queries/in-game-store.js';
-export { requireFreshMoneyEvidence, walletAvailability } from './policy/wallet-admission.js';
-export type { WalletAvailability } from './policy/wallet-admission.js';
+export { AdmissionRefused, DEFAULT_BUY_ORDER_ADMISSION, admissionPolicy, commitmentCapCents, requireFreshMoneyEvidence, walletAvailability } from './policy/wallet-admission.js';
+export type { AdmissionRefusalCode, BuyOrderAdmission, BuyOrderAdmissionPolicy, WalletAvailability } from './policy/wallet-admission.js';

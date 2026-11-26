@@ -70,9 +70,12 @@ const NOTIFY_UNLOCK_CRATE = 1007;
 const NOTIFY_CASKET_CONTENTS = 1012;
 
 /**
- * `NameItem` is a *struct* message, not protobuf: two little-endian uint64s, a zero byte and a
- * NUL-terminated name, sent with a null header, as `node-globaloffensive`'s `nameItem` writes
- * it (`name-item.json`). The notification that answers it reuses the same code.
+ * `NameItem` (1006): `CMsgModifyItemStringAttr { tool_item_id = 1; subject_item_id = 2;
+ * attr_value = 4 }` under a protobuf header, `attr_def` left unset (`name-item.json`). The CS2
+ * build of 2026-10-08 replaced the struct body (two uint64s, a zero byte, a NUL-terminated name,
+ * which `globaloffensive` 3.3.0 still writes) with that message under the same id. The GC still
+ * applied a struct rename on 2026-10-11 and answered none of ours on 2026-10-16. The notification
+ * that answers it reuses the same code.
  */
 const MSG_NAME_ITEM = 1006;
 const NOTIFY_NAME_ITEM = 1006;
@@ -453,7 +456,7 @@ export class SteamGcAdapter implements SteamGcPort {
     if (!send) return { kind: 'DEFINITIVELY_REJECTED', reason: 'client-cannot-send', raw: null };
     try {
       const itemIds = await waitForNotification(session.gc, NOTIFY_NAME_ITEM, itemId, this.operationTimeoutMs, () => {
-        send(MSG_NAME_ITEM, encodeNameItem(nameTagId ?? '0', itemId, name), null);
+        send(MSG_NAME_ITEM, encodeNameItem(nameTagId ?? '0', itemId, name));
       });
       return { kind: 'SUBMITTED', evidence: `NameItem notification for ${itemId}; the label is proven by a later unit observation`, raw: { notification: 'NameItem', itemIds } };
     } catch (error) {
@@ -562,8 +565,8 @@ export class SteamGcAdapter implements SteamGcPort {
     if (session && isLive(session)) return session;
     const status = this.connectionStatus(accountId);
     const because = status.state === 'BLOCKED_ELSEWHERE'
-      ? ` — ${session ? blockedBy(session) : 'another session holds this account'}`
-      : status.detail ? ` — ${status.detail}` : '';
+      ? `: ${session ? blockedBy(session) : 'another session holds this account'}`
+      : status.detail ? `: ${status.detail}` : '';
     throw new Error(`GC is not connected for ${accountId}${because}`);
   }
 }
@@ -688,18 +691,27 @@ function rawSender(session: Session): ((msgType: number, body: Buffer, header?: 
 }
 
 /**
- * The `NameItem` struct body: `uint64 name_tag_id`, `uint64 item_id`, one zero byte, then the
- * name as NUL-terminated UTF-8. Both witnesses write exactly these 17 bytes plus the name.
+ * `CMsgModifyItemStringAttr` for a rename, encoded by hand: `tool_item_id` (1, uint64; 0 for a
+ * storage unit, which needs no Name Tag) and `subject_item_id` (2, uint64), both always written,
+ * then the name as `attr_value` (4, UTF-8 string). `attr_def` (3) is left out: a rename that sets
+ * it to 111, the custom-name attribute, is reported to go unanswered.
  */
 export function encodeNameItem(nameTagId: string, itemId: string, name: string): Buffer {
   const text = Buffer.from(name, 'utf8');
-  const body = Buffer.alloc(8 + 8 + 1 + text.length + 1);
-  body.writeBigUInt64LE(BigInt(nameTagId), 0);
-  body.writeBigUInt64LE(BigInt(itemId), 8);
-  body.writeUInt8(0, 16);
-  text.copy(body, 17);
-  body.writeUInt8(0, 17 + text.length);
-  return body;
+  const out: number[] = [0x08];
+  writeVarint(out, BigInt(nameTagId));
+  out.push(0x10);
+  writeVarint(out, BigInt(itemId));
+  out.push(0x22);
+  writeVarint(out, BigInt(text.length));
+  return Buffer.concat([Buffer.from(out), text]);
+}
+
+/** Appends `value` to `out` as a protobuf base-128 varint. */
+function writeVarint(out: number[], value: bigint): void {
+  let rest = value;
+  while (rest >= 0x80n) { out.push(Number((rest & 0x7fn) | 0x80n)); rest >>= 7n; }
+  out.push(Number(rest));
 }
 
 /**
@@ -715,12 +727,7 @@ export function encodeOpenCrate(message: {
   toolItemId?: string; subjectItemId?: string; forRental?: boolean; pointsRemaining?: number; volatileLimit?: number;
 }): Buffer {
   const out: number[] = [];
-  const varint = (value: bigint): void => {
-    let rest = value;
-    while (rest >= 0x80n) { out.push(Number((rest & 0x7fn) | 0x80n)); rest >>= 7n; }
-    out.push(Number(rest));
-  };
-  const field = (number: number, value: bigint): void => { out.push(number << 3); varint(value); };
+  const field = (number: number, value: bigint): void => { out.push(number << 3); writeVarint(out, value); };
   if (message.toolItemId !== undefined && message.toolItemId !== '0') field(1, BigInt(message.toolItemId));
   if (message.subjectItemId !== undefined && message.subjectItemId !== '0') field(2, BigInt(message.subjectItemId));
   if (message.forRental) field(3, 1n);

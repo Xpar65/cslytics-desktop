@@ -27,6 +27,25 @@ A response never skips to step 5. `Submitted` means the request was accepted, no
 exists, and ambiguity survives until an observation resolves it. That is repository rule 1, and it
 is why `classifyAmbiguity` has no branch that guesses.
 
+One kind of answer stands in for the observation of step 4: one that returns the object as it now
+is, and may settle the change it answers. A CSFloat reprice returns the listing, and the answer is
+recorded as an observation of that listing and judged by the rules a read is judged by
+(`orchestrate/csfloat-selling.ts` → `settleOnAnswer`, `db/csfloat.ts` → `recordAnswer`). A Steam
+price change in place names the listing's price, and the answer is recorded as a stated price on
+the listing, with no observation behind it (`surfaces/market.ts` → `recordPriceAnswer`,
+`db/orders.ts` → `stateSteamPrice`). Nothing else in a response is one: an acknowledgement that
+states nothing still waits for a read, and a read begun after such an answer that disagrees with
+it replaces it.
+
+One kind of mutation is sent again with no observation proving it absent: Steam's discard of a
+lower listing price that waits for its confirmation. A discard only drops something of ours that
+is still waiting, or does nothing, so a second send cannot apply an effect twice. A send Steam
+never answered (no HTTP 200 answer of the market's action route came back, whatever the cause)
+is sent again after 30 seconds, 2 minutes and 10 minutes, four sends in all; when none is heard
+the change fails as `withdrawal-unheard`, because the lower price may still be waiting there
+(`surfaces/market.ts` → `recordDiscardAnswer`, `policy/price-change.ts` →
+`PRICE_DISCARD_BACKOFF_MS`).
+
 ## Finding your way in
 
 | Question | Start at |

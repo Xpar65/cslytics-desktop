@@ -95,12 +95,12 @@ export class WorkStore {
   }
 
   step(id: string): WorkStepRow | undefined {
-    return this.db.raw().prepare('SELECT * FROM work_step WHERE id=?').get(id) as WorkStepRow | undefined;
+    return this.db.statement('SELECT * FROM work_step WHERE id=?').get(id) as WorkStepRow | undefined;
   }
 
   /** A command's steps, each account's in hop order. */
   steps(commandId: string, accountId?: string): WorkStepRow[] {
-    return this.db.raw().prepare(`SELECT * FROM work_step WHERE command_id=? ${accountId ? 'AND account_id=?' : ''} ORDER BY account_id, ordinal, id`)
+    return this.db.statement(`SELECT * FROM work_step WHERE command_id=? ${accountId ? 'AND account_id=?' : ''} ORDER BY account_id, ordinal, id`)
       .all(commandId, ...(accountId ? [accountId] : [])) as WorkStepRow[];
   }
 
@@ -137,6 +137,13 @@ export class WorkStore {
   openForTarget(accountId: string, kind: WorkStepKind, targetId: string): WorkStepRow[] {
     return this.db.raw().prepare(`SELECT * FROM work_step WHERE account_id=? AND kind=? AND target_id=? AND state IN ${OPEN_STEP_STATES_SQL} ORDER BY created_at, id`)
       .all(accountId, kind, targetId) as WorkStepRow[];
+  }
+
+  /** When the latest step of a kind about one remote object settled done, or `null` when none has: a listing's last price change in place. */
+  lastDoneAt(accountId: string, kind: WorkStepKind, targetId: string): string | null {
+    const row = this.db.raw().prepare(`SELECT MAX(w.updated_at) AS at FROM work_step w INDEXED BY work_step_target WHERE w.account_id=? AND w.kind=? AND w.target_id=? AND w.state='DONE'`)
+      .get(accountId, kind, targetId) as { at: string | null };
+    return row.at;
   }
 
   /** The hops of one member of a command: the steps sharing the step's command, account and holding, in order. */
@@ -194,11 +201,21 @@ export class WorkStore {
   /**
    * A command of one hop, admitted with its own id: a delist asked for by hand, a buy order placed
    * or cancelled. The work panel reads it as any other hop (consolidation plan §4.4).
+   *
+   * `commandId`, when the caller names one, makes the admission idempotent: a command that already
+   * holds its hop answers with that hop, so a strategy deciding the same thing again after a
+   * restart makes one command, not two (standing buy orders plan D6).
    */
-  lone(commandKind: string, input: Omit<StepInput, 'id' | 'commandId' | 'ordinal'>, authority: CommandAuthority = 'HUMAN'): WorkStepRow {
-    const commandId = randomUUID();
+  lone(commandKind: string, input: Omit<StepInput, 'id' | 'commandId' | 'ordinal'>, authority: CommandAuthority = 'HUMAN', commandId: string = randomUUID()): WorkStepRow {
+    const existing = this.step(`${commandId}:0`);
+    if (existing) return existing;
     this.adoptCommand(commandId, commandKind, input.now, authority);
     return this.insert({ ...input, id: `${commandId}:0`, commandId, ordinal: 0 });
+  }
+
+  /** The one hop of a command of one hop, by the command's id. */
+  loneStep(commandId: string): WorkStepRow | undefined {
+    return this.step(`${commandId}:0`);
   }
 
   /**
@@ -257,6 +274,8 @@ export class WorkStore {
     if (action.state === 'AWAITING_OBSERVATION') return 'AWAITING_OBSERVATION';
     if (action.state === 'DONE') return 'DONE';
     if (action.state === 'FAILED') return 'FAILED';
+    // Sent, and Steam answered that it will act once the phone confirms: the request is out.
+    if (action.resolution === 'AWAITING_CONFIRMATION') return 'SENT';
     return action.resolution === 'OBSERVED_NOT_APPLIED' ? 'RETRYING' : 'QUEUED';
   }
 
@@ -271,12 +290,17 @@ export class WorkStore {
     return this.step(step.id)!;
   }
 
-  /** Every unsettled step of a command that has no attempt yet, stopped on the person's word. */
-  stopUnsent(commandId: string, now: string): WorkStepRow[] {
+  /**
+   * Every unsettled step of a command with nothing sent that can still land, stopped on the
+   * person's word: one with no attempt yet, and one whose only answer was a refusal that put the
+   * same request back to wait (a price change inside Steam's cooldown), which sent nothing.
+   */
+  stopUnsent(commandId: string, now: string, stoppable: (step: WorkStepRow) => boolean = () => true): WorkStepRow[] {
     const stopped: WorkStepRow[] = [];
     for (const step of this.steps(commandId)) {
-      if (step.state !== 'QUEUED') continue;
-      if (step.action_id && this.db.latestAttempt(step.action_id)) continue;
+      if (step.state !== 'QUEUED' || !stoppable(step)) continue;
+      const attempt = step.action_id ? this.db.latestAttempt(step.action_id) : undefined;
+      if (attempt && !(attempt.outcome === 'DEFINITIVELY_REJECTED' && this.db.action(step.action_id!)?.state === 'READY')) continue;
       this.setState(step.id, 'STOPPED', now, 'command-stopped');
       stopped.push(this.step(step.id)!);
     }

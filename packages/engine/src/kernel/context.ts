@@ -9,6 +9,37 @@ import { marketplaceBlock, type MarketplaceConsent } from './marketplace-commitm
 import { TradeStore } from '../db/trades.js';
 
 /**
+ * What a composing host lets standing Steam buy orders do with one account's wallet (requirements
+ * BUY-11; `policy/wallet-admission.ts` admits by it). Here, in the kernel, so the admission policy
+ * and the portfolio read compute the same figures.
+ *
+ * - `multiple` × (`balance` − `reserveCents`) × `safety` is the most every standing order together
+ *   may commit. Steam lets standing orders total more than the wallet holds; how far to lean on
+ *   that is the host's belief, never the engine's.
+ * - `reserveCents` is wallet money something else will spend, kept out of every figure here.
+ * - `maxOpenOrders` is how many orders may stand at once, the account's own and anyone else's.
+ */
+export type BuyOrderAdmissionPolicy = { multiple: number; safety: number; reserveCents: number; maxOpenOrders: number };
+/** One composing host's policy for each account, answered synchronously (a host answers from a cache). */
+export type BuyOrderAdmission = (accountId: string) => BuyOrderAdmissionPolicy;
+/** The desktop's rule, and the default: what the wallet holds, nothing set aside, no count. Today's arithmetic to the cent. */
+export const DEFAULT_BUY_ORDER_ADMISSION: BuyOrderAdmissionPolicy = { multiple: 1, safety: 1, reserveCents: 0, maxOpenOrders: Number.POSITIVE_INFINITY };
+
+/** The checked policy a host gave, or the default. A policy that would let orders commit less than the spendable balance at 1x, or nothing at all, is refused. */
+export function admissionPolicy(admission: BuyOrderAdmission | undefined, accountId: string): BuyOrderAdmissionPolicy {
+  const policy = admission?.(accountId) ?? DEFAULT_BUY_ORDER_ADMISSION;
+  if (!(policy.multiple >= 1) || !(policy.safety > 0) || !(policy.safety <= 1) || !(policy.reserveCents >= 0) || !(policy.maxOpenOrders >= 0)) {
+    throw new Error('A buy-order admission policy needs a multiple of at least 1, a safety in (0, 1], and a reserve and a count of at least 0');
+  }
+  return policy;
+}
+
+/** What standing orders may commit under a policy: `floor(multiple × max(0, balance − reserve) × safety)`. */
+export function commitmentCapCents(balanceCents: number, policy: BuyOrderAdmissionPolicy): number {
+  return Math.floor(policy.multiple * Math.max(0, balanceCents - policy.reserveCents) * policy.safety);
+}
+
+/**
  * Everything a service needs. Passed once at construction so services stay small.
  *
  * No read coalescer here any more: the read broker (`orchestrate/reads.ts`) runs one walk per scope
@@ -22,6 +53,8 @@ export type EngineContext = {
   readonly locks: AccountLock;
   /** Hints that a read is worth doing. Never evidence — see `kernel/signals.ts`. */
   readonly signals: EngineSignals;
+  /** The composing host's buy-order limits, per account; absent, one times the wallet and no count. */
+  readonly buyOrderAdmission?: BuyOrderAdmission | undefined;
   now(): string;
 };
 
@@ -30,7 +63,8 @@ export function createContext(
   ports: EnginePorts,
   governors: AccountEndpointGovernors,
   locks: AccountLock,
-  signals: EngineSignals = new EngineSignals()
+  signals: EngineSignals = new EngineSignals(),
+  buyOrderAdmission?: BuyOrderAdmission
 ): EngineContext {
   return {
     database,
@@ -38,6 +72,7 @@ export function createContext(
     governors,
     locks,
     signals,
+    buyOrderAdmission,
     now: () => ports.clock.now().toISOString()
   };
 }
@@ -57,10 +92,34 @@ export async function executeMutation(
   context: EngineContext,
   action: ActionRow,
   call: () => Promise<MutationOutcome>,
-  validate?: () => void
+  validate?: () => void,
+  answered?: AnswerRecorder,
+  breakerFailure?: BreakerVerdict
 ): Promise<MutationOutcome> {
-  return (await sendMutation(context, action, call, validate)).answer;
+  return (await sendMutation(context, action, call, validate, answered, breakerFailure)).answer;
 }
+
+/**
+ * Whether an answer counts against its kind's circuit breaker: a failure when it does, a success
+ * when it does not. Every `AMBIGUOUS` answer counts, unless the surface that sends the kind passes
+ * its own verdict; only a Steam discard does (`MarketService.discardTripsBreaker`), because an
+ * answer Steam gave to one can be ambiguous and still say the route answers.
+ */
+export type BreakerVerdict = (outcome: MutationOutcome) => boolean;
+
+/** The verdict every kind but one is held to: an ambiguous answer is a failure. */
+export const AMBIGUOUS_IS_FAILURE: BreakerVerdict = (outcome) => outcome.kind === 'AMBIGUOUS';
+
+/**
+ * What a surface records from an answer, in the one transaction that finishes the attempt, so no
+ * settle, wake or restart ever finds the attempt's outcome without it: the venue's own wait, or the
+ * one kind of answer that states its effect (a listing's price named back by the call that changed
+ * it). `at` is when the answer was recorded. It writes the record and nothing else. Should it throw,
+ * the attempt is still finished, alone, with the venue's answer stored on it, and the surface
+ * re-derives what it would have written from that stored answer the next time it looks at the
+ * action (`MarketService.repairPriceAnswer`); the failure is recorded as `answer-record-error`.
+ */
+export type AnswerRecorder = (outcome: MutationOutcome, at: string) => void;
 
 /**
  * One venue call that carries several actions of one kind on one account (CSFloat's bulk accept).
@@ -139,7 +198,9 @@ export async function sendMutation(
   context: EngineContext,
   action: ActionRow,
   call: () => Promise<MutationOutcome>,
-  validate?: () => void
+  validate?: () => void,
+  answered?: AnswerRecorder,
+  breakerFailure: BreakerVerdict = AMBIGUOUS_IS_FAILURE
 ): Promise<SentMutation> {
   if (action.state !== 'READY') throw new Error(`Action ${action.id} is not READY`);
   const governor = context.governors.forMutation(action.account_id, action.kind);
@@ -183,11 +244,11 @@ export async function sendMutation(
       outcome = { kind: 'AMBIGUOUS', cause: classifyAmbiguity(error), raw: errorMessage(error) };
     }
 
-    if (outcome.kind === 'AMBIGUOUS') governor.breaker.failure();
+    if (breakerFailure(outcome)) governor.breaker.failure();
     else governor.breaker.success();
 
     const now = context.now();
-    context.database.finishAttempt(
+    const finish = (): void => context.database.finishAttempt(
       action.id,
       attemptId,
       outcome.kind,
@@ -196,6 +257,18 @@ export async function sendMutation(
       outcome.kind === 'DEFINITIVELY_REJECTED' ? outcome.reason : undefined,
       venueRetryAt(outcome, now)
     );
+    if (answered) {
+      // One transaction: an attempt finished without what its answer said would read, to every
+      // later pass and after a restart, as an answer that said something else.
+      try {
+        context.database.transaction(() => { finish(); answered(outcome, now); });
+      } catch (error) {
+        finish();
+        context.database.addEvent(action.account_id, 'answer-record-error', { actionId: action.id, actionKind: action.kind, message: errorMessage(error) }, now);
+      }
+    } else {
+      finish();
+    }
     // A settled attempt is the strongest available hint that the surfaces which could *prove* its
     // effect are now worth re-reading. It is emphatically not a hint to try again: this signal
     // reaches a scheduler whose only verbs are the `sync*` methods (rule 1).

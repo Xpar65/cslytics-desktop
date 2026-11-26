@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import type { ReleaseStatus, UpdateState } from '../../../shared/release.js';
 import { engine } from '../../lib/engine.js';
 import { Button, KeyValue, Notice, Panel, PanelHeader } from '../../components/ui.js';
+import { formatDateTime } from '../../lib/time.js';
 
 /**
  * Settings › General › About: which build this is, whether a newer one is waiting, where to read what
@@ -86,7 +87,7 @@ function describeUpdate(update: UpdateState): string {
     case 'disabled': return update.reason;
     case 'idle': return 'Not checked yet';
     case 'checking': return 'Checking…';
-    case 'current': return `Up to date · checked ${new Date(update.checkedAt).toLocaleString()}`;
+    case 'current': return `Up to date · checked ${formatDateTime(update.checkedAt)}`;
     case 'downloading': return `Downloading ${update.version} · ${update.percent}%`;
     case 'ready': return `${update.version} is ready to install`;
     case 'error': return `Could not check for updates: ${update.message}`;

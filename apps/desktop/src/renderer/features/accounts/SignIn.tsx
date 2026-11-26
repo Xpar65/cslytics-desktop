@@ -384,7 +384,7 @@ export function SignIn({
                   icon="smartphone"
                   hint={stage.kind === 'guard'
                     ? `${describeGuardMethods(stage.methods)} The code on the phone changes in ${rotation}s.`
-                    : `Optional. Enter one now and it is sent the moment Steam asks — otherwise you will be asked next. Codes change in ${rotation}s.`}
+                    : `Optional. Enter one now to send it when Steam asks, or you will be asked next. Codes change in ${rotation}s.`}
                 >
                   <input
                     ref={codeInput}

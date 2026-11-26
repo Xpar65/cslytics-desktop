@@ -1,3 +1,5 @@
+import type { CurrencyRef } from '../../lib/money.js';
+
 /**
  * Sends this window has made and the engine has not answered yet.
  *
@@ -28,6 +30,12 @@ export type OutboxItem = {
   localId: string | null;
   /** What the seller receives, when the row priced it. */
   receiveCents: number | null;
+  /**
+   * The currency that figure is in, as the row priced it: the wallet's on Steam, US dollars on
+   * CSFloat, a listing strategy's own. Carried because a send may name no marketplace the panel
+   * could read it from, and `null` when nothing named it: the panel then prints no figure.
+   */
+  currency: CurrencyRef;
 };
 
 /**

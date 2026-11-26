@@ -13,7 +13,9 @@ import type { SettingsPage } from '../../lib/sections.js';
 import { accountAttention, type AttentionAction } from './attention.js';
 import { AboutPanel } from './AboutPanel.js';
 import { AppearancePanel } from './AppearancePanel.js';
+import { AppliedValuePanel } from './AppliedValuePanel.js';
 import { CurrencyPanel } from './CurrencyPanel.js';
+import { TimeZonePanel } from './TimeZonePanel.js';
 import { AccountOverview } from './AccountOverview.js';
 import { CsfloatAccountPage } from './CsfloatAccountPage.js';
 import { CslyticsAccountPage } from './CslyticsAccountPage.js';
@@ -196,6 +198,7 @@ export function SettingsView({
           <>
             <AppearancePanel />
             <CurrencyPanel />
+            <TimeZonePanel />
             <Panel>
               <div className="panel-body stack">
                 <Switch
@@ -205,6 +208,7 @@ export function SettingsView({
                 />
               </div>
             </Panel>
+            <AppliedValuePanel />
             <ListingProtection accountId={accounts[0]?.accountId ?? null} remote={remote} />
             <AboutPanel />
           </>

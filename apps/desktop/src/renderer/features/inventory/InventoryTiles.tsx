@@ -1,14 +1,17 @@
 import React, { useCallback, useRef, useState } from 'react';
 import type { InventoryPageRow, PageEnvelope, StoragePageRow } from '@cslytics/engine';
+import type { AppliedValue, NamedAccessory } from '../../../shared/accessories.js';
 import { PagedGrid } from '../../components/PagedGrid.js';
 import { ItemTile, TileAccountBadge, TileBadge, TileWear } from '../../components/ItemTile.js';
 import { Icon } from '../../components/Icon.js';
 import { lockLabel } from '../../lib/labels.js';
 import { itemIsBusy } from '../work/work-busy.js';
-import { lockOf } from './item-actions.js';
+import { listedVenues, lockOf } from './item-actions.js';
+import { ListingMarks, listedOnTitle } from '../../components/ListingMark.js';
 import { unitName, unitOfItem } from './storage-unit.js';
 import { DISPLAY_ONLY_CAPTION, isDisplayOnly } from './display-only.js';
 import { isSelected, pressTile, selectionKey, type InventorySelection } from './selection.js';
+import { extensions } from '../../lib/extensions.js';
 
 /** An inventory row after the host has attached what the catalogue knows. */
 export type NamedItem = InventoryPageRow & {
@@ -25,6 +28,10 @@ export type NamedItem = InventoryPageRow & {
   csfloatSupport?: 'supported' | 'unsupported' | null;
   /** The catalogue's `marketable` for the kind; `false` is a display item (`display-only.ts`). */
   catalogueMarketable?: boolean | null;
+  /** What is applied to the holding, named; absent when it could not be read (`attachAccessories` in main). */
+  accessories?: readonly NamedAccessory[];
+  /** What the stickers and the charm are estimated to add to the item; `null` or absent when nothing applied has a price. */
+  appliedValue?: AppliedValue | null;
 };
 
 /**
@@ -51,10 +58,10 @@ export function InventoryTiles({ accountIds, accounts, filter, selection, onSele
   busyKeys: ReadonlySet<string>;
   multiAccount: boolean;
   /**
-   * The order to page in. A name order is main's to work out from the catalogue: the engine is
-   * handed identity keys in that order and never a name.
+   * The order to page in. A name order is main's to work out from the catalogue, and a price order
+   * from the price cache: the engine is handed keys in that order and never a name or a price.
    */
-  sort: 'name' | 'float' | 'seen';
+  sort: 'name' | 'price' | 'float' | 'seen';
   direction: 'asc' | 'desc';
   /** The catalogue revision. A name order is only as current as the names it was worked out from. */
   namesRevision: string | null;
@@ -117,6 +124,7 @@ export function InventoryTiles({ accountIds, accounts, filter, selection, onSele
       const unit = unitOfItem(row, units);
       // A display item still opens in the inspector, but has no box to tick into a batch.
       const display = isDisplayOnly(row);
+      const listed = listedVenues(row);
       return (
         <ItemTile
           name={unit ? unitName(unit) : row.name}
@@ -132,12 +140,15 @@ export function InventoryTiles({ accountIds, accounts, filter, selection, onSele
           onOpen={() => onSubject(row)}
           onDismiss={() => onSubject(null)}
           onDetail={() => onDetail(row)}
+          accessories={row.accessories}
           badges={<>
             {display ? <TileBadge corner="lock" title={DISPLAY_ONLY_CAPTION}><Icon name="lock" size={11} /></TileBadge>
               : lock ? <TileBadge corner="lock" lock={lock.kind} title={lockLabel(lock.kind, lock.until)}><Icon name="lock" size={11} /></TileBadge> : null}
             {row.location === 'CASKET' ? <TileBadge corner="where" title={`In ${unitLabel(row)}`}><Icon name="archive" size={11} /></TileBadge> : null}
-            {row.steamListed ? <TileBadge corner="where" title="Listed on the Steam Community Market"><Icon name="tag" size={11} /></TileBadge> : null}
+            {/* Listed is beside the place, not one: a listed item is still in main inventory. */}
+            {listed.length > 0 ? <TileBadge corner="where" shape="tag" title={listedOnTitle(listed)}><ListingMarks venues={listed} size={20} decorative /></TileBadge> : null}
             {multiAccount ? <TileAccountBadge name={nameOf(row.accountId)} photo={photoOf(row.accountId)} /> : null}
+            {extensions.holdingBadges?.(row)}
           </>}
           sub={unit ? <span>{row.name}</span> : <TileWear paintWear={row.paintWear} />}
         />

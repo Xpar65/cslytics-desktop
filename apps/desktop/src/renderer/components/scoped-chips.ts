@@ -12,7 +12,7 @@ import { chipAccounts, type FilterChip, type ScopeAccount } from './filter-gramm
  * render of the shell and a dependency on it would re-read every time. `queryScope` is the scope
  * narrowed by any account chips, and is never empty while the scope is not (`chipAccounts`).
  */
-export function useScopedChips(accountIds: readonly string[], accounts: readonly ScopeAccount[]): {
+export function useScopedChips(accountIds: readonly string[], accounts: readonly ScopeAccount[], initial: readonly FilterChip[] = []): {
   chips: FilterChip[];
   setChips: Dispatch<SetStateAction<FilterChip[]>>;
   scope: string;
@@ -20,7 +20,8 @@ export function useScopedChips(accountIds: readonly string[], accounts: readonly
   /** The accounts a chip may name. Naming the only account in view would add a chip that narrows nothing. */
   scopeAccounts: ScopeAccount[];
 } {
-  const [stored, setChips] = useState<FilterChip[]>([]);
+  // `initial` is read once, as the page mounts: a page opened on something starts narrowed to it.
+  const [stored, setChips] = useState<FilterChip[]>(() => [...initial]);
   const scope = accountIds.join('\0');
   const chips = useMemo(
     () => stored.filter((chip) => chip.accountId === undefined || scope.split('\0').includes(chip.accountId)),

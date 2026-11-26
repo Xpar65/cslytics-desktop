@@ -55,6 +55,17 @@ export type BuyOrderBookRow = {
   quantityRemaining: number;
   /** How many the venue has reported bought against this order so far. `null` when it did not say. */
   purchased: number | null;
+  /** The same count as the record keeps it: what a fill posting has been made for. Never null. */
+  filled: number;
+  /**
+   * The command whose create became this order (standing buy orders plan D6), so a caller that
+   * placed it by command id finds it again; `null` for an order made on the website or anywhere else.
+   */
+  commandId: string | null;
+  /** The record's state of the order: an open word, `UNEXPLAINED` while Steam's counter has not said how it left the book, or an `ENDED_` word. */
+  state: string;
+  /** When it ended, for an order an `endedSince` read returned; `null` while it stands. */
+  endedAt: string | null;
   /** Money still committed: the limit times what is left to buy. What a cancel would free. */
   openCents: number;
   /** Steam `ECurrencyCode` of the money. `null` is a Steam wallet this app has not observed. */
@@ -119,21 +130,32 @@ export const BUY_ORDER_BOOK_LIMIT = 1000;
 type SteamRaw = Omit<BuyOrderBookRow, 'venue' | 'constraints' | 'filters' | 'editable' | 'editPending' | 'editFailure'>;
 type CsfloatRaw = {
   accountId: string; buyOrderId: string; hashName: string; priceCents: number; quantity: number; purchased: number | null;
+  filled: number; commandId: string | null; state: string; endedAt: string | null;
   propertiesJson: string | null; cancelSentAt: string | null; cancelFailure: string | null;
   editSentAt: string | null; editPriceCents: number | null; editQuantity: number | null; editParams: string | null; editFailure: string | null;
   firstSeenAt: string | null; observedAt: string | null; observationComplete: number;
 };
 
-/** The open buy orders for a scope, by name, with their money and the walks behind them. */
-export function readBuyOrders(database: EngineDatabase, request: { accountIds: readonly string[] }): BuyOrderBook {
+/**
+ * The open buy orders for a scope, by name, with their money and the walks behind them. With
+ * `endedSince`, the orders that ended at or after that instant come too, with their ending, so a
+ * caller that missed a walk still learns how each of its orders ended; they commit nothing and
+ * count in neither `money` nor `total`.
+ */
+export function readBuyOrders(database: EngineDatabase, request: { accountIds: readonly string[]; endedSince?: string | undefined }): BuyOrderBook {
   const accounts = assertAccountScope(database, request.accountIds);
   const marks = accounts.map(() => '?').join(',');
   const raw = database.raw();
+  const since = request.endedSince ?? null;
 
   const steam = raw.prepare(`
     SELECT b.account_id AS accountId, b.venue_order_id AS buyOrderId, b.hash_name AS hashName,
-      b.price_cents AS priceCents, b.quantity AS quantity, b.quantity - b.filled AS quantityRemaining,
-      b.filled AS purchased, b.price_cents * (b.quantity - b.filled) AS openCents,
+      b.price_cents AS priceCents, b.quantity AS quantity,
+      CASE WHEN b.state LIKE 'ENDED_%' THEN 0 ELSE b.quantity - b.filled END AS quantityRemaining,
+      b.filled AS purchased, b.filled AS filled,
+      CASE WHEN b.state LIKE 'ENDED_%' THEN 0 ELSE b.price_cents * (b.quantity - b.filled) END AS openCents,
+      (SELECT s.command_id FROM work_step s WHERE s.action_id=b.action_id LIMIT 1) AS commandId,
+      b.state AS state, b.ended_at AS endedAt,
       (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=b.account_id ORDER BY w.id DESC LIMIT 1) AS currency,
       (SELECT MIN(a.created_at) FROM action a
         WHERE a.account_id=b.account_id AND a.kind='CANCEL_BUY_ORDER' AND a.target_id=b.venue_order_id
@@ -146,11 +168,14 @@ export function readBuyOrders(database: EngineDatabase, request: { accountIds: r
     FROM venue_order b
     LEFT JOIN observation f ON f.id=b.first_seen_obs
     LEFT JOIN observation o ON o.id=b.last_seen_obs
-    WHERE b.account_id IN (${marks}) AND b.venue='steam' AND b.side='BUY' AND b.first_seen_obs IS NOT NULL AND b.state NOT LIKE 'ENDED_%'`).all(...accounts) as SteamRaw[];
+    WHERE b.account_id IN (${marks}) AND b.venue='steam' AND b.side='BUY' AND b.first_seen_obs IS NOT NULL
+      AND (b.state NOT LIKE 'ENDED_%' OR (? IS NOT NULL AND b.ended_at >= ?))`).all(...accounts, since, since) as SteamRaw[];
 
   const csfloat = raw.prepare(`
     SELECT b.account_id AS accountId, b.venue_order_id AS buyOrderId, b.hash_name AS hashName,
-      b.price_cents AS priceCents, b.quantity AS quantity, b.filled AS purchased, s.properties_json AS propertiesJson,
+      b.price_cents AS priceCents, b.quantity AS quantity, b.filled AS purchased, b.filled AS filled, s.properties_json AS propertiesJson,
+      (SELECT w.command_id FROM work_step w WHERE w.action_id=b.action_id LIMIT 1) AS commandId,
+      b.state AS state, b.ended_at AS endedAt,
       (SELECT MIN(p.created_at) FROM work_step p
         WHERE p.account_id=b.account_id AND p.kind='CSFLOAT_BUY_ORDER_CANCEL' AND p.target_id=b.venue_order_id
           AND p.state IN ${OPEN_STEP_STATES_SQL}) AS cancelSentAt,
@@ -170,14 +195,16 @@ export function readBuyOrders(database: EngineDatabase, request: { accountIds: r
         AND p.state IN ${OPEN_STEP_STATES_SQL} ORDER BY p.created_at, p.id LIMIT 1)
     LEFT JOIN observation f ON f.id=b.first_seen_obs
     LEFT JOIN observation o ON o.id=b.last_seen_obs
-    WHERE b.account_id IN (${marks}) AND b.venue='csfloat' AND b.side='BUY' AND b.first_seen_obs IS NOT NULL AND b.gone_obs IS NULL`).all(...accounts) as CsfloatRaw[];
+    WHERE b.account_id IN (${marks}) AND b.venue='csfloat' AND b.side='BUY' AND b.first_seen_obs IS NOT NULL
+      AND (b.gone_obs IS NULL OR (? IS NOT NULL AND b.ended_at >= ?))`).all(...accounts, since, since) as CsfloatRaw[];
 
   const rows = [...steam.map(fromSteam), ...csfloat.map(fromCsfloat)]
     .sort((left, right) => left.hashName.localeCompare(right.hashName) || left.accountId.localeCompare(right.accountId)
       || left.venue.localeCompare(right.venue) || left.buyOrderId.localeCompare(right.buyOrderId));
 
+  const standing = rows.filter((row) => row.endedAt === null && !row.state.startsWith('ENDED_'));
   const buckets = new Map<string, BuyOrderMoneyBucket>();
-  for (const row of rows) {
+  for (const row of standing) {
     const key = `${row.venue}:${row.currency ?? 'unknown'}`;
     const bucket = buckets.get(key) ?? { venue: row.venue, currency: row.currency, orders: 0, openCents: 0 };
     bucket.orders += 1;
@@ -205,7 +232,7 @@ export function readBuyOrders(database: EngineDatabase, request: { accountIds: r
       balances.push({ accountId, venue: 'CSFLOAT', availableCents: status?.available_cents ?? null, observedAt: status?.observed_at ?? null });
     }
   }
-  return bounded({ kind: 'book' as const, rows: rows.slice(0, BUY_ORDER_BOOK_LIMIT), total: rows.length, money, coverage, balances });
+  return bounded({ kind: 'book' as const, rows: rows.slice(0, BUY_ORDER_BOOK_LIMIT), total: standing.length, money, coverage, balances });
 }
 
 function fromSteam(row: SteamRaw): BuyOrderBookRow {
@@ -229,7 +256,8 @@ function askedFilters(paramsJson: string | null, properties: Record<string, unkn
  */
 function fromCsfloat(row: CsfloatRaw): BuyOrderBookRow {
   const properties = row.propertiesJson === null ? null : JSON.parse(row.propertiesJson) as Record<string, unknown>;
-  const quantityRemaining = row.purchased === null ? row.quantity : Math.max(0, row.quantity - row.purchased);
+  const ended = row.state.startsWith('ENDED_');
+  const quantityRemaining = ended ? 0 : row.purchased === null ? row.quantity : Math.max(0, row.quantity - row.purchased);
   return {
     accountId: row.accountId,
     venue: 'CSFLOAT',
@@ -239,6 +267,10 @@ function fromCsfloat(row: CsfloatRaw): BuyOrderBookRow {
     quantity: row.quantity,
     quantityRemaining,
     purchased: row.purchased,
+    filled: row.filled,
+    commandId: row.commandId,
+    state: row.state,
+    endedAt: ended ? row.endedAt : null,
     openCents: row.priceCents * quantityRemaining,
     currency: CSFLOAT_CURRENCY,
     constraints: describeBuyOrderConstraints(properties),

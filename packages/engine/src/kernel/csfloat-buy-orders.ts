@@ -59,6 +59,22 @@ const MAX_PAINT_SEED = 1000;
 const MAX_LISTED = 100;
 
 /**
+ * CSFloat's price step at a price, in US cents: below $5 a cent; $5 to $10, five cents; $10 to $100,
+ * ten; $100 to $500, a dollar; $500 to $1,000, five dollars; above, ten. This is the venue's own
+ * FAQ on price increments (read 2026-11-12), not a capture: whether the API refuses a price off its
+ * step or rounds it is not known, so a buy order is admitted only on one and nothing is sent to
+ * find out (corpus `csfloat.buy-orders.create`).
+ */
+export function csfloatPriceIncrement(priceCents: number): number {
+  return priceCents < 500 ? 1 : priceCents < 1_000 ? 5 : priceCents < 10_000 ? 10 : priceCents < 50_000 ? 100 : priceCents < 100_000 ? 500 : 1_000;
+}
+
+/** Whether a whole-cent price is one CSFloat's increments allow. */
+export function onCsfloatPriceIncrement(priceCents: number): boolean {
+  return Number.isSafeInteger(priceCents) && priceCents % csfloatPriceIncrement(priceCents) === 0;
+}
+
+/**
  * New constraints for an edit, checked and put in the form the edit route is sent.
  *
  * `PATCH /buy-orders/{id}` takes every constraint absolutely (a live capture of 2026-09-24

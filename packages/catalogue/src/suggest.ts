@@ -72,6 +72,54 @@ export function score(needle: string, target: Prepared): number | null {
   return total;
 }
 
+/**
+ * A name as its words, for the names that stand for many items: a weapon, a type, a collection.
+ *
+ * These are matched by whole words rather than by scattered letters, because picking one shows
+ * every item under it and the list puts them ahead of the item names. `awp` must offer the AWP and
+ * `ak redline` must not, or Enter on a typed skin would open a weapon instead of the skin.
+ */
+export type Worded = {
+  text: string;
+  /** The name's words, then any other words it is known by. */
+  words: readonly string[];
+  /** The name with nothing between its letters and digits, so `ak47` and `tec9` find theirs. */
+  squashed: string;
+};
+
+const WORD_BREAK = /[^a-z0-9]+/;
+
+export function worded(text: string, aliases: readonly string[] = []): Worded {
+  const own = fold(text).split(WORD_BREAK).filter(Boolean);
+  return { text, words: [...own, ...aliases.map(fold)], squashed: own.join('') };
+}
+
+/**
+ * How well `needle` names `target`: 0 when it is the name, 1 when the name starts with it, 2 when
+ * every typed word starts one of the name's words, and `null` otherwise. A typed plural finds its
+ * singular (`pistols`), and one letter finds nothing: it starts too many names to mean any of them.
+ */
+export function startsWords(needle: string, target: Worded): 0 | 1 | 2 | null {
+  const typed = fold(needle).split(WORD_BREAK).filter(Boolean);
+  const squashed = typed.join('');
+  if (squashed.length < 2) return null;
+  if (squashed === target.squashed) return 0;
+  if (target.squashed.startsWith(squashed)) return 1;
+  const starts = (word: string): boolean => target.words.some((candidate) => candidate.startsWith(word));
+  return typed.every((word) => starts(word) || (word.length > 3 && word.endsWith('s') && starts(word.slice(0, -1)))) ? 2 : null;
+}
+
+/** The best `limit` names for `needle` by `startsWords`, the closest first, then the shorter, then by name. */
+export function rankWords<T>(needle: string, rows: Iterable<{ worded: Worded; value: T }>, limit: number): T[] {
+  const hits: Array<{ grade: number; text: string; value: T }> = [];
+  for (const row of rows) {
+    const grade = startsWords(needle, row.worded);
+    if (grade !== null) hits.push({ grade, text: row.worded.text, value: row.value });
+  }
+  hits.sort((left, right) => left.grade - right.grade || left.text.length - right.text.length || left.text.localeCompare(right.text));
+  return hits.slice(0, Math.max(0, limit)).map((hit) => hit.value);
+}
+
 /** The best `limit` matches, highest score first, ties broken by the shorter name then by name. */
 export function rank<T>(
   needle: string,

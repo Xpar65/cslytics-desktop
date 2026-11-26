@@ -36,8 +36,9 @@ export function decode(cursor: string): Cursor {
   let parsed: Cursor;
   try { parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Cursor; }
   catch { throw new Error('cursor is malformed'); }
+  // Five keys at most, each carried as two values by `queryPage` (`afterOf`).
   if (!parsed || typeof parsed.binding !== 'string' || typeof parsed.revision !== 'string' || !Array.isArray(parsed.after)
-    || parsed.after.length > 5 || parsed.after.some(v => typeof v !== 'string' && typeof v !== 'number')) throw new Error('cursor is malformed');
+    || parsed.after.length > 10 || parsed.after.some(v => typeof v !== 'string' && typeof v !== 'number')) throw new Error('cursor is malformed');
   return parsed;
 }
 export function bounded<T>(value: T): T {
@@ -61,7 +62,67 @@ type PageableRequest = {
   direction?: 'asc' | 'desc' | undefined;
 };
 
-/** Shared by every paged read: cursor, revision and bounds. */
+/**
+ * One walk of a paged read past its first page: every row of the read, in page order, as the
+ * statement answered it once, with the position after each row's keys. A read whose statement
+ * costs more than a page (a joined or derived entry list, a sort no index serves) used to run it
+ * twice a page, a count and a sort, so walking a long list cost pages × the whole list (a trading
+ * host's 9,500-entry trade history: 38 pages, 0.2 s of SQL each, on every pass). Keyed by the
+ * cursor's own binding and revision and the statement, so a walk is served from it exactly while
+ * its cursors are good: anything that would make a cursor stale makes a new key.
+ */
+type Walk = { rows: Array<Record<string, Param>>; after: Map<string, number>; total: PageTotals };
+const walks = new WeakMap<EngineDatabase, Map<string, Walk>>();
+/** Walks kept per database, least recently read dropped first: a few readers walking at once, not a history. */
+export const WALKS_KEPT = 8;
+
+/**
+ * A row's place in a keyset, as a cursor carries it: per key, whether it has a value (0 or 1) and the value (0 for
+ * none), never a null. A null cannot be compared (`(a, b) > (?, ?)` with a null is neither true nor false, which
+ * strands every row behind it) and `decode` refuses one, so a page that ended on a row with a missing key used to
+ * answer `cursor is malformed` for the next (seen 2026-11-11 on `listings.page` sorted by name, every few
+ * minutes). `keyColumns` is the same pair in SQL, so the order is SQLite's own: a null first on the way up, last on
+ * the way down. A value no cursor can carry (a blob, an infinity) is named here rather than left for `decode`.
+ */
+function afterOf(row: Record<string, unknown>, keys: readonly string[], domain: string): Param[] {
+  return keys.flatMap((key): Param[] => {
+    const value = row[key];
+    if (value === null || value === undefined) return [0, 0];
+    if (typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value))) return [1, value];
+    throw new Error(`${domain}: the sort key ${key} holds a ${typeof value} no cursor can carry`);
+  });
+}
+
+/** `afterOf` in SQL: the expressions a page is ordered and compared by, two per key. */
+function keyColumns(keys: readonly string[]): string[] {
+  return keys.flatMap((key) => [`(${key} IS NOT NULL)`, `IFNULL(${key}, 0)`]);
+}
+
+function keysOf(row: Record<string, Param>, keys: readonly string[], domain: string): string {
+  return JSON.stringify(afterOf(row, keys, domain));
+}
+
+function walkFor(database: EngineDatabase, id: string, read: () => Walk): Walk {
+  let kept = walks.get(database);
+  if (!kept) { kept = new Map(); walks.set(database, kept); }
+  let walk = kept.get(id);
+  if (walk) kept.delete(id);
+  else walk = read();
+  kept.set(id, walk);
+  while (kept.size > WALKS_KEPT) kept.delete(kept.keys().next().value!);
+  return walk;
+}
+
+/**
+ * Shared by every paged read: cursor, revision and bounds.
+ *
+ * A first page asks for itself alone (a count and one page), so a reader that wants one page pays
+ * for one. A later page is served from the walk (`Walk`): the first cursor page reads the whole list
+ * once, ordered as the pages are, and every page after it is a slice. Its rows are what the
+ * statement answered when that page was read: a walk is a snapshot of the read from its second
+ * page on, never pages cut at different instants. A cursor the walk cannot place falls back to the
+ * row-value comparison.
+ */
 export function queryPage<T>(database: EngineDatabase, request: PageableRequest, domain: string,
   sql: string, params: Param[], keys: string[], totals?: PageTotals): PageEnvelope<T> {
   const accounts = assertAccountScope(database, request.accountIds);
@@ -73,17 +134,36 @@ export function queryPage<T>(database: EngineDatabase, request: PageableRequest,
   const marks = database.revisionMarks(accounts);
   const revision = hash([marks, readRevision(database, accounts)]);
   const cursor = request.cursor ? decode(request.cursor) : undefined;
-  if (cursor && (cursor.binding !== binding || cursor.revision !== revision || cursor.after.length !== keys.length)) return { kind: 'stale-page', reason: 'cursor does not match surface, scope, filter, sort or revision' };
-  const count = totals ?? (() => {
-    const row = database.raw().prepare(`SELECT COUNT(*) AS n FROM (${sql})`).get(...params) as { n: number };
-    return { handles: row.n, quantity: row.n, groups: row.n, rows: row.n };
-  })();
-  const rows = database.raw().prepare(`SELECT * FROM (${sql}) ${cursor ? `WHERE (${keys.join(',')})${descending ? '<' : '>'}(${keys.map(() => '?').join(',')})` : ''} ORDER BY ${keys.map((key) => (descending ? `${key} DESC` : key)).join(',')} LIMIT ?`)
-    .all(...params, ...(cursor?.after ?? []), size + 1) as Array<T & Record<string, Param>>;
+  if (cursor && (cursor.binding !== binding || cursor.revision !== revision || cursor.after.length !== keys.length * 2)) return { kind: 'stale-page', reason: 'cursor does not match surface, scope, filter, sort or revision' };
+  const columns = keyColumns(keys);
+  const order = columns.map((column) => (descending ? `${column} DESC` : column)).join(',');
+  const counted = (n: number): PageTotals => totals ?? { handles: n, quantity: n, groups: n, rows: n };
+  let rows: Array<T & Record<string, Param>> | undefined;
+  let count: PageTotals | undefined;
+  if (cursor) {
+    // Not the parameters: a read judged at the engine's clock (`asOf`) passes a new instant every page.
+    const walk = walkFor(database, `${binding}|${revision}|${hash(sql)}`, () => {
+      const all = database.raw().prepare(`SELECT * FROM (${sql}) ORDER BY ${order}`).all(...params) as Array<Record<string, Param>>;
+      return { rows: all, after: new Map(all.map((row, index) => [keysOf(row, keys, domain), index + 1])), total: counted(all.length) };
+    });
+    const from = walk.after.get(JSON.stringify(cursor.after));
+    if (from !== undefined) {
+      rows = walk.rows.slice(from, from + size + 1) as Array<T & Record<string, Param>>;
+      count = walk.total;
+    }
+  }
+  if (!rows || !count) {
+    count = totals ?? (() => {
+      const row = database.raw().prepare(`SELECT COUNT(*) AS n FROM (${sql})`).get(...params) as { n: number };
+      return counted(row.n);
+    })();
+    rows = database.raw().prepare(`SELECT * FROM (${sql}) ${cursor ? `WHERE (${columns.join(',')})${descending ? '<' : '>'}(${columns.map(() => '?').join(',')})` : ''} ORDER BY ${order} LIMIT ?`)
+      .all(...params, ...(cursor?.after ?? []), size + 1) as Array<T & Record<string, Param>>;
+  }
   const hasNext = rows.length > size;
-  if (hasNext) rows.pop();
+  if (hasNext) rows = rows.slice(0, size);
   const last = rows.at(-1);
   return bounded({ kind: 'page', requestId: randomUUID(), revision, rows,
-    nextCursor: hasNext && last ? Buffer.from(JSON.stringify({ binding, revision, after: keys.map(k => last[k]) })).toString('base64url') : null,
+    nextCursor: hasNext && last ? Buffer.from(JSON.stringify({ binding, revision, after: afterOf(last, keys, domain) })).toString('base64url') : null,
     hasNext, total: count });
 }

@@ -1,23 +1,57 @@
 import type { AccountId, BuyOrderRequest, MutationOutcome } from '@cslytics/ports';
 import type { ActionRow, ObservationRow } from '../db/database.js';
+import type { CommandAuthority } from '../db/alphabets.js';
 import { type EngineContext, executeMutation } from '../kernel/context.js';
 import { ACCOUNT_HISTORY, ACCOUNT_MARKET, attemptReturned, postAttempt, surfaceEvidence, type ProofNeed } from '../kernel/evidence.js';
 import { required } from '../kernel/support.js';
-import { settleNotApplied } from '../kernel/not-applied.js';
-import { requireFreshMoneyEvidence, walletAvailability } from '../policy/wallet-admission.js';
+import { attemptsMade, settleNotApplied } from '../kernel/not-applied.js';
+import { CONFIRM_RETRY_DELAYS_MS } from '../kernel/retry-policy.js';
+import { AdmissionRefused, admissionPolicy, requireFreshMoneyEvidence, walletAvailability, type BuyOrderAdmissionPolicy } from '../policy/wallet-admission.js';
+import { errorMessage } from '../kernel/support.js';
 import { LedgerStore } from '../db/ledger.js';
 import { WorkStore } from '../db/work.js';
-import { OrderStore } from '../db/orders.js';
+import { BUY_ORDER_STATUS_SURFACE, OrderStore } from '../db/orders.js';
+import { ConfirmationStore } from '../db/confirmations.js';
 
 /** Provenance for a fill posting, deliberately outside `FRESHNESS` — see `syncStatuses`. */
-export const BUY_ORDER_STATUS_SURFACE = 'steam-buy-order-status';
+export { BUY_ORDER_STATUS_SURFACE } from '../db/orders.js';
 
 export type BuyOrderParams = { request: BuyOrderRequest; reservationCents: number };
 export type CancelBuyParams = { buyOrderId: string };
 
+/** Whose a buy order or its cancel is, and the id the caller gave its command, if it gave one (standing buy orders plan D6). */
+export type BuyOrderCommandOptions = { commandId?: string | undefined; authority?: CommandAuthority | undefined };
+
+/** A create's action, with what the venue answered its first request; `null` when the command was already admitted and this is its replay. */
+export type BuyOrderCreated = ActionRow & { outcome: MutationOutcome | null };
+
+/**
+ * How many times a create waiting for its phone confirmation is sent again: once for each press the
+ * confirmation schedule allows (`CONFIRM_RETRY_DELAYS_MS`, twelve presses). After the last, it
+ * waits for the walks that settle any create.
+ */
+export const BUY_ORDER_CONFIRMATION_ROUNDS = CONFIRM_RETRY_DELAYS_MS.length + 1;
+
+/**
+ * How long a create waits for its tap with nothing sending it again. A host with a confirmation
+ * port presses on its own schedule, which is over by then; without one the person taps and asks
+ * the engine to continue (`buyOrder.continue`). Past it, the create goes back to the walks that
+ * settle any create, so an order nobody continued is not reserving money for ever (D9).
+ */
+export const BUY_ORDER_CONFIRMATION_WAIT_MS = 2 * 60 * 60_000;
+
 /** Buy-order admission, wallet reservation, cancellation and fill attribution. */
 export class BuyOrderService {
-  constructor(protected readonly context: EngineContext) {}
+  protected readonly confirmations: ConfirmationStore;
+
+  constructor(protected readonly context: EngineContext) {
+    this.confirmations = new ConfirmationStore(context.database);
+  }
+
+  /** The limits the composing host gave this account, or one times the wallet and no count (BUY-11). */
+  protected policy(accountId: AccountId): BuyOrderAdmissionPolicy {
+    return admissionPolicy(this.context.buyOrderAdmission, accountId);
+  }
 
   /**
    * Admits one buy order.
@@ -25,16 +59,21 @@ export class BuyOrderService {
    * Serialised per account, and fails closed when either the wallet or the current-orders
    * observation is incomplete — an order placed on a half-known wallet can overcommit real
    * money (rollout-v3 §4.3 invariant 4).
+   *
+   * A command id the caller already admitted answers with that command's action and sends
+   * nothing: one decision, one order, however often it is made (N-BUY-21).
    */
-  async create(accountId: AccountId, request: BuyOrderRequest): Promise<ActionRow> {
+  async create(accountId: AccountId, request: BuyOrderRequest, admission: BuyOrderCommandOptions = {}): Promise<BuyOrderCreated> {
     return this.context.locks.run(accountId, async () => {
       const { database } = this.context;
-      this.requireCompleteAdmission(accountId);
-
-      // Three claims on one balance — ours, somebody else's at the Steam website, and what is
-      // left — computed once for every wallet spender in `policy/wallet-admission.ts` (N-BUY-05).
-      const available = walletAvailability(database, accountId, request.currency).availableCents;
-      if (available < request.priceTotalCents) throw new Error(`Insufficient unreserved wallet balance: ${available}`);
+      const replay = admission.commandId ? this.admitted(accountId, admission.commandId) : undefined;
+      if (replay) return { ...replay, outcome: null };
+      try {
+        this.requireCompleteAdmission(accountId);
+      } catch (error) {
+        throw error instanceof AdmissionRefused ? error : new AdmissionRefused('STALE_MONEY_EVIDENCE', errorMessage(error));
+      }
+      this.admit(accountId, request);
 
       await this.context.ports.market.getTradeFeeTaxRate(accountId, request.billing);
 
@@ -43,9 +82,14 @@ export class BuyOrderService {
       // The order itself is a `SUBMITTED` row of the one order table until a walk shows it (D4).
       const now = this.context.now();
       const work = new WorkStore(database);
+      // Steam holds one order per name, so a create for a name whose last one no walk has explained
+      // is refused before a command exists (N-BUY-07).
+      if (database.inFlight(accountId, `buy-order:${request.marketHashName}`)) {
+        throw new AdmissionRefused('NAME_IN_FLIGHT', `Resource buy-order:${request.marketHashName} already has an in-flight action`);
+      }
       const action = database.transaction(() => {
         const hop = work.lone('BUY_ORDER_CREATE', { accountId, kind: 'BUY_ORDER_CREATE', targetId: request.marketHashName,
-          params: { request, reservationCents: request.priceTotalCents, hashName: request.marketHashName }, now });
+          params: { request, reservationCents: request.priceTotalCents, hashName: request.marketHashName }, now }, admission.authority ?? 'HUMAN', admission.commandId);
         const queued = database.enqueueAction({ accountId, stepId: hop.id, actionKind: 'CREATE_BUY_ORDER', targetId: request.marketHashName,
           resourceKey: `buy-order:${request.marketHashName}`, params: { request, reservationCents: request.priceTotalCents } satisfies BuyOrderParams, now });
         work.attachAction(hop.id, queued.id, now);
@@ -57,9 +101,46 @@ export class BuyOrderService {
         VALUES (?, 'BUY_ORDER_ACTION', ?, ?, 'SUBMITTED_UNOBSERVED')
       `).run(accountId, action.id, request.priceTotalCents);
 
-      await this.execute(action.id);
-      return required(database.action(action.id), `Action disappeared ${action.id}`);
+      const outcome = await this.execute(action.id);
+      return { ...required(database.action(action.id), `Action disappeared ${action.id}`), outcome };
     });
+  }
+
+  /**
+   * Whether the wallet can carry one more standing order, or why not, as an `AdmissionRefused` code
+   * (BUY-11). Three claims on one balance — ours, somebody else's at the Steam website, and what is
+   * left — computed once for every wallet spender in `policy/wallet-admission.ts` (N-BUY-05), under
+   * the limits the host's policy sets, in this order:
+   *
+   *  1. one unit may not cost more than the wallet holds less what is set aside, because a fill
+   *     spends it from the balance itself, whatever the multiple (N-BUY-17, N-BUY-22);
+   *  2. every standing order together may not pass the cap (N-BUY-17);
+   *  3. no more orders may stand than the policy allows, anyone's counted (N-BUY-23).
+   */
+  protected admit(accountId: AccountId, request: BuyOrderRequest): void {
+    const policy = this.policy(accountId);
+    const admitted = walletAvailability(this.context.database, accountId, request.currency, policy);
+    const unit = Math.floor(request.priceTotalCents / request.quantity);
+    const spendable = admitted.balanceCents - policy.reserveCents;
+    if (unit > spendable) {
+      throw new AdmissionRefused('UNIT_ABOVE_WALLET', `A unit of ${unit} costs more than the wallet holds: ${spendable}${policy.reserveCents ? ` after ${policy.reserveCents} set aside` : ''}`);
+    }
+    if (admitted.availableCents < request.priceTotalCents) throw new AdmissionRefused('COMMITMENT_CAP', `Insufficient unreserved wallet balance: ${admitted.availableCents}`);
+    const standing = this.standingOrderCount(accountId);
+    if (standing >= policy.maxOpenOrders) throw new AdmissionRefused('OPEN_ORDER_CAP', `${standing} buy orders already stand, the most this account allows`);
+  }
+
+  /** How many orders stand against the open-order cap: anyone's, and our creates in flight. Isolated so a saboteur can count only ours. */
+  protected standingOrderCount(accountId: AccountId): number {
+    return new OrderStore(this.context.database).countStandingSteamBuyOrders(accountId);
+  }
+
+  /** The create a command id already admitted for this account, if any. */
+  protected admitted(accountId: AccountId, commandId: string): ActionRow | undefined {
+    const step = new WorkStore(this.context.database).loneStep(commandId);
+    if (!step) return undefined;
+    if (step.account_id !== accountId || step.kind !== 'BUY_ORDER_CREATE') throw new Error(`Command ${commandId} is not a buy order of this account`);
+    return step.action_id ? this.context.database.action(step.action_id) : undefined;
   }
 
   async execute(actionId: string): Promise<MutationOutcome> {
@@ -68,22 +149,74 @@ export class BuyOrderService {
     const params = database.desiredParams(action) as BuyOrderParams;
     const outcome = await new WorkStore(database).send(action.id, () => executeMutation(this.context, action, () =>
       this.context.ports.market.createBuyOrder(action.account_id, params.request)), () => this.context.now());
-    if (outcome.kind === 'DEFINITIVELY_REJECTED') {
-      database.raw().prepare(`UPDATE reservation SET state='RELEASED' WHERE account_id=? AND ref_id=?`)
-        .run(action.account_id, action.id);
-    }
+    this.answered(action.id, outcome);
     return outcome;
   }
 
+  /**
+   * Sends a create waiting for its phone confirmation again, carrying the confirmation's id (D1):
+   * the same action, a second attempt, so everything that keys on the action — the one open create
+   * per name, the reservation, the proof — follows the order whichever request placed it.
+   *
+   * Only a create Steam asked to have confirmed may go again; anything else is refused before it is
+   * sent. The answer is evidence like any other: `success: 1` waits for the walk that binds the
+   * order, the same confirmation again means the tap did not apply.
+   */
+  async repost(actionId: string): Promise<MutationOutcome> {
+    const { database } = this.context;
+    const action = required(database.action(actionId), `Unknown action ${actionId}`);
+    if (action.kind !== 'CREATE_BUY_ORDER' || action.state !== 'READY' || action.resolution !== 'AWAITING_CONFIRMATION') {
+      throw new Error('Only a buy order waiting for its phone confirmation can be continued');
+    }
+    const confirmationId = this.confirmations.requestedConfirmation(action.id);
+    if (confirmationId === null) throw new Error('Steam named no confirmation for this buy order');
+    const params = database.desiredParams(action) as BuyOrderParams;
+    const outcome = await new WorkStore(database).send(action.id, () => executeMutation(this.context, action, () =>
+      this.context.ports.market.createBuyOrder(action.account_id, { ...params.request, confirmationId })), () => this.context.now());
+    this.answered(action.id, outcome);
+    return outcome;
+  }
+
+  /**
+   * What a create's answer does to its action. A refusal releases its money. An answer asking for
+   * a tap puts the action back to `READY` with `AWAITING_CONFIRMATION`, while rounds are left: the
+   * order does not exist yet, so nothing is released and no walk can prove anything about it.
+   */
+  protected answered(actionId: string, outcome: MutationOutcome): void {
+    const { database } = this.context;
+    const now = this.context.now();
+    if (outcome.kind === 'DEFINITIVELY_REJECTED') {
+      database.raw().prepare(`UPDATE reservation SET state='RELEASED' WHERE account_id=(SELECT account_id FROM action WHERE id=?) AND ref_id=?`)
+        .run(actionId, actionId);
+      return;
+    }
+    if (outcome.kind !== 'SUBMITTED' || this.confirmations.requestedConfirmation(actionId) === null) return;
+    if (attemptsMade(database, actionId) > BUY_ORDER_CONFIRMATION_ROUNDS) return;
+    const work = new WorkStore(database);
+    database.transaction(() => {
+      this.confirmations.awaitConfirmation(actionId, now);
+      work.mirror(actionId, now);
+      const hop = work.byAction(actionId);
+      if (hop) work.update(hop.id, { reason: 'Waiting for the phone confirmation' }, now);
+    });
+  }
+
   /** A cancel is a command of one hop (`BUY_ORDER_CANCEL`) named by the order, whose action is the hop's (D3). */
-  queueCancel(accountId: AccountId, buyOrderId: string): ActionRow {
+  queueCancel(accountId: AccountId, buyOrderId: string, admission: BuyOrderCommandOptions = {}): ActionRow {
     const { database } = this.context;
     const now = this.context.now();
     const work = new WorkStore(database);
+    if (admission.commandId) {
+      const step = work.loneStep(admission.commandId);
+      if (step) {
+        if (step.account_id !== accountId || step.kind !== 'BUY_ORDER_CANCEL') throw new Error(`Command ${admission.commandId} is not a buy-order cancel of this account`);
+        return required(step.action_id ? database.action(step.action_id) : undefined, `Cancel ${admission.commandId} has no action`);
+      }
+    }
     const order = new OrderStore(database).steamBuyOrder(accountId, buyOrderId);
     return database.transaction(() => {
       const hop = work.lone('BUY_ORDER_CANCEL', { accountId, kind: 'BUY_ORDER_CANCEL', targetId: buyOrderId,
-        params: { buyOrderId, ...(order ? { hashName: order.hash_name } : {}) }, now });
+        params: { buyOrderId, ...(order ? { hashName: order.hash_name } : {}) }, now }, admission.authority ?? 'HUMAN', admission.commandId);
       const action = database.enqueueAction({ accountId, stepId: hop.id, actionKind: 'CANCEL_BUY_ORDER', targetId: buyOrderId,
         resourceKey: `buy-order-cancel:${buyOrderId}`, params: { buyOrderId } satisfies CancelBuyParams, now });
       work.attachAction(hop.id, action.id, now);
@@ -100,12 +233,15 @@ export class BuyOrderService {
   }
 
   /**
-   * Polls `getbuyorderstatus` and records any new fill.
+   * Polls `getbuyorderstatus` for every order still open, and records any new fill.
    *
    * Two things this deliberately does not do. It does not treat the order's limit as what was
    * paid — `getbuyorderstatus` reports quantities and nothing else, so the ledger posting is
    * `UNKNOWN` until `myhistory` supplies a real `paid_amount` (BUY-06, N-BUY-04). And it does not
    * guess lineage: the lot keeps every candidate and stays `UNATTRIBUTED`.
+   *
+   * Only orders not yet ended are asked about (N-BUY-20): an ended order has nothing left to fill,
+   * and asking about every order ever shown grew the poll with the account's whole history.
    *
    * The status poll gets its own observation row. Its surface is deliberately absent from
    * `FRESHNESS` and `CADENCE`: it is provenance for a posting, not a schedulable walk, and a
@@ -114,7 +250,7 @@ export class BuyOrderService {
   async syncStatuses(accountId: AccountId): Promise<void> {
     const { database } = this.context;
     const store = new OrderStore(database);
-    for (const row of store.steamBuyOrders(accountId)) {
+    for (const row of store.openSteamBuyOrders(accountId)) {
       const buyOrderId = row.venue_order_id!;
       // One HTTP request per order, under the venue's budget: a scope the broker has no need for,
       // since the poll is provenance for a posting and not evidence (read broker plan D12).
@@ -127,14 +263,15 @@ export class BuyOrderService {
           accountId, surface: BUY_ORDER_STATUS_SURFACE, startedAt, finishedAt: this.context.now(),
           complete: true, totalExpected: 1, scopeKind: 'listing', scopeId: buyOrderId
         });
-        store.recordSteamBuyOrderStatus(accountId, row, status, observationId, this.context.now());
+        // The fill first: it moves the reservation, and an ending below settles what is left of it.
         if (delta > 0) {
           // Lineage is not invented: the posting names the order and no holding (consolidation plan D12).
           new LedgerStore(database).recordBuyOrderFill({
             accountId, buyOrderId, purchasedTotal: status.purchased, delta,
-            unitPriceCents: row.price_cents ?? 0, observationId, now: this.context.now()
+            unitPriceCents: row.price_cents ?? 0, observationId, now: this.context.now(), hashName: row.hash_name
           });
         }
+        store.recordSteamBuyOrderStatus(accountId, row, status, observationId, this.context.now());
         if (!status.active) this.settleReservation(accountId, buyOrderId);
       });
     }
@@ -161,6 +298,7 @@ export class BuyOrderService {
   /** Resolves buy-order actions against one complete market observation. */
   reconcile(accountId: AccountId, observationId: number): void {
     const { database } = this.context;
+    this.reconcileAwaitingConfirmation(accountId, observationId);
     for (const action of database.awaitingActionsOfKinds(accountId, ['CREATE_BUY_ORDER', 'CANCEL_BUY_ORDER'])) {
       // A superseded attempt is still *sent*. Refusing to look at it is how a real order, and the
       // wallet money behind it, becomes invisible the moment the user changes their mind
@@ -185,10 +323,7 @@ export class BuyOrderService {
         if (own?.venue_order_id) {
           database.setActionState(action.id, superseded ? 'FAILED' : 'DONE', this.context.now(),
             superseded ? 'superseded-after-the-order-was-created' : undefined);
-          database.raw().prepare(`
-            UPDATE reservation SET ref_kind='BUY_ORDER', ref_id=?, state='ACTIVE'
-            WHERE account_id=? AND ref_kind='BUY_ORDER_ACTION' AND ref_id=?
-          `).run(own.venue_order_id, accountId, action.id);
+          this.bindReservation(accountId, action.id, own.venue_order_id);
         } else if (matches.length === 0) {
           // Absence from the active-order book is exactly as compatible with "created, then
           // filled before anyone looked" as it is with "never created" (BUY-05, N-BUY-02). Only
@@ -225,6 +360,9 @@ export class BuyOrderService {
       } else {
         const params = database.desiredParams(action) as CancelBuyParams;
         const row = new OrderStore(database).steamBuyOrder(accountId, params.buyOrderId);
+        // Gone from the book and not yet explained by Steam's counter: it may have filled before the
+        // cancel reached it, so neither "cancelled" nor "still open" is known yet (N-BUY-18).
+        if (row?.state === 'UNEXPLAINED') continue;
         if (row && !row.state.startsWith('ENDED_')) {
           // Still open on a complete walk that began after the attempt finished. That is the later
           // authoritative observation rule 1 asks for, and it says the cancel did not take: a
@@ -249,6 +387,38 @@ export class BuyOrderService {
         }
       }
     }
+  }
+
+  /**
+   * Creates waiting for their phone confirmation (D2, D9). One a walk has already bound was placed
+   * by the tap alone, so it is done; one nobody sent again within `BUY_ORDER_CONFIRMATION_WAIT_MS`
+   * goes back to the walks that settle any create, which end it as never placed if no walk and no
+   * purchase shows it.
+   */
+  protected reconcileAwaitingConfirmation(accountId: AccountId, observationId: number): void {
+    const { database } = this.context;
+    const now = this.context.now();
+    for (const action of this.confirmations.awaitingConfirmation(accountId)) {
+      const own = new OrderStore(database).byAction(accountId, action.id);
+      if (own?.venue_order_id) {
+        database.resolveAction(action, observationId, true, now);
+        this.bindReservation(accountId, action.id, own.venue_order_id);
+        new WorkStore(database).mirror(action.id, now);
+        continue;
+      }
+      const asked = database.latestAttempt(action.id)?.finished_at ?? action.updated_at;
+      if (Date.parse(now) - Date.parse(asked) < BUY_ORDER_CONFIRMATION_WAIT_MS) continue;
+      this.confirmations.stopAwaitingConfirmation(action.id, now);
+      new WorkStore(database).mirror(action.id, now);
+    }
+  }
+
+  /** The reservation an admitted create held follows the order a walk bound it to. */
+  private bindReservation(accountId: AccountId, actionId: string, buyOrderId: string): void {
+    this.context.database.raw().prepare(`
+      UPDATE reservation SET ref_kind='BUY_ORDER', ref_id=?, state='ACTIVE'
+      WHERE account_id=? AND ref_kind='BUY_ORDER_ACTION' AND ref_id=?
+    `).run(buyOrderId, accountId, actionId);
   }
 
   /**
@@ -291,13 +461,7 @@ export class BuyOrderService {
    * zero is CONSUMED rather than RELEASED, because those are different histories.
    */
   protected settleReservation(accountId: string, buyOrderId: string): void {
-    const { database } = this.context;
-    const row = database.raw().prepare(`SELECT amount_cents FROM reservation
-      WHERE account_id=? AND ref_kind='BUY_ORDER' AND ref_id=? AND state IN ('ACTIVE','SUBMITTED_UNOBSERVED')`)
-      .get(accountId, buyOrderId) as { amount_cents: number } | undefined;
-    if (!row) return;
-    database.raw().prepare(`UPDATE reservation SET state=? WHERE account_id=? AND ref_kind='BUY_ORDER' AND ref_id=?`)
-      .run(row.amount_cents > 0 ? 'RELEASED' : 'CONSUMED', accountId, buyOrderId);
+    new LedgerStore(this.context.database).settleBuyOrderReservation(accountId, buyOrderId);
   }
 
   /**

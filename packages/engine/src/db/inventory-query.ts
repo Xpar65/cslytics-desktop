@@ -1,6 +1,6 @@
 import type { EngineDatabase, ItemRow } from './database.js';
 import { cannotTradeSql } from '../kernel/attributes.js';
-import { steamListedSql } from './commitment.js';
+import { csfloatListedSql, steamListedSql } from './commitment.js';
 
 /**
  * What the engine will filter inventory by.
@@ -39,10 +39,70 @@ export type InventoryFilter = { matchKeys?: readonly string[]; location?: ItemRo
   minWear?: number; maxWear?: number; paintSeed?: number; lock?: LockKind; wearBands?: readonly WearBand[];
   excludeMatchKeys?: readonly string[]; excludeCannotTrade?: boolean;
   /**
-   * `true` keeps the holdings an open Steam listing names, `false` the ones none does. Not a
-   * location: a listed item is in main inventory (`db/commitment.ts`).
+   * `true` keeps the holdings a listing on any marketplace names — Steam's market walk or CSFloat's
+   * stall walk, the row's `steamListed` or `csfloatListed` — and `false` the ones none does. Not a
+   * location: a listed item is in main inventory on either venue (`db/commitment.ts`).
    */
-  listed?: boolean };
+  listed?: boolean;
+  /** What must be applied to a holding: every requirement holds (`AppliedRequirement`). */
+  applied?: readonly AppliedRequirement[] };
+
+/** The two kinds of slot an owner fills: a sticker slot holds a sticker or a patch, the charm slot a charm. */
+export type AppliedSlot = 'sticker-slot' | 'charm-slot';
+/** One kit an applied filter names: a sticker or patch by its sticker kit, a charm by its charm kit and, for a souvenir charm, its highlight. */
+export type AppliedKit = { slot: AppliedSlot; kitId: number; highlight?: number | undefined };
+/**
+ * One thing a holding must have applied, read from `item_accessory`, which every walk rewrites.
+ *
+ * `{ slot }` is anything in that kind of slot: "has stickers", "has a charm". `{ kits }` is any one
+ * of the kits named, which is how a sticker *name* arrives: the host resolves it against the
+ * catalogue into the kits it is, as it resolves an item name into `matchKeys`, and the engine never
+ * sees the name. `kits: []` is a name the catalogue matched to no sticker, patch or charm, and
+ * matches nothing, by the same rule as `matchKeys: []`.
+ */
+export type AppliedRequirement = { slot: AppliedSlot } | { kits: readonly AppliedKit[] };
+
+/** A slot kind as SQL. Spelled from this table and never from the request, so a value that is not one is refused. */
+const SLOT_SQL: Readonly<Record<AppliedSlot, string>> = { 'sticker-slot': "'sticker-slot'", 'charm-slot': "'charm-slot'" };
+
+/**
+ * The applied requirements as predicates on one holding, named by the SQL for its account and its
+ * local id, so the inventory and the listings pages ask them identically.
+ *
+ * Each requirement is one `EXISTS` over the holding's own slots, a seek of `item_accessory`'s key,
+ * whatever else the filter asks. A kit list is one JSON value read by a CTE of its own, as every
+ * other list in these queries is, so a name that resolves to every sticker in the catalogue is one
+ * parameter. The CTEs come first in the text, and so do their parameters.
+ */
+export function appliedPredicates(requirements: readonly AppliedRequirement[], holding: { account: string; local: string }): {
+  lists: string[]; listParams: string[]; clauses: string[];
+} {
+  const lists: string[] = [];
+  const listParams: string[] = [];
+  const clauses: string[] = [];
+  const own = `a.account_id=${holding.account} AND a.local_id=${holding.local}`;
+  requirements.forEach((requirement, index) => {
+    if ('slot' in requirement) {
+      const slot = SLOT_SQL[requirement.slot];
+      if (!slot) throw new Error(`Unknown applied slot ${String(requirement.slot)}`);
+      clauses.push(`EXISTS (SELECT 1 FROM item_accessory a WHERE ${own} AND a.kind=${slot})`);
+      return;
+    }
+    if (requirement.kits.length === 0) { clauses.push('0'); return; }
+    for (const kit of requirement.kits) {
+      if (!SLOT_SQL[kit.slot] || !Number.isSafeInteger(kit.kitId) || (kit.highlight !== undefined && !Number.isSafeInteger(kit.highlight))) {
+        throw new Error('An applied kit names a slot kind and whole-number ids');
+      }
+    }
+    const name = `applied${index}`;
+    lists.push(`${name}(slot, kit, highlight) AS MATERIALIZED (SELECT json_extract(value, '$.slot'), json_extract(value, '$.kitId'), json_extract(value, '$.highlight') FROM json_each(?))`);
+    listParams.push(JSON.stringify(requirement.kits));
+    // A kit with no highlight is any highlight of it: a plain charm has none, and a highlight
+    // charm named without one is still that charm.
+    clauses.push(`EXISTS (SELECT 1 FROM item_accessory a JOIN ${name} k ON k.slot=a.kind AND k.kit=a.kit_id AND (k.highlight IS NULL OR k.highlight=a.highlight) WHERE ${own})`);
+  });
+  return { lists, listParams, clauses };
+}
 export type InventoryQueryPage = { after?: readonly [string, string]; limit?: number };
 
 /**
@@ -62,7 +122,7 @@ export const IDENTITY_MATCH_SQL = "def_index || ':' || IFNULL(paint_index,'') ||
 function filterIsNarrow(filter: InventoryFilter): boolean {
   return Boolean(filter.matchKeys || filter.tradableOnly || filter.location || filter.casketId || filter.listed !== undefined
     || filter.minWear !== undefined || filter.maxWear !== undefined || filter.paintSeed !== undefined
-    || filter.lock || filter.wearBands || filter.excludeMatchKeys?.length || filter.excludeCannotTrade);
+    || filter.lock || filter.wearBands || filter.excludeMatchKeys?.length || filter.excludeCannotTrade || filter.applied?.length);
 }
 
 /** Wear, seed and band predicates are questions about an individual item. A case has no float. */
@@ -119,6 +179,10 @@ export function inventoryQuery(
       FROM json_each(?) b, json_each(b.value, '$.matchKeys') k)`);
     listParams.push(JSON.stringify(bands));
   }
+  // What is applied is asked of either kind: a patched agent is a fungible unit with patches in its sticker slots.
+  const applied = appliedPredicates(filter.applied ?? [], { account: 'inventory.account_id', local: 'inventory.local_id' });
+  lists.push(...applied.lists);
+  listParams.push(...applied.listParams);
   // The engine's clock, bound twice: a lock is over when its end is at or before now (D23).
   const lockFree = '(tradable_after IS NULL OR tradable_after<=?) AND (trade_protected_until IS NULL OR trade_protected_until<=?)';
   const branches = accountIds.flatMap((accountId) => {
@@ -127,7 +191,8 @@ export function inventoryQuery(
       let where = `account_id=? AND location<>'MISSING' AND unit_kind=${commodity ? "'fungible'" : "'individual'"}`;
       params.push(accountId);
       if (filter.location) { where += ' AND location=?'; params.push(filter.location); }
-      if (filter.listed !== undefined) where += ` AND ${filter.listed ? '' : 'NOT '}${steamListedSql('inventory')}`;
+      // Listed on any marketplace: what the row's `steamListed` and `csfloatListed` say, asked the same way.
+      if (filter.listed !== undefined) where += ` AND ${filter.listed ? '' : 'NOT '}(${steamListedSql('inventory')} OR ${csfloatListedSql('inventory')})`;
       if (filter.casketId) { where += ' AND casket_id=?'; params.push(filter.casketId); }
       if (matchKeys) where += matchKeys.length === 0 ? ' AND 0' : ` AND (${match}) IN (SELECT key FROM named)`;
       if (filter.excludeMatchKeys && filter.excludeMatchKeys.length > 0) {
@@ -137,6 +202,7 @@ export function inventoryQuery(
           AND IFNULL((SELECT t.marketable FROM asset_evidence t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community'), 0)<>1)`;
       }
       if (filter.excludeCannotTrade) where += ` AND NOT (${cannotTradeSql('inventory')})`;
+      for (const clause of applied.clauses) where += ` AND ${clause}`;
       if (filter.tradableOnly) {
         // Per unit, for either kind and in any place: free of both locks and of `cannot trade`.
         // The Community read is walked only for a transfer or a sale, so it can take an item out
@@ -192,6 +258,7 @@ export function inventoryQuery(
         tradable_after AS tradableAfter, trade_protected_until AS tradeProtectedUntil, ${match} AS matchKey,
         asset_id AS assetId,
         (${steamListedSql('inventory')}) AS steamListed,
+        (${csfloatListedSql('inventory')}) AS csfloatListed,
         (SELECT t.marketable FROM asset_evidence t WHERE t.account_id=inventory.account_id AND t.asset_id=inventory.asset_id AND t.source='community') AS marketable,
         (${cannotTradeSql('inventory')}) AS cannotTrade${columns?.detected ? `,
         (SELECT o.finished_at FROM observation o WHERE o.id=inventory.first_seen_obs) AS firstSeenAt` : ''}

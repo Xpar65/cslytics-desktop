@@ -235,7 +235,7 @@ export function AccountOverview({ account, remote, connection, connecting, venue
         <ul>
           <li>items, storage units and the moves between them</li>
           <li>listings, buy orders, trades, market history and the ledger</li>
-          <li>work still in progress — Steam may still finish it</li>
+          <li>work still in progress, which Steam may still finish</li>
         </ul>
         <p>The Steam sign-in, the CSFloat key and this account's settings stay. Nothing on Steam or CSFloat is cancelled. History Steam no longer shows, such as old trades, cannot be read back.</p>
         <p className="quiet">CSlytics restarts its engine to do this, so your other accounts reconnect a moment later.</p>
@@ -255,7 +255,7 @@ export function AccountOverview({ account, remote, connection, connecting, venue
         <ul>
           <li>its saved Steam sign-in and CSFloat key</li>
           <li>everything CSlytics recorded about it: items, listings, buy orders, trades, market history and the ledger</li>
-          <li>its settings here, and work still in progress — Steam may still finish it</li>
+          <li>its settings here, and work still in progress, which Steam may still finish</li>
         </ul>
         <p>Nothing on Steam or CSFloat is cancelled. Adding the account again means signing in with Steam Guard or a QR code, and history Steam no longer shows cannot be read back.</p>
         <p className="quiet">CSlytics restarts its engine to do this, so your other accounts reconnect a moment later.</p>

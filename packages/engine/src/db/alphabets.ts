@@ -11,7 +11,9 @@
 /**
  * The hops a command is made of: one row of `work_step` each. `CONFIRM` is the engine's own phone
  * tap for a listing or an offer one of its hops made, only where a host composed a confirmation port
- * (strategy authority and confirmations plan D9).
+ * (strategy authority and confirmations plan D9). `CSFLOAT_BUY_ORDER_CREATE` places a CSFloat buy
+ * order, a command of one hop like its edit and cancel (migration 32). `EDIT_PRICE` changes the
+ * price of an open Steam listing in place, on the same listing (migration 34).
  */
 export const WORK_STEP_KINDS = [
   'DELIST', 'LIST', 'RETRIEVE', 'STORE',
@@ -21,7 +23,9 @@ export const WORK_STEP_KINDS = [
   'CSFLOAT_ACCEPT', 'CSFLOAT_SEND', 'CSFLOAT_NOTIFY', 'CSFLOAT_CANNOT_DELIVER',
   'CSFLOAT_BUY_ORDER_EDIT', 'CSFLOAT_BUY_ORDER_CANCEL',
   'STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL',
-  'CONFIRM'
+  'CONFIRM',
+  'CSFLOAT_BUY_ORDER_CREATE',
+  'EDIT_PRICE'
 ] as const;
 export type WorkStepKind = (typeof WORK_STEP_KINDS)[number];
 

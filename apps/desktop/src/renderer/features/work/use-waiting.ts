@@ -107,9 +107,14 @@ export const STALE_AFTER_MS = 3_600_000;
  * Two independent reasons, and an offer can have both: it has been waiting longer than someone
  * doing this deliberately would take, or it has an expiry Steam will enforce. A listing has no
  * expiry — it simply earns nothing, indefinitely, which is why age alone has to escalate it.
+ *
+ * A lower price's `expiresAt` is not an expiry of that kind: it is the engine's own deadline, an
+ * hour after Steam asked, and always under a day away, so by the offer's rule every lower price
+ * would read "Still not confirmed" the moment it appeared. Its row says when it is dropped
+ * instead, and only age escalates it.
  */
 export function isOverdue(row: WaitingRow, now = Date.now()): boolean {
-  if (row.expiresAt) {
+  if (row.expiresAt && row.kind !== 'LISTING_PRICE_CHANGE') {
     const expires = new Date(row.expiresAt).getTime();
     if (Number.isFinite(expires) && expires - now < 24 * STALE_AFTER_MS) return true;
   }

@@ -34,6 +34,44 @@ export type BusyWorkRow = {
  */
 export const UNSENT_STATES: ReadonlySet<string> = new Set(['PREPARED', 'QUEUED', 'BLOCKED', 'RETRIEVING']);
 
+/**
+ * Why a member waits (`retryCause`) when it is a Steam price change held for its listing's
+ * cooldown: Steam takes one price change per listing every five minutes, and a change asked for
+ * inside that time is held unsent until it ends.
+ */
+export const COOLDOWN_CAUSE = 'cooldown';
+
+/**
+ * Whether a member is a Steam price change held unsent for its listing's cooldown.
+ *
+ * The one test for it, read by everything that words the wait, counts it down or offers to remove
+ * it. It is the cause that says so, on work still open, whatever state the member is reported in:
+ * the work read reports a held change as waiting on its venue, and the state alone means something
+ * else on other work (a CSFloat listing waiting for CSFloat's copy of the inventory).
+ */
+export function isHeldForCooldown(row: { memberState: string; retryCause?: string | null | undefined }): boolean {
+  return row.retryCause === COOLDOWN_CAUSE && isOpenWork(row);
+}
+
+/**
+ * Whether a member still has a hop Stop can halt.
+ *
+ * Its state says so for most work. A Steam price change held for the listing's cooldown is the
+ * exception: it is reported in a waiting state, because it waits on Steam's clock, but nothing has
+ * been sent, and a person who changes their mind inside those minutes can still take it back.
+ */
+export function isUnsent(row: { memberState: string; retryCause?: string | null | undefined }): boolean {
+  return UNSENT_STATES.has(row.memberState) || isHeldForCooldown(row);
+}
+
+/**
+ * Whether a member is a lower Steam price that was sent and waits for its confirmation. Stop
+ * withdraws it: the engine sends Steam a discard, and the listing stays at the price it has.
+ */
+export function isWaitingPriceChange(row: { memberState: string; actionKind?: string | null | undefined }): boolean {
+  return row.memberState === 'AWAITING_CONFIRMATION' && row.actionKind === 'UPDATE_SELL_LISTING_PRICE';
+}
+
 export function isOpenWork(row: Pick<BusyWorkRow, 'memberState'>): boolean {
   return !TERMINAL.has(row.memberState);
 }

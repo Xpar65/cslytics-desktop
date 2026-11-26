@@ -7,6 +7,11 @@ import { CsfloatStore } from '../db/csfloat.js';
 export const CSFLOAT_STALL_SURFACE = 'csfloat-stall';
 /** A walk that has not finished in this many pages has not established anything (CSF-05). */
 export const MAX_STALL_PAGES = 40;
+/**
+ * How many times a walk starts again from its first page when the book's count changes under it
+ * (CSF-59). The pages of every start count against `MAX_STALL_PAGES`.
+ */
+export const MAX_STALL_RESTARTS = 2;
 
 export type StallSyncResult = {
   observationId: number;
@@ -66,8 +71,21 @@ export class CsfloatListingService {
     return observationId;
   }
 
+  /**
+   * Whether a walk whose book changed between two pages starts again from the first page, after
+   * `restarts` starts already. The count changing is the venue's book moving under the read: one
+   * of this account's own creates landing, a sale, a delist. Before CSF-59 such a walk ended
+   * incomplete, which proves nothing (rule 5) yet is the newest stall observation, so every
+   * CSFloat create, delivery and transfer the claim check judged was refused with "Refresh CSFloat
+   * listings" until a walk happened to fall between the account's own sends: a pass of ten creates
+   * on 2026-11-02 failed nine of them at the send. Isolated so a saboteur can give up at once.
+   */
+  protected restartsWhenTheBookMoves(restarts: number): boolean {
+    return restarts < MAX_STALL_RESTARTS;
+  }
+
   protected async walk(accountId: AccountId): Promise<StallSyncResult> {
-    const startedAt = this.context.now();
+    let startedAt = this.context.now();
     const connection = this.store.connection(accountId, CSFLOAT_VENUE);
     if (!connection?.credential_ref || !connection.remote_steam_id || connection.status === 'DISCONNECTED') {
       // Not a failed read: nothing was asked. An unlinked venue is not an empty book.
@@ -82,6 +100,7 @@ export class CsfloatListingService {
     let cursor: string | undefined;
     let totalCount: number | null = null;
     let pages = 0;
+    let restarts = 0;
 
     while (pages < MAX_STALL_PAGES) {
       let result: CsfloatStallResult;
@@ -101,6 +120,18 @@ export class CsfloatListingService {
         collected.push(listing);
       }
       if (this.store.connection(accountId,CSFLOAT_VENUE)?.generation !== connection.generation) return this.incomplete(accountId,startedAt,pages,collected.length,totalCount,'connection-changed');
+      if (result.page.totalCount !== null && totalCount !== null && result.page.totalCount !== totalCount && this.restartsWhenTheBookMoves(restarts)) {
+        // The book moved under the walk: read it again from the first page, as of now, so what is
+        // published is one book read whole after the change (CSF-59).
+        restarts += 1;
+        startedAt = this.context.now();
+        collected.length = 0;
+        seen.clear();
+        cursors.clear();
+        cursor = undefined;
+        totalCount = null;
+        continue;
+      }
       if (result.page.totalCount === null || (totalCount !== null && result.page.totalCount !== totalCount)) return this.incomplete(accountId,startedAt,pages,collected.length,totalCount,'count-missing-or-changed');
       totalCount = result.page.totalCount;
       if (!result.page.nextCursor) {

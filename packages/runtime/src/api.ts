@@ -48,8 +48,23 @@ const wearBand = z.object({
  * itself — a wear tier, a seed, a location — is already a number or an enum on the filter beside
  * this, and never arrives as a name.
  */
+/**
+ * One thing an item must have applied: anything in a kind of slot, or any one of named kits. A
+ * sticker *name* is a chip the caller resolves into kits against its catalogue, and strips, as it
+ * does an item name into `matchKeys`; `kits: []` is a name that matched none and must survive the
+ * trip, because it means "nothing qualifies".
+ */
+const appliedSlot = z.enum(['sticker-slot', 'charm-slot']);
+const appliedRequirement = z.union([
+  z.object({ slot: appliedSlot }).strict(),
+  z.object({ kits: z.array(z.object({
+    slot: appliedSlot,
+    kitId: z.number().int().min(0),
+    highlight: z.number().int().min(0).optional()
+  }).strict()).max(20000).readonly() }).strict()
+]);
 const filterChip = z.object({
-  kind: z.enum(['item','name','category','rarity','collection','norm']),
+  kind: z.enum(['item','name','category','rarity','collection','norm','applied']),
   text: z.string().max(200),
   rarityId: z.string().max(64).optional(),
   quality: z.enum(['stattrak','souvenir','normal']).optional(),
@@ -57,7 +72,7 @@ const filterChip = z.object({
   value: z.number().min(0).max(1).optional()
 }).strict();
 export const inventoryFilterSchema = z.object({ search: z.string().max(200).optional(), location: z.enum(['MAIN','CASKET','MISSING']).optional(),
-  // Listed is not a place: a listed item is in main inventory (engine `db/commitment.ts`).
+  // Listed on any marketplace, and not a place: a listed item is in main inventory (engine `db/commitment.ts`).
   listed: z.boolean().optional(),
   casketId: z.string().optional(), category: z.string().optional(), tradableOnly: z.boolean().optional(),
   matchKeys: z.array(z.string().max(64)).max(20000).readonly().optional(),
@@ -74,6 +89,7 @@ export const inventoryFilterSchema = z.object({ search: z.string().max(200).opti
   excludeDisplayOnly: z.boolean().optional(),
   excludeMatchKeys: z.array(z.string().max(64)).max(20000).readonly().optional(),
   excludeCannotTrade: z.boolean().optional(),
+  applied: z.array(appliedRequirement).max(32).readonly().optional(),
   chips: z.array(filterChip).max(32).optional() }).strict();
 /**
  * What the cross-venue listings page narrows by: the inventory's filter bar, less the questions a
@@ -86,7 +102,7 @@ export const inventoryFilterSchema = z.object({ search: z.string().max(200).opti
  * `matchKeys` and `wearBands` exactly as it does for inventory, then strips it. A typed name is
  * never a chip here for that reason, so `name` is not a kind this schema admits.
  */
-const listingChip = filterChip.extend({ kind: z.enum(['item','category','rarity','collection','norm']) }).strict();
+const listingChip = filterChip.extend({ kind: z.enum(['item','category','rarity','collection','norm','applied']) }).strict();
 export const listingFilterSchema = z.object({
   venue: z.enum(['STEAM','CSFLOAT']).optional(),
   state: z.string().max(64).optional(),
@@ -95,6 +111,14 @@ export const listingFilterSchema = z.object({
   minWear: z.number().min(0).max(1).optional(), maxWear: z.number().min(0).max(1).optional(),
   paintSeed: z.number().int().min(0).max(1000).optional(),
   wearBands: z.array(wearBand).max(64).readonly().optional(),
+  applied: z.array(appliedRequirement).max(32).readonly().optional(),
+  // The listings of these holdings only, by row or asset id: the item inspector's question. As many
+  // as one page of inventory holds.
+  holdings: z.array(z.object({
+    accountId: z.string().min(1),
+    localId: z.string().min(1).max(128),
+    assetId: z.string().max(64).nullable().optional()
+  }).strict()).max(250).readonly().optional(),
   chips: z.array(listingChip).max(32).optional()
 }).strict();
 /**
@@ -137,14 +161,20 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   // `force` is a person's decision to change the price inside the venue's price-change interval; without it an early ask is refused with the next allowed time.
   z.object({ type: z.literal('csfloat.reprice'), commandId: z.string().uuid(), accountId: z.string().min(1), listingId: z.string().min(1).max(64), priceCents: z.number().int().min(3).max(Number.MAX_SAFE_INTEGER), force: z.boolean().optional(), authority }).strict(),
   z.object({ type: z.literal('csfloat.cancel'), commandId: z.string().uuid(), accountId: z.string().min(1), listingId: z.string().min(1).max(64), authority }).strict(),
+  // A new CSFloat buy order for any item of one market name, at a limit per item in USD cents. The
+  // venue takes 1 to 249 and a second order for a name already bid on, so the command id is the
+  // create: the same id with the same terms answers the same command, and never places a second.
+  // The engine refuses a price off CSFloat's increments, and one create of a name at a time.
+  z.object({ type: z.literal('csfloat.buyOrderCreate'), commandId: z.string().uuid(), accountId: z.string().min(1), marketHashName: z.string().min(1).max(256),
+    maxPriceCents: z.number().int().min(3).max(Number.MAX_SAFE_INTEGER), quantity: z.number().int().min(1).max(249), authority }).strict(),
   // A change to, or a cancel of, one of the account's own CSFloat buy orders. The price is the
   // buyer's limit per item in USD cents. `constraints`, when sent, is the order's whole new filter
   // set, as the site's edit dialog sends it; when absent the engine carries the order's own through
   // (kernel/csfloat-buy-orders). Either way the engine checks it and is the gate.
   z.object({ type: z.literal('csfloat.buyOrderEdit'), commandId: z.string().uuid(), accountId: z.string().min(1), orderId: z.string().min(1).max(64),
     maxPriceCents: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER), quantity: z.number().int().min(1).max(100_000),
-    constraints: buyOrderConstraints.optional() }).strict(),
-  z.object({ type: z.literal('csfloat.buyOrderCancel'), commandId: z.string().uuid(), accountId: z.string().min(1), orderId: z.string().min(1).max(64) }).strict(),
+    constraints: buyOrderConstraints.optional(), authority }).strict(),
+  z.object({ type: z.literal('csfloat.buyOrderCancel'), commandId: z.string().uuid(), accountId: z.string().min(1), orderId: z.string().min(1).max(64), authority }).strict(),
   z.object({ type: z.literal('csfloat.deliver'), commandId: z.string().uuid(), accountId: z.string().min(1), tradeId: z.string().min(1).max(64) }).strict(),
   z.object({ type: z.literal('csfloat.deliveryRefresh'), accountId: z.string().min(1), operationId: z.string().max(128) }).strict(),
   // The sales queued together, accepted by one bulk call and then each advanced (CSF-SEND-10).
@@ -215,8 +245,11 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
     pageSize: z.number().int().positive().max(250).optional(),
     // `name` is a window's word and a catalogue's to resolve: it becomes `keys` with a `keyOrder`
     // of identity keys, exactly as a name filter becomes `matchKeys`, and never reaches the engine.
-    sort: z.enum(['localId', 'defIndex', 'keys', 'float', 'seen', 'name']).optional(),
-    keyOrder: z.array(z.string().max(64)).max(20000).readonly().optional(),
+    // `price` is the same for the price cache: it becomes `kinds` with a `keyOrder` of market kinds.
+    sort: z.enum(['localId', 'defIndex', 'keys', 'kinds', 'float', 'seen', 'name', 'price']).optional(),
+    // A summary is capped at 5,000 groups and a group is at most five wear tiers, so a kind order
+    // can be five times the length of a key order.
+    keyOrder: z.array(z.string().max(64)).max(25000).readonly().optional(),
     direction: z.enum(['asc', 'desc']).optional(),
     cursor: z.string().min(1).optional(),
     filter: inventoryFilterSchema.optional()
@@ -248,9 +281,22 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('authority.read'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).min(1).max(1000) }).strict(),
   z.object({ type: z.literal('authority.set'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).min(1).max(1000), authority: z.enum(['HUMAN', 'STRATEGY']) }).strict(),
   z.object({ type: z.literal('csfloat.eligibility'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).max(100) }).strict(),
+  // The stickers, patches and charm applied to each item, by kit id with each sticker's wear. Keys
+  // only: the host names them. Up to a page of items, so a page can be asked about in one read.
+  z.object({ type: z.literal('inventory.accessories'), accountId: z.string().min(1), localIds: z.array(z.string().min(1).max(128)).min(1).max(250) }).strict(),
   z.object({
     type: z.literal('history.page'),
     filter: recordFilter.optional(),
+    accountIds: z.array(z.string().min(1)).min(1).max(32),
+    pageSize: z.number().int().positive().max(250).optional(),
+    cursor: z.string().min(1).optional()
+  }).strict(),
+  // The listing time of each sale and purchase, read from Steam's 2026 history route on the
+  // accounts a host turned it on for, beside the history's own word on the same event. `since` is an
+  // ISO time: only what a walk wrote or quarantined at or after it.
+  z.object({
+    type: z.literal('history.times'),
+    filter: z.object({ since: z.string().datetime({ offset: true }).optional() }).strict().optional(),
     accountIds: z.array(z.string().min(1)).min(1).max(32),
     pageSize: z.number().int().positive().max(250).optional(),
     cursor: z.string().min(1).optional()
@@ -368,7 +414,9 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('command.submit'),
     commandId: z.string().uuid(),
-    kind: z.enum(['STORE', 'RETRIEVE', 'LIST', 'TRANSFER', 'REPRICE', 'DELIST_TO_STORE']),
+    // REPRICE changes a Steam listing's price in place. RELIST is the cancel and new listing a reprice used to be,
+    // kept as a deprecated fallback for a listing Steam will not edit.
+    kind: z.enum(['STORE', 'RETRIEVE', 'LIST', 'TRANSFER', 'REPRICE', 'RELIST', 'DELIST_TO_STORE']),
     members: z.array(z.object({
       accountId: z.string().min(1),
       localId: z.string().uuid(),
@@ -383,7 +431,7 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
     priceReceiveCents: z.number().int().positive().optional(),
     // What the person agreed to store despite, when the pre-check named it (bulk storage plan D9).
     consent: z.array(z.enum(['csfloat-listed', 'csfloat-owed', 'trade-pledged'])).max(3).optional(),
-    // A person's decision to reprice inside the venue's price-change interval; read by a REPRICE only.
+    // A person's decision to change a price inside the venue's price-change interval; read by a REPRICE or a RELIST only.
     force: z.boolean().optional(),
     authority
   }).strict().refine((command) => Boolean((command.members && command.members.length > 0) || command.manifestToken), {
@@ -397,12 +445,24 @@ export const runtimeCommandSchema = z.discriminatedUnion('type', [
     priceTotalCents: z.number().int().positive(),
     quantity: z.number().int().positive(),
     currency: z.number().int().positive(),
-    billingState: z.string().min(1)
+    billingState: z.string().min(1),
+    // The caller's own id for the order's command. The same id answers the same command and its
+    // action, and never places a second order: a decision made again is the decision already made.
+    commandId: z.string().uuid().optional(),
+    authority
   }).strict(),
-  z.object({ type: z.literal('buyOrder.cancel'), accountId: z.string().min(1), buyOrderId: z.string().min(1) }).strict(),
+  z.object({ type: z.literal('buyOrder.cancel'), accountId: z.string().min(1), buyOrderId: z.string().min(1), commandId: z.string().uuid().optional(), authority }).strict(),
+  // A buy order waiting for its phone confirmation, sent again with the confirmation's id once it
+  // was tapped somewhere this engine does not press. `actionId` is the create's, as `waiting.open` names it.
+  z.object({ type: z.literal('buyOrder.continue'), accountId: z.string().min(1), actionId: z.string().min(1) }).strict(),
+  // Steam's per-order counter for every open buy order of one account: what filled since the book
+  // last showed it. Answers the buy-order book as it stands after the poll.
+  z.object({ type: z.literal('buyOrders.syncStatuses'), accountId: z.string().min(1) }).strict(),
   // Every buy order Steam shows open across the named accounts, whole: `mylistings` returns an
   // account's orders on one page, so the book is small and bounded rather than paged.
-  z.object({ type: z.literal('buyOrders.read'), accountIds: accountScope, filter: buyOrderFilterSchema.optional() }).strict(),
+  // `endedSince` (an instant) adds the orders that ended at or after it, with their state and when:
+  // how a caller that missed a walk learns how its orders ended. They commit nothing.
+  z.object({ type: z.literal('buyOrders.read'), accountIds: accountScope, filter: buyOrderFilterSchema.optional(), endedSince: z.string().datetime().optional() }).strict(),
   // The page's refresh: the chosen venue's book read again now for the accounts in view, or both
   // venues' when none is chosen. Through the read budget, never past it.
   z.object({ type: z.literal('buyOrders.refresh'), accountIds: accountScope, venue: z.enum(['STEAM', 'CSFLOAT']).nullable() }).strict(),

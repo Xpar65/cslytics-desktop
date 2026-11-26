@@ -518,8 +518,114 @@ export const MIGRATIONS: readonly Migration[] = [
       // written before this was answered without one.
       addColumn(sqlite, 'attempt', 'retry_after', 'TEXT');
     }
+  },
+  {
+    version: 32,
+    name: 'a CSFloat buy order can be placed',
+    foreignKeysOff: true,
+    up(sqlite) {
+      // A create of a CSFloat buy order is a hop of its own kind, a command of one hop like the
+      // edit and the cancel, which the step alphabet must admit. Nothing else carries the kind in a
+      // CHECK: the action's kind is unchecked text.
+      rebuildTable(sqlite, 'work_step', WORK_STEP_32, "'CSFLOAT_BUY_ORDER_CREATE'",
+        ['id', 'command_id', 'account_id', 'local_id', 'target_id', 'offer_id', 'ordinal', 'kind', 'state', 'action_id', 'desired_id', 'reason', 'params_json', 'observation_id', 'deadline_at', 'created_at', 'updated_at']);
+    }
+  },
+  {
+    version: 34,
+    name: "a Steam listing's price changes in place",
+    foreignKeysOff: true,
+    up(sqlite) {
+      // Until now a Steam `REPRICE` was a cancel and a new listing. That chain keeps running under
+      // its own kind, `RELIST`, and every command a record of the old shape holds as `REPRICE` is
+      // one of them, so each takes the new name before the first `REPRICE` that edits in place is
+      // admitted: a chain found half-way through the upgrade keeps the gate that holds its relist
+      // until the cancel is proved, and a listing's last price change is still dated by the relist
+      // that made it. It runs once, in the transaction that stamps this version, and no build
+      // that admits an in-place `REPRICE` opens a record before that stamp, so it renames nothing
+      // such a build wrote.
+      sqlite.exec("UPDATE command SET kind='RELIST' WHERE kind='REPRICE'");
+      // The edit is a hop of its own kind, which the step alphabet must admit. Its action kinds
+      // (`UPDATE_SELL_LISTING_PRICE`, `DISCARD_SELL_LISTING_PRICE_CHANGE`), the command kind and a
+      // confirmation's kind (`LISTING_PRICE_CHANGE`) are unchecked text and need no rebuild.
+      rebuildTable(sqlite, 'work_step', WORK_STEP_34, "'EDIT_PRICE'",
+        ['id', 'command_id', 'account_id', 'local_id', 'target_id', 'offer_id', 'ordinal', 'kind', 'state', 'action_id', 'desired_id', 'reason', 'params_json', 'observation_id', 'deadline_at', 'created_at', 'updated_at']);
+      // Steam's cooldown on a listing's price, and when a venue answer last stated that price: both
+      // unknown for every listing the record already holds, which is what null says.
+      addColumn(sqlite, 'steam_order', 'reprice_ready_at', 'TEXT');
+      addColumn(sqlite, 'steam_order', 'price_stated_at', 'TEXT');
+    }
+  },
+  {
+    version: 35,
+    name: 'the price an answer stated, kept apart from when it stated it',
+    up(sqlite) {
+      // `price_stated_at` did two jobs: it kept a walk already under way from undoing an answer,
+      // and its being set meant no walk begun after the answer had looked yet. The first walk begun
+      // after the answer cleared it, so a second walk still in flight from before the answer could
+      // then put the old price back. The time is kept from now on, and the second job moves to this
+      // column: the price the answer stated, until a walk begun after it has compared the two.
+      // A row whose time is set under the old rule is one no such walk has looked at, and its price
+      // is still the stated one, so that price is what it is owed a comparison against.
+      addColumn(sqlite, 'steam_order', 'price_stated_cents', 'INTEGER');
+      sqlite.exec(`UPDATE steam_order SET price_stated_cents=(SELECT v.price_cents FROM venue_order v
+        WHERE v.account_id=steam_order.account_id AND v.order_id=steam_order.order_id) WHERE price_stated_at IS NOT NULL AND price_stated_cents IS NULL`);
+    }
+  },
+  {
+    version: 36,
+    name: 'the market minimum a wallet read learned',
+    up(sqlite) {
+      // Steam states each wallet's minimum fee and price (`wallet_market_minimum`), and the fee
+      // rule took it from a table by currency and date instead, which was a day behind when AUD
+      // wallets moved to 2c. A wallet read keeps what Steam stated from now on. NULL on every row
+      // written before this, and on a read that learned none: the table still answers for those.
+      addColumn(sqlite, 'wallet_snapshot', 'market_minimum_cents', 'INTEGER');
+    }
   }
 ];
+
+/** `work_step` as migration 34 rebuilds it: migration 32's shape with `EDIT_PRICE` in its alphabet. */
+const WORK_STEP_34 = `CREATE TABLE IF NOT EXISTS work_step (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL REFERENCES command(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  local_id TEXT,
+  target_id TEXT,
+  offer_id TEXT,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('DELIST', 'LIST', 'RETRIEVE', 'STORE', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL', 'SEND', 'ACCEPT', 'CANCEL', 'CSFLOAT_CREATE', 'CSFLOAT_AWAIT_VENUE', 'CSFLOAT_REPRICE', 'CSFLOAT_CANCEL', 'CSFLOAT_ACCEPT', 'CSFLOAT_SEND', 'CSFLOAT_NOTIFY', 'CSFLOAT_CANNOT_DELIVER', 'CSFLOAT_BUY_ORDER_EDIT', 'CSFLOAT_BUY_ORDER_CANCEL', 'STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL', 'CONFIRM', 'CSFLOAT_BUY_ORDER_CREATE', 'EDIT_PRICE')),
+  state TEXT NOT NULL CHECK(state IN ('QUEUED', 'SENT', 'AWAITING_OBSERVATION', 'RETRYING', 'DONE', 'FAILED', 'STOPPED')),
+  action_id TEXT REFERENCES action(id),
+  desired_id TEXT REFERENCES desired_state(id),
+  reason TEXT,
+  params_json TEXT,
+  observation_id INTEGER REFERENCES observation(id),
+  deadline_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT`;
+
+/** `work_step` as migration 32 rebuilds it: migration 30's shape with `CSFLOAT_BUY_ORDER_CREATE` in its alphabet. */
+const WORK_STEP_32 = `CREATE TABLE IF NOT EXISTS work_step (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL REFERENCES command(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+  local_id TEXT,
+  target_id TEXT,
+  offer_id TEXT,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('DELIST', 'LIST', 'RETRIEVE', 'STORE', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL', 'SEND', 'ACCEPT', 'CANCEL', 'CSFLOAT_CREATE', 'CSFLOAT_AWAIT_VENUE', 'CSFLOAT_REPRICE', 'CSFLOAT_CANCEL', 'CSFLOAT_ACCEPT', 'CSFLOAT_SEND', 'CSFLOAT_NOTIFY', 'CSFLOAT_CANNOT_DELIVER', 'CSFLOAT_BUY_ORDER_EDIT', 'CSFLOAT_BUY_ORDER_CANCEL', 'STORE_INIT', 'STORE_APPROVE', 'STORE_FINALIZE', 'STORE_CANCEL', 'CONFIRM', 'CSFLOAT_BUY_ORDER_CREATE')),
+  state TEXT NOT NULL CHECK(state IN ('QUEUED', 'SENT', 'AWAITING_OBSERVATION', 'RETRYING', 'DONE', 'FAILED', 'STOPPED')),
+  action_id TEXT REFERENCES action(id),
+  desired_id TEXT REFERENCES desired_state(id),
+  reason TEXT,
+  params_json TEXT,
+  observation_id INTEGER REFERENCES observation(id),
+  deadline_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT`;
 
 /** `work_step` as migration 30 rebuilds it: migration 29's shape with `CONFIRM` in its alphabet. */
 const WORK_STEP_30 = `CREATE TABLE IF NOT EXISTS work_step (

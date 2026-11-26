@@ -2,6 +2,7 @@ import type {
   AccountId,
   CredentialVault,
   CsfloatBuyOrder,
+  CsfloatBuyOrderCreate,
   CsfloatBuyOrderEdit,
   CsfloatBuyOrderPage,
   CsfloatBuyOrderPort,
@@ -13,9 +14,9 @@ import { CsfloatTransport, requireKey } from './transport.js';
 import { id as digits, mutationResult, readResult, record, timestamp } from './outcome.js';
 
 /**
- * The account's own buy orders: the book, an edit, a removal.
+ * The account's own buy orders: the book, a create, an edit, a removal.
  *
- * Three routes, each pinned to a capture rather than to the unofficial reference alone:
+ * Four routes, each pinned to a capture rather than to the unofficial reference alone:
  *
  *  - `GET /me/buy-orders?page=&limit=&order=desc` answers `{count, orders}` with the developer
  *    key and no cookie (this repository, 2026-09-11, on two empty books). Paging is by page
@@ -25,6 +26,11 @@ import { id as digits, mutationResult, readResult, record, timestamp } from './o
  *    for none, and answers the order as it now stands (captured 2026-09-23: `{"id","created_at",
  *    "qty","price","market_hash_name","hybrid_properties","bought_item_count"}`). Its budget is two
  *    a minute, which is why an edit is admitted once and sent once.
+ *  - `POST /buy-orders` takes a flat `{market_hash_name, max_price, quantity}` and answers the new
+ *    order in the same row shape (captured 2026-11-07, the developer key alone). `quantity` is an
+ *    unsigned byte the venue bounds to 1-249, a price under three cents is a 500, and a balance
+ *    that does not cover price times quantity is a 422 with code 3. The venue takes a second order
+ *    for a name the account already bids on, so a lost answer is never a reason to send again.
  *  - `DELETE /buy-orders/{id}` answers a `{message}` body on the same 50,000-a-day family as the
  *    reads. The venue says quantity already matched into a trade is unaffected, so a removal is
  *    never read as undoing a fill.
@@ -43,6 +49,17 @@ export class CsfloatBuyOrderAdapter implements CsfloatBuyOrderPort {
       key: await requireKey(this.vault, credential) }), readBuyOrderPage);
   }
 
+  async create(accountId: AccountId, credential: CsfloatCredentialRef, order: CsfloatBuyOrderCreate): Promise<MutationOutcome> {
+    return mutationResult(await this.transport.send({ accountId, method: 'POST', path: '/buy-orders',
+      key: await requireKey(this.vault, credential), body: buyOrderCreateBody(order) }),
+    (body) => {
+      // The reply is the new order. One that names another item or other terms is not an
+      // acknowledgement of this create, and its id is not this create's order.
+      const row = readBuyOrder(body);
+      return row !== null && row.marketHashName === order.marketHashName && row.priceCents === order.maxPriceCents && row.quantity === order.quantity;
+    });
+  }
+
   async update(accountId: AccountId, credential: CsfloatCredentialRef, orderId: string, edit: CsfloatBuyOrderEdit): Promise<MutationOutcome> {
     return mutationResult(await this.transport.send({ accountId, method: 'PATCH', path: `/buy-orders/${encodeURIComponent(orderId)}`,
       key: await requireKey(this.vault, credential), body: buyOrderUpdateBody(edit) }),
@@ -58,6 +75,11 @@ export class CsfloatBuyOrderAdapter implements CsfloatBuyOrderPort {
     return mutationResult(await this.transport.send({ accountId, method: 'DELETE', path: `/buy-orders/${encodeURIComponent(orderId)}`,
       key: await requireKey(this.vault, credential) }), (body) => typeof record(body)?.['message'] === 'string');
   }
+}
+
+/** The wire shape of a create: flat, as captured; nothing else travels. */
+export function buyOrderCreateBody(order: CsfloatBuyOrderCreate): Record<string, unknown> {
+  return { market_hash_name: order.marketHashName, max_price: order.maxPriceCents, quantity: order.quantity };
 }
 
 /**

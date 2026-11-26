@@ -4,6 +4,7 @@ import { PagedRows } from '../../components/PagedRows.js';
 import { Badge, Button, Check, DetailView, Drawer, Empty, IconButton, Notice, Panel, Segmented, Thumbnail } from '../../components/ui.js';
 import { PageHeader } from '../../components/PageHeader.js';
 import { GroupBlock, WearRange } from '../../components/GroupBlock.js';
+import { CompactAccessories } from '../../components/AccessoryStrip.js';
 import { Icon } from '../../components/Icon.js';
 import { Avatar } from '../../components/Avatar.js';
 import { locationLabel, plural } from '../../lib/labels.js';
@@ -16,12 +17,17 @@ import { InventoryTiles, type NamedItem } from './InventoryTiles.js';
 import { InspectorSplit } from '../../components/InspectorSplit.js';
 import { ItemInspector } from './ItemInspector.js';
 import type { StagedItem } from './list-intent.js';
+import { listedVenues } from './item-actions.js';
+import { ListingMarks } from '../../components/ListingMark.js';
+import type { StagedListing } from '../listings/listing-actions.js';
+import type { NamedListing } from '../listings/listing-parts.js';
 import { emptyInventorySelection, selectionKey, selectionQuantity, withPage, type InventorySelection } from './selection.js';
 import { isStorageUnit, itemName, unitGroupName, unitName } from './storage-unit.js';
 import { DISPLAY_ONLY_CAPTION, DISPLAY_ONLY_LABEL, isDisplayOnly } from './display-only.js';
 import { SortControl, type SortDirection, type SortOption } from '../../components/SortControl.js';
 import { compareNames } from '../../../shared/name-order.js';
 import type { Message } from '../../components/ui.js';
+import { extensions } from '../../lib/extensions.js';
 
 export type { InventorySelection };
 export { emptyInventorySelection, selectionQuantity };
@@ -54,11 +60,14 @@ const GROUP_SORTS: ReadonlyArray<SortOption<GroupSort>> = [
 /**
  * A tile is one copy, so its wear is worth ordering by as well as what it is.
  * `seen` is when the holding was first detected: the walk that first showed it, which is also
- * when a later arrival was received. Steam does not report an acquisition date.
+ * when a later arrival was received. Steam does not report an acquisition date. `price` is the
+ * price this app holds for the item, the one the Portfolio values it at (`inventoryPriceOrder` in
+ * main); an item with none is last either way.
  */
-type TileSort = 'name' | 'float' | 'seen';
+type TileSort = 'name' | 'price' | 'float' | 'seen';
 const TILE_SORTS: ReadonlyArray<SortOption<TileSort>> = [
   { id: 'name', label: 'Name', asc: 'A to Z', desc: 'Z to A' },
+  { id: 'price', label: 'Price', asc: 'lowest first', desc: 'highest first' },
   { id: 'float', label: 'Float', asc: 'lowest first', desc: 'highest first' },
   { id: 'seen', label: 'Detected', asc: 'oldest first', desc: 'newest first' }
 ];
@@ -84,7 +93,7 @@ const HIGHLIGHT_CAP = 1_000;
  * as much as a skin: forty cases are forty rows to tick, as they are forty tiles. The inspector on the right is the same panel the tile view uses: click a copy
  * to see the skin and the actions that copy actually allows.
  */
-export function InventoryView({ accountIds, accounts = [], selection, onSelection, selectionOnly = false, onStage, onOpenItem }: {
+export function InventoryView({ accountIds, accounts = [], selection, onSelection, selectionOnly = false, onStage, onReprice, onOpenListing, onOpenItem }: {
   accountIds: string[];
   /** Names (and optional avatar refs and Steam ids) for the ids, so a row can say which account owns it. */
   accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; steamId64?: string | null | undefined; currency?: number | null | undefined }> | undefined;
@@ -93,6 +102,10 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
   selectionOnly?: boolean;
   /** The inspector's *Stage listing*: the shell stages these and holds the workspace. */
   onStage?: ((selected: readonly StagedItem[]) => void) | undefined;
+  /** The inspector's *Reprice*: the item's listings join the shell's reprice workspace, the one Listings stages into. */
+  onReprice?: ((staged: readonly StagedListing[]) => void) | undefined;
+  /** The inspector's *Go to listing*: the Listings page, on that listing. */
+  onOpenListing?: ((listing: NamedListing) => void) | undefined;
   /** Opens the item page for a market name: the book, the history and the curve (plan §7). */
   onOpenItem?: ((name: string) => void) | undefined;
 }): React.JSX.Element {
@@ -350,6 +363,8 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
         { kind: 'unit', text: unitName(unit), accountId: unit.accountId, casketId: unit.casketId }
       ])}
       onStage={(selected) => onStage?.(selected)}
+      onReprice={onReprice}
+      onOpenListing={onOpenListing}
       onDeselect={(key) => {
         const rows = { ...selection.rows };
         delete rows[key];
@@ -445,6 +460,7 @@ export function InventoryView({ accountIds, accounts = [], selection, onSelectio
                   {group.rarity ? <><span className="sep">·</span><span>{group.rarity.name}</span></> : null}
                   {group.collection ? <><span className="sep">·</span><span>{group.collection.name}</span></> : null}
                   {display ? <><span className="sep">·</span><span className="inline" title={DISPLAY_ONLY_CAPTION}><Icon name="lock" size={11} />{DISPLAY_ONLY_LABEL}</span></> : null}
+                  {extensions.holdingBadges?.(group)}
                 </>}
                 counts={<>
                   <span className="count-chip" title="Total quantity in this group"><Icon name="layers" size={11} />{group.quantity.toLocaleString()}</span>
@@ -544,9 +560,11 @@ function GroupItems({ group, filter, selection, onSelection, subject, onSubject,
         <span className="group-name">{name}</span>
         <span className="group-meta">
           <Badge tone={where.tone === 'accent' ? 'accent' : 'quiet'} icon={where.icon}>{where.label}</Badge>
+          <ListingMarks venues={listedVenues(row)} />
           {display ? <span title={DISPLAY_ONLY_CAPTION}>{DISPLAY_ONLY_LABEL}</span> : null}
           {row.paintWear !== null ? <WearRange min={row.paintWear} max={row.paintWear} /> : null}
           {row.paintSeed !== null ? <span>pattern {row.paintSeed}</span> : null}
+          <CompactAccessories accessories={row.accessories} />
           {locked ? <span className="caption" data-tone="warn"><Icon name="lock" size={11} /> trade locked</span> : null}
         </span>
       </button>

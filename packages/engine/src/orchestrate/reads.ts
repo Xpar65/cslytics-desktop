@@ -8,6 +8,7 @@ import { laneOf, type Transport } from '../kernel/governor.js';
 import { BackoffLedger, isRateLimitReason, BLOCKED_ELSEWHERE_RETRY_MS } from '../policy/backoff.js';
 import { baseIntervalMs, hasOpenCommitment, isDue, latestFor, SURFACE_ORDER, type DueVerdict, type Tier } from '../policy/cadence.js';
 import { proofDueAtMs, type ProofDemand } from '../policy/proof.js';
+import { READ_BUDGETS, readBudget, type BudgetVerdict } from '../kernel/read-budget.js';
 import type { InventoryService } from '../surfaces/inventory.js';
 import type { MarketService } from '../surfaces/market.js';
 import type { StorageService } from '../surfaces/storage.js';
@@ -19,6 +20,7 @@ import type { CsfloatListingService } from '../surfaces/csfloat-listings.js';
 import type { CsfloatInventoryService } from '../surfaces/csfloat-inventory.js';
 import type { CsfloatTradeService } from '../surfaces/csfloat-trades.js';
 import type { CsfloatBuyOrderService } from '../surfaces/csfloat-buy-orders.js';
+import type { ListingTimesService } from '../surfaces/listing-times.js';
 import type { Settling } from './settle.js';
 
 /** How often the retention sweep runs for an account. */
@@ -65,6 +67,8 @@ export type ReadServices = {
   csfloatInventory?: CsfloatInventoryService;
   csfloatTrades?: CsfloatTradeService;
   csfloatBuyOrders?: CsfloatBuyOrderService;
+  /** The listing times a host turned on (listing times plan D5). Absent, or off for an account, the surface is not read for it. */
+  listingTimes?: ListingTimesService;
 };
 
 /**
@@ -118,7 +122,8 @@ export interface Reading {
 }
 
 /** What the window is told after a walk. Surfaces only — never rows (continuous freshness plan §4.5). */
-export type RefreshNotice = { accountId: AccountId; surfaces: readonly Surface[]; at: string };
+/** `surfaces` are the walks that changed something, and a per-order read with no walk of its own (`steam-buy-order-status`). */
+export type RefreshNotice = { accountId: AccountId; surfaces: readonly string[]; at: string };
 
 /** Why an account is not currently refreshing, in the words the window shows, and every scope's state. */
 export type RefreshStatus = {
@@ -142,6 +147,7 @@ export const TRANSPORT_OF: Readonly<Record<Surface, Transport>> = {
   'gc-store-price-sheet': 'gc-wire',
   'steam-market': 'steam-web',
   'steam-market-history': 'steam-web',
+  'steam-market-listing-times': 'steam-web',
   'steam-wallet': 'steam-web',
   'steam-trade-offers': 'steam-web',
   'steam-trade-history': 'steam-web',
@@ -158,7 +164,9 @@ export const TRANSPORT_OF: Readonly<Record<Surface, Transport>> = {
 
 /** What one walk came back with. */
 export type WalkResult =
-  | { kind: 'walked'; complete: boolean; observationId: number | null; transport?: Transport; reason?: string }
+  | { kind: 'walked'; complete: boolean; observationId: number | null; transport?: Transport; reason?: string;
+      /** How long the venue said to wait, when it refused the walk for its pace and named a moment. */
+      retryAfterMs?: number }
   | { kind: 'no-venue' }
   | { kind: 'no-session' };
 
@@ -305,6 +313,17 @@ export class ReadBroker implements Reading {
     return [...this.accounts.values()].filter((account) => account.kept).map((account) => account.accountId);
   }
 
+  /**
+   * Looks again, now, at what this account's waiting work needs read. Proof demand is derived from
+   * the record when the worker turns, and a turn is otherwise up to `IDLE_TICK_MS` away: this is
+   * for work that came to need a read with no signal to say so. It raises no need of its own, and
+   * does nothing for an account nobody keeps current.
+   */
+  reconsider(accountId: AccountId): void {
+    const account = this.accounts.get(accountId);
+    if (account?.kept) this.wake(account);
+  }
+
   // --- asking --------------------------------------------------------------
 
   async need(accountId: AccountId, need: Need, signal?: AbortSignal): Promise<ReadOutcome> {
@@ -371,14 +390,20 @@ export class ReadBroker implements Reading {
    * than floods. The reconnect sweep raises the same needs, because "a session just came back" and
    * "the user asked" want the same thing — the one window in which the world could have changed
    * unobserved (continuous freshness plan §1).
+   *
+   * `unasked: true` reads the surfaces with a daily allowance (`READ_BUDGETS`) as work rather than as
+   * a person, as a machine waking does: a person pressing Refresh asked for CSFloat's copy of the
+   * inventory, a laptop lid opening did not, so that read keeps the spacing and the automatic share
+   * the day's 120 reads are budgeted by, and is answered at once when it may not run (CSF-61).
    */
-  async refreshNow(accountId: AccountId, options: { contents?: boolean } = {}): Promise<readonly Surface[]> {
+  async refreshNow(accountId: AccountId, options: { contents?: boolean; unasked?: boolean } = {}): Promise<readonly Surface[]> {
     await this.awaitHandshake(accountId);
     const account = this.account(accountId);
     this.liftHolds(account);
     const refs = this.scopes(accountId, this.demand(accountId)).filter((ref) => options.contents !== false || ref.surface !== 'gc-casket');
     const startedAfter = this.context.now();
-    const outcomes = await Promise.all(refs.map((ref) => this.need(accountId, { ref, startedAfter, priority: 'person' })));
+    const priorityOf = (ref: SurfaceRef): NeedPriority => (options.unasked && READ_BUDGETS[ref.surface] ? 'work' : 'person');
+    const outcomes = await Promise.all(refs.map((ref) => this.need(accountId, { ref, startedAfter, priority: priorityOf(ref) })));
     return [...new Set(refs.filter((_, index) => outcomes[index]!.kind === 'observed').map((ref) => ref.surface))];
   }
 
@@ -534,6 +559,25 @@ export class ReadBroker implements Reading {
   }
 
   /**
+   * Whether a listing-times walk should hand its lane back now: anything at all is queued on another
+   * scope of the same lane, the cadence's wants included. Stricter than `yieldsTo`, because nothing
+   * waits on a listing time, while everything else on the account's web lane is a book, a wallet or
+   * a history some listing or order may be waiting on (listing times plan D5). Isolated so a saboteur can hold the lane.
+   */
+  protected yieldsToAnything(accountId: AccountId, ref: SurfaceRef): () => boolean {
+    return () => {
+      const account = this.accounts.get(accountId);
+      if (!account) return false;
+      const lane = laneOf(TRANSPORT_OF[ref.surface]);
+      for (const scope of account.scopes.values()) {
+        if (scope.ref.surface === ref.surface || laneOf(scope.transport) !== lane) continue;
+        if (scope.needs.some((entry) => entry.state === 'queued')) return true;
+      }
+      return false;
+    };
+  }
+
+  /**
    * Whether a Game Coordinator need waits for the session to come up rather than being refused.
    * It never does: one waited for would be raised again by its cadence and waited for again, and
    * *Refresh now* on a Steam-only account would never answer. Isolated so a saboteur can wait.
@@ -671,11 +715,42 @@ export class ReadBroker implements Reading {
         }
         if (!scope.needs.some((entry) => this.presses(account, scope, entry))) continue;
       }
+      // A surface with a daily allowance is walked only inside it (`kernel/read-budget.ts`, CSF-61).
+      if (!this.withinBudget(account, scope, nowMs)) continue;
       // The bucket is the endpoint's, not the scope's: a venue counts calls to a route, so a
       // hundred listings read one at a time share one route's budget.
       if (!this.context.governors.tryAdmitRead(account.accountId, scope.transport, scope.ref.surface)) continue;
       this.startWalk(account, scope, lane);
     }
+  }
+
+  /**
+   * Whether this scope's walk fits its venue's daily allowance now. Spent, nobody reads, a person
+   * included, and the scope takes a rate limit's hold to the moment the oldest read leaves the
+   * window. Past the automatic share, or inside the spacing between reads, only a person's need
+   * reads. A need somebody waits on that may not read is answered at once with why; a want waits,
+   * and the hold set here wakes the worker when the budget allows.
+   */
+  private withinBudget(account: AccountEntry, scope: ScopeEntry, nowMs: number): boolean {
+    const verdict = this.budgetVerdict(account.accountId, scope.ref.surface, nowMs);
+    if (verdict.kind === 'open') return true;
+    const personMay = verdict.kind === 'person-only';
+    const personReads = (entry: NeedEntry) => personMay && entry.need.priority === 'person';
+    if (scope.needs.some((entry) => entry.state === 'queued' && personReads(entry))) return true;
+    if (verdict.kind === 'spent') this.backoff.rateLimit(account.accountId, scope.name, nowMs, verdict.untilMs);
+    else this.backoff.hold(account.accountId, scope.name, verdict.untilMs - nowMs, nowMs);
+    if (verdict.reason !== null) {
+      scope.holdReason = verdict.reason;
+      account.held = { until: verdict.untilMs, reason: verdict.reason, surface: scope.ref.surface };
+    }
+    const detail = `${verdict.reason ?? 'spacing between reads'}; until ${new Date(verdict.untilMs).toISOString()}`;
+    for (const entry of [...scope.needs]) if (entry.state === 'queued' && entry.resolve && !personReads(entry)) this.answer(scope, entry, refused('incomplete', detail));
+    return false;
+  }
+
+  /** What the budget says about a walk of this surface now. Isolated so a saboteur can read past it. */
+  protected budgetVerdict(accountId: AccountId, surface: Surface, nowMs: number): BudgetVerdict {
+    return readBudget(this.context.database, accountId, surface, nowMs);
   }
 
   /**
@@ -739,7 +814,7 @@ export class ReadBroker implements Reading {
     // The venue's own words when the walk recorded them, so a 429 or a stale session reads as itself.
     const recorded = result.observationId !== null ? this.context.database.observation(accountId, result.observationId) : undefined;
     const reason = result.reason ?? recorded?.error ?? 'incomplete-observation';
-    this.decay(accountId, scope.ref, reason);
+    this.decay(accountId, scope.ref, reason, result.retryAfterMs);
     // An incomplete walk answers no need (rule 5). Whoever waited is told; a want waits the hold out.
     for (const entry of [...walk.needs]) {
       if (entry.resolve) this.answer(scope, entry, refused('incomplete', reason));
@@ -786,6 +861,7 @@ export class ReadBroker implements Reading {
     if (this.context.governors.breakerFor(account.accountId, scope.name).isOpen()) return 'breaker';
     if (isGcSurface(surface) && !this.waitsForSession(scope.ref) && this.context.ports.gc.connectionStatus(account.accountId).state !== 'CONNECTED') return 'no-session';
     if (surface.startsWith('csfloat-') && !this.venue(account.accountId)) return 'no-venue';
+    if (surface === 'steam-market-listing-times' && !this.services.listingTimes?.enabled(account.accountId)) return 'no-venue';
     return undefined;
   }
 
@@ -916,6 +992,12 @@ export class ReadBroker implements Reading {
         return walked(result.observationId, result.complete);
       }
       case 'steam-market-history': return walked(await services.market.orders.syncHistory(accountId, undefined, { yield: this.yieldsTo(accountId, ref) }));
+      case 'steam-market-listing-times': {
+        // Its own observation, on its own surface: whatever this walk does, the history walk's is untouched.
+        if (!services.listingTimes?.enabled(accountId)) return { kind: 'no-venue' };
+        const result = await services.listingTimes.sync(accountId, { yield: this.yieldsToAnything(accountId, ref) });
+        return walked(result.observationId, result.complete);
+      }
       case 'steam-wallet': return walked(await services.market.syncWallet(accountId));
       case 'steam-trade-inventory': return walked(await services.trades.syncEligibility(accountId));
       case 'steam-trade-offers': {
@@ -962,7 +1044,8 @@ export class ReadBroker implements Reading {
       }
       case 'csfloat-inventory': {
         if (!services.csfloatInventory) return { kind: 'no-venue' };
-        return walked(await services.csfloatInventory.sync(accountId));
+        const read = await services.csfloatInventory.sync(accountId);
+        return { ...walked(read.observationId), ...(read.retryAfterMs === undefined ? {} : { retryAfterMs: read.retryAfterMs }) };
       }
     }
   }
@@ -975,6 +1058,11 @@ export class ReadBroker implements Reading {
    * stale second rather than a wrong screen (continuous freshness plan §4.5).
    */
   protected notify(accountId: AccountId, surfaces: readonly Surface[]): void {
+    this.onChanged?.({ accountId, surfaces, at: this.context.now() });
+  }
+
+  /** The same notice for a read made outside the broker: a per-order status poll a host asked for, which no walk carries. */
+  announce(accountId: AccountId, surfaces: readonly string[]): void {
     this.onChanged?.({ accountId, surfaces, at: this.context.now() });
   }
 
@@ -1018,11 +1106,14 @@ export class ReadBroker implements Reading {
       tier: account.tier,
       observation,
       now,
-      hasOpenCommitment: hasOpenCommitment(this.context.database, accountId),
+      // Only the wallet's interval reads it (`baseIntervalMs`); counted for every scope on every turn of the loop it was 18 % of the
+      // loop's CPU at 7,000 orders (measured 2026-11-03).
+      ...(ref.surface === 'steam-wallet' ? { hasOpenCommitment: hasOpenCommitment(this.context.database, accountId) } : {}),
       transferIntervalMs,
       proofDueAtMs: proofDueAtMs(ref, demand, observation?.started_at, now.getTime()),
       backfillPending: (ref.surface === 'steam-market-history' && this.services.market.orders.backfillPending(accountId))
         || (ref.surface === 'steam-trade-history' && this.services.trades.backfillPending(accountId))
+        || (ref.surface === 'steam-market-listing-times' && this.services.listingTimes?.backfillPending(accountId) === true)
     });
   }
 
@@ -1040,6 +1131,8 @@ export class ReadBroker implements Reading {
       const listings = new Set(demand.filter((need) => need.ref.surface === 'csfloat-listing' && need.ref.scope.id).map((need) => need.ref.scope.id!));
       for (const id of listings) refs.push({ surface: 'csfloat-listing', scope: { kind: 'item', id } });
     }
+    // Only for an account a host named: the desktop reads no listing times (listing times plan D5).
+    if (this.services.listingTimes?.enabled(accountId)) refs.push({ surface: 'steam-market-listing-times', scope: { kind: 'account' } });
     const caskets = this.context.database.raw()
       .prepare(`SELECT casket_id FROM storage_unit WHERE account_id=?`)
       .all(accountId) as Array<{ casket_id: string }>;
@@ -1050,15 +1143,16 @@ export class ReadBroker implements Reading {
   /**
    * Backs a scope off after a failed or incomplete walk, from its own interval, and says why in the
    * window's words. A walk the venue refused for its pace earns the rate limit's hold instead: flat,
-   * long, and lifted by nothing but time (`RATE_LIMIT_HOLD_MS`).
+   * long, and lifted by nothing but time — to the moment the venue named when it named one
+   * (`retryAfterMs`), else `RATE_LIMIT_HOLD_MS`.
    */
-  protected decay(accountId: AccountId, ref: SurfaceRef, reason: string): void {
+  protected decay(accountId: AccountId, ref: SurfaceRef, reason: string, retryAfterMs?: number): void {
     const name = this.scopeKey(ref);
     const nowMs = this.context.ports.clock.now().getTime();
     const account = this.account(accountId);
     const base = baseIntervalMs(ref.surface, account.tier);
     const state = isRateLimitReason(reason)
-      ? this.backoff.rateLimit(accountId, name, nowMs)
+      ? this.backoff.rateLimit(accountId, name, nowMs, retryAfterMs === undefined ? undefined : nowMs + retryAfterMs)
       : this.backoff.fail(accountId, name, Number.isFinite(base) ? base : 60_000, nowMs);
     this.scope(account, ref).holdReason = reason;
     account.held = { until: state.notBeforeMs, reason, surface: ref.surface };
@@ -1101,10 +1195,15 @@ export class ReadBroker implements Reading {
       if (signal.state === 'CONNECTED') {
         // The reconnect sweep. The gap is the one window in which the world could have moved
         // with nobody watching (continuous freshness plan §1), so everything is suspect, contents
-        // included: a person need for each, which lifts every hold as *Refresh now* does.
+        // included: a person need for each, which lifts every hold as *Refresh now* does. A surface
+        // with a daily allowance is asked for as work: a session coming back is not a person asking,
+        // and a host whose sessions drop often read CSFloat's copy of the inventory on every
+        // reconnect, one of 120 a day, so it keeps the budget's spacing and automatic share (CSF-61).
         this.liftHolds(account);
         const startedAfter = this.context.now();
-        for (const ref of this.scopes(accountId, this.demand(accountId))) this.want(accountId, { ref, startedAfter, priority: 'person' });
+        for (const ref of this.scopes(accountId, this.demand(accountId))) {
+          this.want(accountId, { ref, startedAfter, priority: READ_BUDGETS[ref.surface] ? 'work' : 'person' });
+        }
       }
       this.wake(account);
       return;
@@ -1114,14 +1213,14 @@ export class ReadBroker implements Reading {
       // decision reads (settling plan D5): waking the worker is all a Steam action needs. Trade and
       // CSFloat sends still nudge, for the drivers that own them.
       const startedAfter = this.context.now();
-      for (const surface of NUDGES[signal.actionKind] ?? []) this.want(accountId, { ref: atAccount(surface), startedAfter, priority: 'work' });
+      for (const surface of this.nudges(signal.actionKind)) this.want(accountId, { ref: atAccount(surface), startedAfter, priority: 'work' });
       if (signal.actionKind.startsWith('trade.')) {
         const batches = this.context.database.raw().prepare(`SELECT s.account_id AS account_id,d.destination_account_id AS destination_account_id
           FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
           WHERE s.kind='SEND' AND (s.account_id=? OR d.destination_account_id=?) AND s.state IN ('QUEUED','SENT','AWAITING_OBSERVATION','RETRYING')`).all(accountId, accountId) as Array<{ account_id: string; destination_account_id: string }>;
         for (const batch of batches) for (const other of [batch.account_id, batch.destination_account_id]) {
           if (other !== accountId && this.accounts.get(other)?.kept) {
-            for (const surface of NUDGES[signal.actionKind] ?? []) this.want(other, { ref: atAccount(surface), startedAfter, priority: 'work' });
+            for (const surface of this.nudges(signal.actionKind)) this.want(other, { ref: atAccount(surface), startedAfter, priority: 'work' });
           }
         }
       }
@@ -1133,6 +1232,11 @@ export class ReadBroker implements Reading {
       if (signal.side === 'BUY') refs.push(...SIGNAL_READS.buyOrderChanged.map(atAccount));
       this.hint(accountId, refs);
     }
+  }
+
+  /** The walks a settled send of this kind asks for (`NUDGES`). Isolated so a saboteur can walk the stall after every edit again (CSF-68). */
+  protected nudges(actionKind: string): readonly Surface[] {
+    return NUDGES[actionKind] ?? [];
   }
 }
 
@@ -1149,14 +1253,17 @@ export const NUDGES: Readonly<Record<string, readonly Surface[]>> = {
   'trade.send': ['steam-trade-offers'],
   'trade.accept': ['steam-trade-offers','steam-trade-history','gc-inventory'],
   'trade.cancel': ['steam-trade-offers','gc-inventory'],
-  // The stall is the book a CSFloat listing appears in, changes price in and leaves. The send is
-  // engine-driven (`CsfloatSellingService.advance`), so this walk is what proves a create, the way
-  // the market walk proves a sellitem. A delist or reprice is proved by the listing's own read,
-  // which is proof demand (`CsfloatSellingService.needs`); the walk here keeps the book current.
+  // The stall is the book a CSFloat listing appears in. The send is engine-driven
+  // (`CsfloatSellingService.advance`), so this walk is what proves a create, the way the market
+  // walk proves a sellitem. A delist or reprice nudges nothing: a reprice is settled on its own
+  // answer and a delist by the listing's own read (proof demand, `CsfloatSellingService.needs`),
+  // and the stall's cadence keeps the book current.
+  // A whole-stall walk after every edit was most of the 50,000 calls a day CSFloat allows one IP:
+  // frequent reprices on a stall of many pages ran the counter dry, and no sale was accepted until
+  // its reset (measured 2026-11-12, CSF-68).
   CSFLOAT_CREATE: ['csfloat-stall'],
-  CSFLOAT_REPRICE: ['csfloat-stall'],
-  CSFLOAT_CANCEL: ['csfloat-stall'],
-  // The own buy-order book is where a CSFloat buy order changes its terms and leaves.
+  // The own buy-order book is where a CSFloat buy order appears, changes its terms and leaves.
+  CSFLOAT_BUY_ORDER_CREATE: ['csfloat-buy-orders'],
   CSFLOAT_BUY_ORDER_EDIT: ['csfloat-buy-orders'],
   CSFLOAT_BUY_ORDER_CANCEL: ['csfloat-buy-orders']
 };

@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { bucketStart, formatTimeTick, isHourly, nearestIndex, niceScale, timeTicks, volumeBars, type VolumeUnit } from './chart-math.js';
+import { formatInZone } from '../../lib/time.js';
 
 /**
  * One interactive line chart over time, drawn in SVG at the size it is shown, with no library.
@@ -104,7 +105,7 @@ export function PriceChart({ series, formatY, formatTick = formatY, ariaLabel, h
 
   const hovered = hover === null ? null : primary.points[hover] ?? null;
   const rows = hovered === null ? [] : tooltipRows(drawn, hovered.x);
-  const pointerLabel = hovered === null ? '' : new Date(hovered.x).toLocaleString(undefined, isHourly(primaryXs, hover!)
+  const pointerLabel = hovered === null ? '' : formatInZone(hovered.x, isHourly(primaryXs, hover!)
     ? { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }
     : { day: 'numeric', month: 'short', year: 'numeric' });
   // The bar under the pointer, which the tooltip reads rather than the row: a row is an hour or a

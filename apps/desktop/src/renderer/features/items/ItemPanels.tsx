@@ -3,6 +3,7 @@ import type { BookLevel, StoredBook } from '@cslytics/market-data';
 import type { ItemCurve, ItemHistory, ItemPage, ItemVariants } from '../../../shared/market.js';
 import { Tip } from '../../components/Tip.js';
 import { Empty, Notice, Panel, PanelHeader, Pill, Segmented, Skeleton } from '../../components/ui.js';
+import { useNow } from '../../lib/clock.js';
 import { useCurrency } from '../../lib/currency.js';
 import { engine } from '../../lib/engine.js';
 import { amountParts, conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick } from '../../lib/money.js';
@@ -12,6 +13,7 @@ import { FloatCurveChart, type CurveLayers, type CurveWear } from './FloatCurveC
 import { stagedMarks, type StagedUnit } from './staged-marks.js';
 import { ageLabel, bookChanges, liveness, midOf, type BookChanges, type LevelChange, type Move } from './live-book.js';
 import { PriceChart, type ChartSeries } from './PriceChart.js';
+import { formatDateTime } from '../../lib/time.js';
 
 /**
  * The Items page's parts (portfolio and pricing plan §7): the quote in the header, the order book
@@ -92,17 +94,11 @@ function Flash({ change, read }: { change: LevelChange; read: string }): React.J
   return change ? <span key={read} className="items-flash" data-change={change} aria-hidden="true" /> : null;
 }
 
-/** The wall clock, re-read once a second, so a live mark turns to an age when the reads stop. */
-function useNow(): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1_000);
-    return () => clearInterval(timer);
-  }, []);
-  return now;
-}
-
-/** "Live" with a beating dot while reads keep arriving, and the book's age once they stop. */
+/**
+ * "Live" with a beating dot while reads keep arriving, and the book's age once they stop. The
+ * clock is read once a second for as long as the mark is shown, so a live mark turns to an age
+ * when the reads stop.
+ */
 function LiveMark({ book }: { book: StoredBook }): React.JSX.Element {
   const { live, ageMs } = liveness(book.observedAt, useNow());
   const code = currencyCodeOf(book.currency);
@@ -114,7 +110,7 @@ function LiveMark({ book }: { book: StoredBook }): React.JSX.Element {
         label="About the live book"
         content={live
           ? `Steam's order book, read every 5 s while this page is open. Last read ${age}, from this connection, in ${code}. What a read changes flashes.`
-          : `Last read ${age} (${new Date(book.observedAt).toLocaleString()}), in ${code}. No newer read has landed since; the page keeps asking every 5 s.`}
+          : `Last read ${age} (${formatDateTime(book.observedAt)}), in ${code}. No newer read has landed since; the page keeps asking every 5 s.`}
       >
         {live ? 'Live' : `Delayed · ${age}`}
       </Tip>
@@ -367,7 +363,7 @@ export function CurvePanel({ name, variants, staged = NO_STAGED }: {
       <PanelHeader
         title="Float curve"
         icon="activity"
-        subtitle={own ? <span title={own.computedAt ? `Computed ${new Date(own.computedAt).toLocaleString()} by CSlytics from ${own.venue === 'steam' ? 'Steam' : 'CSFloat'} listings` : undefined}>{own.currency}{own.computedAt ? ` · ${freshness(own.computedAt, new Date()).label}` : ''}</span> : null}
+        subtitle={own ? <span title={own.computedAt ? `Computed ${formatDateTime(own.computedAt)} by CSlytics from ${own.venue === 'steam' ? 'Steam' : 'CSFloat'} listings` : undefined}>{own.currency}{own.computedAt ? ` · ${freshness(own.computedAt, new Date()).label}` : ''}</span> : null}
         actions={<Segmented label="Venue" value={venue} onChange={setVenue} options={VENUES} />}
       />
       <div className="panel-body" data-testid="item-curve" data-state={state} data-venue={venue}>

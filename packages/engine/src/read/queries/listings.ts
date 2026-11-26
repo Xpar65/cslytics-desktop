@@ -1,10 +1,14 @@
+import { buyerPaysFor } from '@cslytics/ports';
+import { feeTermsNow, latestWalletStatement } from '../../kernel/wallet-terms.js';
 import type { EngineDatabase } from '../../db/database.js';
-import type { WearBand } from '../../db/inventory-query.js';
+import { appliedPredicates, type AppliedRequirement, type WearBand } from '../../db/inventory-query.js';
 import { MarketplaceStore } from '../../db/marketplace.js';
 import { CSFLOAT_CURRENCY } from '../../db/csfloat.js';
 import { PRICE_CHANGE, nextPriceChangeAt } from '../../kernel/price-cadence.js';
 import { AuthorityStore } from '../../db/authority.js';
 import type { CommandAuthority } from '../../db/alphabets.js';
+import { OPEN_STEP_STATES_SQL } from '../../db/work.js';
+import { priceChangeConfirmer } from '../../kernel/listing-price.js';
 import { assertAccountScope, queryPage, type PageEnvelope } from './paging.js';
 
 /**
@@ -60,7 +64,19 @@ export type ListingFilter = {
   maxWear?: number | undefined;
   paintSeed?: number | undefined;
   wearBands?: readonly WearBand[] | undefined;
+  /** What must be applied to the listed item, asked of the holding the listing names; one that names none has nothing applied that this app saw. */
+  applied?: readonly AppliedRequirement[] | undefined;
+  /**
+   * Only the listings that name one of these holdings. A listing names its holding by the row a
+   * walk bound it to or by the asset id a list → cancel keeps (rule 3), and either answers, as
+   * `db/commitment.ts` asks whether a holding is listed: an item's `steamListed` or
+   * `csfloatListed` and the listings this finds for it are one question. The item inspector asks
+   * it of the items it shows. `[]` matches nothing.
+   */
+  holdings?: readonly ListingHolding[] | undefined;
 };
+/** A holding as a listing may name it. */
+export type ListingHolding = { accountId: string; localId: string; assetId?: string | null | undefined };
 export type ListingPageRequest = {
   accountIds: readonly string[];
   pageSize?: number | undefined;
@@ -106,12 +122,33 @@ export type ListingPageRow = {
   observedAt: string | null;
   observationComplete: number;
   /**
-   * When this app last changed the listing's price: a Steam listing's create attempt when it was a
-   * reprice's, the last proved CSFloat reprice. `null` is a listing never repriced from here.
+   * When this app last changed the listing's price: for a Steam listing the later of its last
+   * settled price change in place and its create attempt when that was a relist's; the last CSFloat
+   * reprice that ended done, on its answer or on a read. `null` is a listing never repriced from here.
    */
   lastPriceChangeAt: string | null;
-  /** The earliest the venue's price-change cadence admits another change (`kernel/price-cadence.ts`); `null` is now. */
+  /**
+   * The earliest the venue's price-change cadence admits another change (`kernel/price-cadence.ts`);
+   * `null` is now. On Steam it binds a strategy's change and a relist; a person's change in place
+   * is bound by `repriceReadyAt` alone.
+   */
   nextPriceChangeAt: string | null;
+  /**
+   * When Steam's cooldown on this listing's price ends, as an ISO-8601 instant like every time on
+   * this row: Steam takes one price change per listing every five minutes, counted from when it
+   * went live and from every change it accepted. `null` is not known to be in cooldown, which is
+   * every CSFloat row and a Steam listing nothing has timed. A change asked for before it is
+   * admitted and sent when it ends.
+   */
+  repriceReadyAt: string | null;
+  /**
+   * A lower price Steam has accepted for this listing and holds until it is confirmed: what the
+   * seller would receive and a buyer pay, when Steam answered that it holds it (an ISO-8601
+   * instant), and who confirms it. The listing is still on the market at the prices this row
+   * carries. `null` when none waits, and on every CSFloat row. `awaitingConfirmation` is a
+   * different wait: the listing itself is not live yet.
+   */
+  pendingPriceChange: { receiveCents: number; buyerCents: number; askedAt: string; confirmBy: 'phone' | 'email' } | null;
   /**
    * Who may act on the listing's holding (strategy authority plan D5): `HUMAN` a person holds it and
    * a strategy's change is refused, `STRATEGY` a strategy may act, `null` nobody has said, or the
@@ -187,19 +224,55 @@ export function pageListings(database: EngineDatabase, request: ListingPageReque
       // The sort column is the cursor's business, not the row's.
       delete row.sortValue;
       // The plain interval: a read does not know the price to come, so it cannot say whether the
-      // drift exception would apply (`priceChangeRefusal` does, at admission).
+      // drift exception would apply (`priceChangeRefusal` does, at admission). On Steam it is when
+      // a relist may follow; a change in place waits for `repriceReadyAt` alone.
       row.nextPriceChangeAt = row.lastPriceChangeAt ? nextPriceChangeAt(row.lastPriceChangeAt, PRICE_CHANGE[row.venue === 'STEAM' ? 'steam' : 'csfloat']) : null;
       row.authority = null;
+      row.pendingPriceChange = null;
     }
-    // Whose each holding is, asked once per account for the whole page.
+    // Whose each holding is, and which lower prices wait for a confirmation, each asked once per account for the whole page.
     const store = new AuthorityStore(database);
     for (const accountId of new Set(page.rows.map((row) => row.accountId))) {
       const rows = page.rows.filter((row) => row.accountId === accountId && row.localId);
       const say = new Map(store.say(accountId, rows.map((row) => row.localId!)).map((entry) => [entry.localId, entry.authority]));
       for (const row of rows) row.authority = say.get(row.localId!) ?? null;
+      const pending = pendingPriceChanges(database, accountId);
+      for (const row of page.rows) {
+        if (row.accountId === accountId && row.venue === 'STEAM') row.pendingPriceChange = pending.get(row.listingId) ?? null;
+      }
     }
   }
   return page;
+}
+
+/**
+ * The account's lower prices Steam holds until they are confirmed, by listing: each an open price
+ * change whose own answer said so (`MarketService.recordPriceAnswer`). The seller price is the
+ * change's frozen one, the buyer price follows from it by the fee rule at the time it was asked,
+ * and who confirms is read from the stored answer.
+ */
+function pendingPriceChanges(database: EngineDatabase, accountId: string): Map<string, NonNullable<ListingPageRow['pendingPriceChange']>> {
+  const rows = database.raw().prepare(`SELECT s.target_id AS listingId, s.params_json AS params, t.finished_at AS askedAt, t.response_ref AS response
+    FROM work_step s INDEXED BY work_step_account_state
+    JOIN action a ON a.id=s.action_id
+    JOIN attempt t ON t.id=(SELECT p.id FROM attempt p WHERE p.action_id=a.id ORDER BY p.rowid DESC LIMIT 1)
+    WHERE s.account_id=? AND s.state IN ${OPEN_STEP_STATES_SQL} AND s.kind='EDIT_PRICE'
+      AND a.state='AWAITING_OBSERVATION' AND a.resolution='AWAITING_CONFIRMATION'`).all(accountId) as
+    Array<{ listingId: string | null; params: string | null; askedAt: string | null; response: string | null }>;
+  const pending = new Map<string, NonNullable<ListingPageRow['pendingPriceChange']>>();
+  // The wallet's own stated minimum when it has stated one; the fee table as it stood when Steam answered otherwise.
+  const wallet = rows.length > 0 ? latestWalletStatement(database, accountId) : null;
+  for (const row of rows) {
+    const terms = JSON.parse(row.params ?? 'null') as { priceReceiveCents?: number; currency?: number } | null;
+    if (!row.listingId || !row.askedAt || !terms?.priceReceiveCents) continue;
+    pending.set(row.listingId, {
+      receiveCents: terms.priceReceiveCents,
+      buyerCents: buyerPaysFor('steam', terms.priceReceiveCents, feeTermsNow(wallet, row.askedAt, terms.currency ?? null)),
+      askedAt: row.askedAt,
+      confirmBy: priceChangeConfirmer(row.response) ?? 'phone'
+    });
+  }
+  return pending;
 }
 
 /**
@@ -325,6 +398,14 @@ function itemPredicate(filter: ListingFilter): Branch & { lists: string[]; listP
   if (filter.minWear !== undefined) { clauses.push('paintWear IS NOT NULL AND paintWear>=?'); params.push(filter.minWear); }
   if (filter.maxWear !== undefined) { clauses.push('paintWear IS NOT NULL AND paintWear<=?'); params.push(filter.maxWear); }
   if (filter.paintSeed !== undefined) { clauses.push('paintSeed=?'); params.push(filter.paintSeed); }
+  if (filter.holdings) {
+    if (filter.holdings.length === 0) clauses.push('0');
+    else {
+      lists.push(`held(account, local, asset) AS MATERIALIZED (SELECT json_extract(value, '$.accountId'), json_extract(value, '$.localId'), json_extract(value, '$.assetId') FROM json_each(?))`);
+      listParams.push(JSON.stringify(filter.holdings.map((holding) => ({ accountId: holding.accountId, localId: holding.localId, assetId: holding.assetId ?? null }))));
+      clauses.push('EXISTS (SELECT 1 FROM held h WHERE h.account=accountId AND (h.local=localId OR h.asset=assetId))');
+    }
+  }
   if (filter.wearBands) {
     // Each band is its own key set with its own absolute bounds, exactly as in inventory: the same
     // normalised position is a different float in a 0–0.4 skin than in a 0–1 one.
@@ -337,6 +418,11 @@ function itemPredicate(filter: ListingFilter): Branch & { lists: string[]; listP
       clauses.push('paintWear IS NOT NULL AND EXISTS (SELECT 1 FROM band b WHERE b.key=matchKey AND paintWear BETWEEN b.low AND b.high)');
     }
   }
+  // Asked of the holding the row names, as the inventory asks it of its own rows.
+  const applied = appliedPredicates(filter.applied ?? [], { account: 'accountId', local: 'localId' });
+  lists.push(...applied.lists);
+  listParams.push(...applied.listParams);
+  clauses.push(...applied.clauses);
   return { sql: clauses.join(' AND '), params, lists, listParams };
 }
 
@@ -358,8 +444,13 @@ function steamBranch(accounts: readonly string[], filter: ListingFilter): Branch
         m.transactable_after AS holdUntil, CASE WHEN s.raw_bucket='PENDING_CONFIRMATION' THEN 1 ELSE 0 END AS awaitingConfirmation,
         NULL AS createdAt, f.finished_at AS firstSeenAt,
         o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete,
-        (SELECT a.created_at FROM action a JOIN work_step w ON w.id=a.step_id JOIN command c ON c.id=w.command_id
-          WHERE a.id=m.action_id AND c.kind='REPRICE') AS lastPriceChangeAt, NULL AS nextPriceChangeAt
+        (SELECT MAX(changed.at) FROM (
+          SELECT a.created_at AS at FROM action a JOIN work_step w ON w.id=a.step_id JOIN command c ON c.id=w.command_id
+            WHERE a.id=m.action_id AND c.kind='RELIST'
+          UNION ALL
+          SELECT MAX(w.updated_at) FROM work_step w INDEXED BY work_step_target
+            WHERE w.account_id=m.account_id AND w.kind='EDIT_PRICE' AND w.target_id=m.venue_order_id AND w.state='DONE') changed) AS lastPriceChangeAt,
+        NULL AS nextPriceChangeAt, s.reprice_ready_at AS repriceReadyAt
       FROM venue_order m
       JOIN steam_order s ON s.account_id=m.account_id AND s.order_id=m.order_id
       LEFT JOIN item i ON i.local_id=m.local_id AND i.account_id=m.account_id
@@ -400,7 +491,7 @@ function csfloatBranch(accounts: readonly string[], filter: ListingFilter): Bran
         k.created_at AS createdAt, f.finished_at AS firstSeenAt,
         o.finished_at AS observedAt, IFNULL(o.complete,0) AS observationComplete,
         (SELECT MAX(w.updated_at) FROM work_step w INDEXED BY work_step_target WHERE w.account_id=c.account_id AND w.kind='CSFLOAT_REPRICE' AND w.target_id=c.venue_order_id AND w.state='DONE') AS lastPriceChangeAt,
-        NULL AS nextPriceChangeAt
+        NULL AS nextPriceChangeAt, NULL AS repriceReadyAt
       FROM venue_order c
       JOIN csfloat_order k ON k.account_id=c.account_id AND k.order_id=c.order_id
       LEFT JOIN item i ON i.local_id=c.local_id AND i.account_id=c.account_id

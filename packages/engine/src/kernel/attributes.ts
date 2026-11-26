@@ -62,6 +62,13 @@ export type AccessorySlot = {
   highlight: number | null;
 };
 
+/**
+ * `keychain slot 0 sticker`: the sticker sealed inside a sticker-slab charm, by its sticker kit id.
+ * A slab is one charm kit whatever it holds, so this is what tells two slabs apart. It has no
+ * column in `item_accessory`; a read takes it from the row's stored attributes.
+ */
+export const ATTRIBUTE_CHARM_STICKER = 321;
+
 /** Items that are accessories carry their own kit in the slot attribute; nothing on them is applied. */
 const ACCESSORY_ITEMS: ReadonlySet<number> = new Set([1209, 4609, 1348, 1349, 1355, 1314]);
 

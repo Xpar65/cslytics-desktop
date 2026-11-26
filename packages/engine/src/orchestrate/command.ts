@@ -1,12 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import type { AccountId, MutationOutcome } from '@cslytics/ports';
+import { quoteFromReceive, type AccountId, type FeeTerms, type MutationOutcome } from '@cslytics/ports';
+import { feeTermsNow, latestWalletStatement } from '../kernel/wallet-terms.js';
 import type { ActionRow, CommandMemberRow, CommandRow, DraftMemberRow, ItemRow } from '../db/database.js';
 import type { EngineContext } from '../kernel/context.js';
 import { errorMessage, required } from '../kernel/support.js';
 import { CASKET_CAPACITY, MAIN_INVENTORY_HARD_CAP, StorageService, type CasketParams } from '../surfaces/storage.js';
 import { InventoryService } from '../surfaces/inventory.js';
 import { TradeService } from '../surfaces/trades.js';
-import type { MarketService } from '../surfaces/market.js';
+import { COMMAND_STOPPED, DISCARD_NOT_NEEDED, type MarketService, type PriceUpdateParams } from '../surfaces/market.js';
+import { DISCARD_SELL_LISTING_PRICE_CHANGE, PRICE_CHANGE_LISTING_GONE, PRICE_WITHDRAWAL_UNHEARD, SOLD_DURING_PRICE_CHANGE, priceAlreadyThere, strategyPriceMoved, type PriceDiscardReason } from '../kernel/listing-price.js';
+import { BREAKER_RESET_MS } from '../kernel/governor.js';
+import { priceChangeDeadline } from '../policy/price-change.js';
 import { inventoryQuery, type InventoryFilter } from '../db/inventory-query.js';
 import { MEMBER_HOP_JOINS, MEMBER_STATE_SQL } from '../db/member-state.js';
 import { csfloatClaimedAssets, marketplaceBlock, MARKETPLACE_CONSENTS, type MarketplaceConsent } from '../kernel/marketplace-commitments.js';
@@ -20,7 +24,7 @@ import { OPEN_STEP_STATES_SQL, WorkStore, isSettled, type WorkStepRow } from '..
 import { ACCOUNT_TRANSFER } from '../db/transfers.js';
 import { sqlList, type CommandAuthority, type WorkStepKind } from '../db/alphabets.js';
 import { claimForPerson, strategyRefusal } from '../policy/authority.js';
-import { attemptsMade } from '../kernel/not-applied.js';
+import { sendsThatCouldLand } from '../kernel/not-applied.js';
 import { RETRY_POLICY, retryPlan } from '../kernel/retry-policy.js';
 import { ACCOUNT_INVENTORY, ObservationRequired, surfaceEvidence, surfaceName, type SurfaceRef } from '../kernel/evidence.js';
 import type { SentMutation } from '../kernel/context.js';
@@ -28,10 +32,19 @@ import { storePrecheck, type StorePrecheck, type StorePrecheckRequest } from './
 import type { Settling } from './settle.js';
 import type { Need, Reading } from './reads.js';
 
-export type CommandKind = 'STORE' | 'RETRIEVE' | 'LIST' | 'TRANSFER' | 'REPRICE' | 'DELIST_TO_STORE';
+/**
+ * `REPRICE` changes the price of an open Steam listing in place: one hop, the same listing, and
+ * the item never off the market. `RELIST` is the chain a reprice used to be, a cancel and then a
+ * new listing once the cancel is proved.
+ *
+ * @deprecated `RELIST` is kept as a fallback for a listing Steam will not edit and for a host
+ * that has to turn the price change off; it is removed once the price change has run clean. New
+ * callers send `REPRICE`.
+ */
+export type CommandKind = 'STORE' | 'RETRIEVE' | 'LIST' | 'TRANSFER' | 'REPRICE' | 'RELIST' | 'DELIST_TO_STORE';
 
-/** The commands this service drives: one Steam account's holdings, moved, listed or delisted. */
-export const COMMAND_KINDS: readonly CommandKind[] = ['STORE', 'RETRIEVE', 'LIST', 'TRANSFER', 'REPRICE', 'DELIST_TO_STORE'];
+/** The commands this service drives: one Steam account's holdings, moved, listed, repriced or delisted. */
+export const COMMAND_KINDS: readonly CommandKind[] = ['STORE', 'RETRIEVE', 'LIST', 'TRANSFER', 'REPRICE', 'RELIST', 'DELIST_TO_STORE'];
 
 /**
  * The commands whose open stage this service drives after a settle or a restart: its own, and a
@@ -51,15 +64,27 @@ const DRIVEN_HOP_SQL = `(c.kind<>'${ACCOUNT_TRANSFER}' OR s.kind='RETRIEVE')`;
 const MIRRORED_KINDS_SQL = `(${sqlList([...COMMAND_KINDS, ACCOUNT_TRANSFER, 'DELIST', 'BUY_ORDER_CREATE', 'BUY_ORDER_CANCEL'])})`;
 
 /** The chains whose first hop is cancelling an open listing. */
-const DELIST_FIRST: readonly CommandKind[] = ['REPRICE', 'DELIST_TO_STORE'];
+const DELIST_FIRST: readonly CommandKind[] = ['RELIST', 'DELIST_TO_STORE'];
+
+/** The commands that set a new price on a listing, and so carry a person's `force` onto the member it admitted. */
+const PRICE_CHANGES: readonly CommandKind[] = ['REPRICE', 'RELIST'];
 
 /** The kinds whose proved-not-applied resend this service owns for a hop (`kernel/retry-policy.ts`, `resend: 'owner'`). */
-const RESENT_HERE: ReadonlySet<string> = new Set(['CREATE_SELL_LISTING', 'STORE_IN_CASKET', 'RETRIEVE_FROM_CASKET']);
+const RESENT_HERE: ReadonlySet<string> = new Set(['CREATE_SELL_LISTING', 'STORE_IN_CASKET', 'RETRIEVE_FROM_CASKET', 'UPDATE_SELL_LISTING_PRICE']);
 
 /** The reason on a chain's hops when its item sold before the chain reached them. */
 export const SOLD_BEFORE_REACHED = 'Sold before the chain reached it';
 /** The reason on a delist hop whose listing sold before the cancel was proved. */
 export const SOLD_BEFORE_CANCEL = 'Sold before the cancel took';
+/** The reason on a price change whose listing sold while the change was open (`kernel/listing-price.ts`). */
+export { SOLD_DURING_PRICE_CHANGE };
+
+/**
+ * The refusal of a `REPRICE` where the composed Steam market has no price change in place. A
+ * sentence, because it reaches the person as it is; a hop that fails for the same lack at its
+ * send carries the word `price-edit-unavailable` instead, which a caller reads.
+ */
+export const PRICE_EDIT_NOT_AVAILABLE_HERE = 'Steam price changes are not available here. Remove the listing and list the item again.';
 
 /**
  * The reason a store or retrieve is refused, or failed unsent, while the account's Game Coordinator
@@ -124,7 +149,8 @@ export type CommandRequest = {
   consent?: readonly MarketplaceConsent[];
   /**
    * A person's decision to change a price inside the venue's price-change interval
-   * (`kernel/price-cadence.ts`). Read by a `REPRICE` only, and recorded on each member it admitted.
+   * (`kernel/price-cadence.ts`). Read by a `REPRICE` or a `RELIST` only, and recorded on each
+   * member it admitted. A person's `REPRICE` needs none: Steam's own cooldown is its only limit.
    */
   force?: boolean;
   /**
@@ -166,8 +192,13 @@ export type CommandProgress = {
 /** Where chunked preparation has reached, and what it has already admitted against capacity. */
 type PrepareCursor = { afterAccount: string; afterKey: string; offset: number; admitted: Map<string, number> };
 
-/** The frozen terms of a hop, in `work_step.params_json`. */
-export type CommandHopParams = { casketId?: string; forListing?: boolean; priceReceiveCents?: number; listingId?: string; consent?: readonly MarketplaceConsent[] };
+/**
+ * The frozen terms of a hop, in `work_step.params_json`. A price change in place carries the
+ * listing, the price asked for, the price the listing had at admission (`fromPriceCents`) and the
+ * wallet's currency as Steam numbers it.
+ */
+export type CommandHopParams = { casketId?: string; forListing?: boolean; priceReceiveCents?: number; listingId?: string; consent?: readonly MarketplaceConsent[];
+  fromPriceCents?: number; currency?: number };
 
 /** What a chain's next hop may do: send, wait for proof, be settled by what a walk already showed, or end in a sale. */
 type HopGate = 'ready' | 'wait' | 'done' | 'sold';
@@ -221,11 +252,12 @@ export type CommandServices = {
  * account-keyed work. A known-invalid member rejects the whole batch before any mutation.
  *
  * A member is a holding and a chain of hops (consolidation plan D2): a store is one hop, a
- * transfer between two units a retrieve then a store, a reprice a delist then a listing, a listing
- * from a unit a retrieve then the listing. The hops are written at admission with the terms they
- * were asked with; the first gets its action at once, each later one when the chain reaches it,
- * which is only ever after an observation proved the hop before (rule 1). `advanceMember` is the
- * one place a chain moves, whether a dispatch, a restart or a settled walk drives it.
+ * transfer between two units a retrieve then a store, a reprice one price change in place, a relist
+ * a delist then a listing, a listing from a unit a retrieve then the listing. The hops are written
+ * at admission with the terms they were asked with; the first gets its action at once, each later
+ * one when the chain reaches it, which is only ever after an observation proved the hop before
+ * (rule 1). `advanceMember` is the one place a chain moves, whether a dispatch, a restart, a
+ * settled walk or the end of a venue's own wait drives it.
  */
 export class CommandService {
   /** The holdings write path: units, reservations, stacks as a read (`db/holdings.ts`). */
@@ -243,6 +275,8 @@ export class CommandService {
   private readonly aborts = new Map<string, AbortController>();
   /** Commands a settle woke while a pass of theirs was still running: each gets one more pass when it ends, so no proof is lost between two walks. */
   private readonly rewake = new Map<string, AccountId>();
+  /** The moment each command's account is next woken for a hop held until then: the earliest asked for (`wakeAt`). */
+  private readonly wakes = new Map<string, number>();
 
   constructor(protected readonly context: EngineContext, protected readonly services: CommandServices) {}
 
@@ -318,6 +352,10 @@ export class CommandService {
    */
   async resume(accountId: AccountId): Promise<string[]> {
     const { database } = this.context;
+    // An answer whose record never wrote is re-derived from the stored answer before anything is judged on it.
+    this.services.market.repairPriceAnswers(accountId);
+    // A discard a dead process left on the wire was never heard back from: it is owed again, on its schedule.
+    this.services.market.reviveInterruptedDiscards(accountId);
     const rows = database.raw().prepare(`
       SELECT c.id AS id FROM command c
       WHERE c.kind IN ${DRIVEN_KINDS_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL') AND c.preparing=0
@@ -334,7 +372,26 @@ export class CommandService {
         try { database.setCommandState(row.id, 'PARTIAL', String(error)); } catch { /* closed under us */ }
       }));
     }
+    // A price change sent and still open is not unsent work, and dispatch is not its driver: a
+    // raise proved absent and held for the cooldown before its resend, and a lower price waiting for
+    // its confirmation, each wait on a timer the dead process held. One wake pass arms it again.
+    const held = database.raw().prepare(`SELECT DISTINCT c.id AS id FROM command c JOIN work_step s ON s.command_id=c.id JOIN action x ON x.id=s.action_id
+      WHERE s.account_id=? AND s.kind='EDIT_PRICE' AND s.state IN ${OPEN_STEP_STATES_SQL} AND c.kind IN ${DRIVEN_KINDS_SQL}
+        AND c.state IN ('ADMITTED','RUNNING','PARTIAL','COMPLETE') AND c.preparing=0
+        AND ((x.state='READY' AND x.resolution='OBSERVED_NOT_APPLIED') OR (x.state='AWAITING_OBSERVATION' AND x.resolution='AWAITING_CONFIRMATION'))
+      ORDER BY c.created_at LIMIT 50`).all(accountId) as Array<{ id: string }>;
+    for (const row of held) {
+      if (resumed.includes(row.id) || this.inflight.has(row.id)) continue;
+      resumed.push(row.id);
+      this.advanceCommand(row.id, accountId);
+    }
     await Promise.all(resumed.map(id => this.settled(id)));
+    // A stopped command's lower price a record still holds as waiting (one an earlier build left) is
+    // withdrawn now, as Stop would; then every discard queued and never sent, a stopped command's included.
+    this.withdrawStopped(accountId);
+    await this.sendOwedDiscards(accountId);
+    // And a stopped command's hops a settle already decided are closed, without waiting for the next walk.
+    this.reflectOpen(accountId);
     return resumed;
   }
 
@@ -365,7 +422,12 @@ export class CommandService {
       const woken = this.rewake.get(commandId);
       if (woken !== undefined && !this.shutDown) {
         this.rewake.delete(commandId);
-        this.advanceSteps(woken);
+        // The one more pass this command was owed, and only this command's. Sweeping the account again
+        // found every other command's pass in flight and owed each of them one more, whose settles owed
+        // again: a chain of passes on a promise lock that never yielded, and the host's event loop
+        // starved (2026-10-30, four LIST commands open at once).
+        this.reflectOpen(woken);
+        if (this.advanceable(commandId, woken)) this.advanceCommand(commandId, woken);
       }
     });
     this.inflight.set(commandId, done);
@@ -438,7 +500,7 @@ export class CommandService {
       // A forced price change is recorded on the member it admitted, so the record says it was a decision.
       for (const { key, member } of input) db.insertCommandMember({ command_id: request.commandId, account_id: member.accountId, local_id: key,
         stack_key: member.stackKey ?? null, quantity: member.quantity ?? 1, destination: member.destinationCasketId ?? null, price_receive_cents: member.priceReceiveCents ?? null,
-        state: 'PREPARED', input_json: JSON.stringify(request.kind === 'REPRICE' && request.force ? { ...member, force: true } : member) });
+        state: 'PREPARED', input_json: JSON.stringify(PRICE_CHANGES.includes(request.kind) && request.force ? { ...member, force: true } : member) });
       claimForPerson(db, request.authority, request.commandId, input.map((row) => row.member), this.context.now());
     });
     cursor.afterAccount = input.at(-1)!.member.accountId; cursor.afterKey = input.at(-1)!.key; cursor.offset += input.length;
@@ -548,7 +610,7 @@ export class CommandService {
       for (const [index, member] of members.entries()) {
         const admitted = this.admitMember(request.commandId, request.kind, member, index);
         // A forced price change is recorded on the member it admitted, so the record says it was a decision.
-        for (const row of admitted) database.insertCommandMember(request.kind === 'REPRICE' && request.force && row.input_json
+        for (const row of admitted) database.insertCommandMember(PRICE_CHANGES.includes(request.kind) && request.force && row.input_json
           ? { ...row, input_json: JSON.stringify({ ...(JSON.parse(row.input_json) as object), force: true }) } : row);
       }
       claimForPerson(database, request.authority, request.commandId, members, now);
@@ -581,10 +643,13 @@ export class CommandService {
     // read and every round's wait (read broker plan D8): a second command on the account admits
     // while this one waits for a walk, which the teardown of L-10 spent eight minutes unable to do.
     const runAccount = async (accountId: AccountId): Promise<void> => {
-      try {
-        await this.context.ports.gc.connect(accountId, 30_000);
-      } catch (error) {
-        if (!this.failsWithoutGc(commandId, accountId)) throw error;
+      // A price change in place moves nothing and is proved on the market alone: it asks for no Game Coordinator session.
+      if (this.needsGcSession(command)) {
+        try {
+          await this.context.ports.gc.connect(accountId, 30_000);
+        } catch (error) {
+          if (!this.failsWithoutGc(commandId, accountId)) throw error;
+        }
       }
       await this.context.locks.run(accountId, async () => { this.expandPrepared(command, accountId); });
       await this.advanceMembers(commandId, accountId, { walk: true, results, signal: controller.signal });
@@ -617,8 +682,11 @@ export class CommandService {
       if (!page.length) return;
       for (const row of page) {
         if (!row.input_json) { database.setCommandMember(command.id, accountId, row.local_id, { state: 'REJECTED' }); continue; }
-        const input = JSON.parse(row.input_json) as CommandMemberInput;
-        const reason = this.preflight({ commandId: command.id, kind: command.kind as CommandKind, members: [input] }, 'dispatch');
+        const input = JSON.parse(row.input_json) as CommandMemberInput & { force?: boolean };
+        // Whose the command is and whether the person forced it were judged at submit and are judged
+        // again here, on the same terms: the cadence asks both.
+        const reason = this.preflight({ commandId: command.id, kind: command.kind as CommandKind, members: [input],
+          ...(command.authority ? { authority: command.authority } : {}), ...(input.force ? { force: true } : {}) }, 'dispatch');
         if (reason) { database.setCommandMember(command.id, accountId, row.local_id, { state: 'REJECTED' }); continue; }
         database.transaction(() => {
           const admitted = this.admitMember(command.id, command.kind as CommandKind, input, expandedIndex++);
@@ -636,26 +704,226 @@ export class CommandService {
    * by observation alone (N-BATCH-05). A hop a walk has proved did not land is owed only a resend,
    * which is a send not yet made, so it stops too (`stopNotApplied`). A member none of whose hops
    * went out is stopped in its own word, and the unit it reserved is handed back.
+   *
+   * One sent hop can still be taken back: a lower listing price Steam holds for its confirmation.
+   * Stop withdraws every one of the command's (in-place reprice plan D16): a discard is sent, and
+   * the walk begun after it decides, the old price stopping the hop in the person's word and the
+   * new one, confirmed just before, making it done. A command that is complete in every send it
+   * made, but has such a change still open, is stopped for it. Every other sent hop is left as it is.
    */
   stop(commandId: string): CommandRow {
     const { database } = this.context;
     const command = required(database.command(commandId), `Unknown command ${commandId}`);
-    if (command.state === 'REJECTED' || command.state === 'COMPLETE') return command;
+    const withdrawable = this.withdrawnOnStop(commandId);
+    if (command.state === 'REJECTED' || (command.state === 'COMPLETE' && !withdrawable.length)) return command;
     // The reads the dispatch is waiting on are withdrawn: a stopped command's reader answers at once.
     this.aborts.get(commandId)?.abort();
-    return database.transaction(() => {
+    const stopped = database.transaction(() => {
       const now = this.context.now();
       for (const member of database.commandMembers(commandId)) {
         if (member.state === 'PREPARED') database.setCommandMember(commandId, member.account_id, member.local_id, { state: 'STOPPED' });
       }
-      for (const step of this.work.stopUnsent(commandId, now)) this.failStopped(step, now);
+      for (const step of this.work.stopUnsent(commandId, now, (step) => this.stoppable(step))) this.failStopped(step, now);
       database.setCommandState(commandId, 'STOPPED');
       for (const step of this.work.steps(commandId)) {
         if (!isSettled(step) && this.provedNotApplied(step)) this.stopNotApplied(step);
       }
+      // Each is owed its discard until one has been sent and answered; with none on the composed
+      // market, the walk begun after its refusal decides it (`sendDiscard`).
+      for (const { change } of withdrawable) this.services.market.queuePriceDiscard(change, 'stopped');
       this.closeStoppedMembers(commandId);
       return database.command(commandId)!;
     });
+    for (const accountId of new Set(withdrawable.map(({ hop }) => hop.account_id))) void this.sendOwedDiscards(accountId);
+    return stopped;
+  }
+
+  /** Whether Stop halts an unsent hop. Every one: isolated so a saboteur can leave a held price change as if it were sent. */
+  protected stoppable(_step: WorkStepRow): boolean {
+    return true;
+  }
+
+  /**
+   * The command's lower listing prices Steam holds, or may hold, for their confirmation: the sent
+   * hops Stop can still take back. One whose answer said so; and one whose answer never came or said
+   * nothing usable, which Steam may be holding unseen (D30): a discard of a change Steam does not
+   * hold changes nothing, and without it a command that reads complete ignored the Stop. Isolated
+   * so a saboteur can leave them waiting.
+   */
+  protected withdrawnOnStop(commandId: string): Array<{ hop: WorkStepRow; change: ActionRow }> {
+    const found: Array<{ hop: WorkStepRow; change: ActionRow }> = [];
+    for (const hop of this.work.steps(commandId)) {
+      if (hop.kind !== 'EDIT_PRICE' || isSettled(hop) || !hop.action_id) continue;
+      const change = this.context.database.action(hop.action_id);
+      if (change?.state !== 'AWAITING_OBSERVATION') continue;
+      const lower = (params: PriceUpdateParams): boolean => params.priceReceiveCents < params.fromPriceCents;
+      if (change.resolution === 'AWAITING_CONFIRMATION' || (change.resolution === null && lower(this.context.database.actionParams(change) as PriceUpdateParams))) {
+        found.push({ hop, change });
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Withdraws every lower price of a stopped command of the account that a record still holds as
+   * waiting for its confirmation, as Stop does (D16). Since this build an answer that lands on a
+   * stopped command withdraws it at once (`MarketService.stoppedWhileSent`), so only a record an
+   * earlier build wrote holds one; nothing would ever drive it otherwise. Once per restart.
+   */
+  protected withdrawStopped(accountId: AccountId): void {
+    const rows = this.context.database.raw().prepare(`SELECT x.* FROM work_step s INDEXED BY work_step_account_state JOIN command c ON c.id=s.command_id JOIN action x ON x.id=s.action_id
+      WHERE s.account_id=? AND s.state IN ${OPEN_STEP_STATES_SQL} AND s.kind='EDIT_PRICE' AND c.state='STOPPED'
+        AND x.state='AWAITING_OBSERVATION' AND x.resolution='AWAITING_CONFIRMATION'`).all(accountId) as ActionRow[];
+    for (const change of rows) this.services.market.queuePriceDiscard(change, 'stopped');
+  }
+
+  /** Discards being sent, per account, so one account's never go out twice at once; and whether more were queued meanwhile. */
+  private readonly discarding = new Map<AccountId, Promise<void>>();
+  private readonly discardAgain = new Set<AccountId>();
+  /** The moment each account is next woken for a discard held back for the moment (`sendDiscard`). */
+  private readonly discardWakes = new Map<AccountId, number>();
+
+  /**
+   * Sends every discard of the account that is owed: one Stop queued, one the deadline queued, one
+   * a walk queued for a lower price whose answer never came, one whose answer never came back and
+   * is owed again, one refused for the moment and due again, or one a dead process queued and never
+   * sent. Not a command's pass, because a stopped command has none. Under the account lock, never
+   * twice at once.
+   */
+  sendOwedDiscards(accountId: AccountId): Promise<void> {
+    if (this.shutDown) return Promise.resolve();
+    const running = this.discarding.get(accountId);
+    if (running) { this.discardAgain.add(accountId); return running; }
+    if (!this.readyDiscards(accountId).length) return Promise.resolve();
+    const work = this.context.locks.run(accountId, () => this.sendReadyDiscards(accountId)).catch(() => undefined).finally(() => {
+      this.discarding.delete(accountId);
+      if (this.discardAgain.delete(accountId)) void this.sendOwedDiscards(accountId);
+    });
+    this.discarding.set(accountId, work);
+    return work;
+  }
+
+  /**
+   * The account's owed discards that are due, sent in turn, the caller holding the account lock
+   * (in-place reprice plan D19, D27). One Steam never heard is due only after its backoff
+   * (`MarketService.discardDueAt`), never again in the same pass, and the account is woken for that
+   * moment; one held back for the moment waits for the wake `sendDiscard` asked for.
+   */
+  protected async sendReadyDiscards(accountId: AccountId): Promise<void> {
+    for (const discard of this.readyDiscards(accountId)) {
+      if (this.shutDown) return;
+      const dueAt = this.services.market.discardDueAt(discard);
+      if (dueAt > this.context.ports.clock.now().getTime()) {
+        this.wakeDiscardsAt(accountId, dueAt);
+        continue;
+      }
+      if ((await this.sendDiscard(discard)) !== 'sent') continue;
+      // Sent and unheard, it is owed again after its backoff: woken then.
+      const after = this.context.database.action(discard.id);
+      if (after?.state === 'READY') this.wakeDiscardsAt(accountId, this.services.market.discardDueAt(after));
+    }
+  }
+
+  private readyDiscards(accountId: AccountId): ActionRow[] {
+    return this.context.database.raw().prepare(`SELECT * FROM action INDEXED BY action_ready WHERE account_id=? AND state='READY' AND kind='${DISCARD_SELL_LISTING_PRICE_CHANGE}'
+      ORDER BY created_at, id`).all(accountId) as ActionRow[];
+  }
+
+  /**
+   * Sends one discard, the caller holding the account lock (in-place reprice plan D19, D20). A
+   * change that ended first, as by a sale, needs none, and it is failed unsent. With no discard on
+   * the composed market it is recorded as refused and nothing goes out: the walk begun after the
+   * refusal decides the change as it would after a discard (`MarketService.discardUnavailable`).
+   * Refused here for the moment, by the kind's open breaker or by any other check made before the
+   * call, it stays owed, `READY` with the refusal's words, and the account is woken to send it again
+   * when the breaker lets one through: a change Steam may still hold is never ended because a
+   * discard could not go out. Whatever a discard that went out answers, the walk its proof need asks
+   * for decides the change.
+   */
+  protected async sendDiscard(discard: ActionRow): Promise<'sent' | 'held' | 'ended'> {
+    const { database } = this.context;
+    const withdrawn = discard.step_id ? this.work.step(discard.step_id) : undefined;
+    const open = withdrawn?.action_id ? database.action(withdrawn.action_id) : undefined;
+    if (open?.state !== 'AWAITING_OBSERVATION') {
+      // The change ended first, as by a sale: there is nothing left to withdraw.
+      if (database.action(discard.id)?.state === 'READY') database.setActionState(discard.id, 'FAILED', this.context.now(), DISCARD_NOT_NEEDED);
+      return 'ended';
+    }
+    if (!this.context.ports.market.discardListingPriceChange) {
+      this.services.market.discardUnavailable(discard);
+      return 'ended';
+    }
+    const breaker = this.context.governors.forMutation(discard.account_id, DISCARD_SELL_LISTING_PRICE_CHANGE).breaker;
+    if (breaker.isOpen()) {
+      this.holdDiscard(discard, `Circuit open for ${DISCARD_SELL_LISTING_PRICE_CHANGE} on ${discard.account_id}`, breaker.resetsAtMs());
+      return 'held';
+    }
+    try {
+      await this.services.market.executePriceDiscard(discard.id);
+      return 'sent';
+    } catch (error) {
+      if (database.action(discard.id)?.state !== 'READY') return 'sent';
+      this.holdDiscard(discard, errorMessage(error), breaker.resetsAtMs());
+      return 'held';
+    }
+  }
+
+  /**
+   * A discard refused before it went out, left owed with the refusal's words, and the account woken
+   * when it may go: when the breaker lets one through, or a breaker's span from now for any other
+   * refusal. Nothing is sent meanwhile, so asking again costs nothing.
+   */
+  protected holdDiscard(discard: ActionRow, reason: string, resetsAtMs: number | null): void {
+    this.context.database.setActionState(discard.id, 'READY', this.context.now(), reason);
+    this.wakeDiscardsAt(discard.account_id, resetsAtMs ?? this.context.ports.clock.now().getTime() + BREAKER_RESET_MS);
+  }
+
+  /** Wakes the account's owed discards at a moment, one timer per account for the earliest asked; nothing is stored, and `resume` sends what a dead process held. */
+  protected wakeDiscardsAt(accountId: AccountId, atMs: number): void {
+    const pending = this.discardWakes.get(accountId);
+    if (pending !== undefined && pending <= atMs) return;
+    this.discardWakes.set(accountId, atMs);
+    const delay = Math.max(0, atMs - this.context.ports.clock.now().getTime());
+    void this.context.ports.clock.sleep(delay).then(() => {
+      if (this.discardWakes.get(accountId) !== atMs) return;
+      this.discardWakes.delete(accountId);
+      if (this.shutDown) return;
+      try {
+        void this.sendOwedDiscards(accountId);
+      } catch {
+        // The runtime closed the record while the timer slept; `resume` sends it on the next open.
+      }
+    });
+  }
+
+  /**
+   * A waiting lower price past its deadline is withdrawn (in-place reprice plan D15), the caller
+   * holding the account lock; one not yet past it wakes the account when it is, because no walk is
+   * asked for while it waits on a person. One with no deadline at all, a record written before the
+   * deadline existed, takes one now, counted from now (D22).
+   */
+  protected async withdrawIfDue(commandId: string, hop: WorkStepRow, change: ActionRow): Promise<void> {
+    if (change.state !== 'AWAITING_OBSERVATION' || change.resolution !== 'AWAITING_CONFIRMATION') return;
+    let deadline = this.work.step(hop.id)?.deadline_at ?? null;
+    if (deadline === null) {
+      deadline = priceChangeDeadline(this.context.now());
+      this.work.update(hop.id, { deadline_at: deadline }, this.context.now());
+    }
+    if (deadline > this.context.now()) {
+      this.wakeAt(commandId, hop.account_id, Date.parse(deadline));
+      return;
+    }
+    await this.withdrawPriceChange(hop, change, 'deadline');
+  }
+
+  /**
+   * Withdraws one waiting lower price now, the caller holding the account lock: its discard queued
+   * and the account's owed discards sent (`sendReadyDiscards`); with none on the composed market,
+   * the walk begun after the refusal decides it.
+   */
+  protected async withdrawPriceChange(hop: WorkStepRow, change: ActionRow, why: PriceDiscardReason): Promise<void> {
+    this.services.market.queuePriceDiscard(change, why);
+    await this.sendReadyDiscards(hop.account_id);
   }
 
   /**
@@ -722,6 +990,15 @@ export class CommandService {
     const kind = this.context.database.command(commandId)?.kind as CommandKind | undefined;
     if (kind && GC_COMMANDS.includes(kind)) return true;
     return Boolean(this.context.database.raw().prepare(`SELECT 1 FROM work_step WHERE command_id=? AND account_id=? AND kind IN ('STORE','RETRIEVE') LIMIT 1`).get(commandId, accountId));
+  }
+
+  /**
+   * Whether a dispatch brings the account's Game Coordinator session up first. Every command does
+   * but a price change in place: its listing stays where it is, its item never moves, and nothing
+   * about it is proved by an inventory walk. Isolated so a saboteur can wait for a session it does not need.
+   */
+  protected needsGcSession(command: CommandRow): boolean {
+    return command.kind !== 'REPRICE';
   }
 
   /**
@@ -846,7 +1123,9 @@ export class CommandService {
   commandProgress(commandId: string): CommandProgress {
     const command = required(this.context.database.command(commandId), `Unknown command ${commandId}`);
     // The same words `work.open` uses (`db/member-state.ts`): a member is on its hop, and observed
-    // completed counts `DONE` hops only, which an observation wrote.
+    // completed counts members whose hop is `DONE`. An observation wrote every one of those but a
+    // raise in place, which Steam's answer naming the price settles (in-place reprice plan D4); the
+    // field keeps its name because the window reads it.
     const members = this.context.database.raw().prepare(`SELECT m.account_id AS accountId, m.local_id AS memberId, ${MEMBER_STATE_SQL} AS state, m.quantity AS quantity
       FROM command c JOIN command_member m ON m.command_id=c.id ${MEMBER_HOP_JOINS}
       WHERE c.id=? ORDER BY m.account_id, m.local_id LIMIT 100`).all(commandId) as CommandProgress['members'];
@@ -861,10 +1140,13 @@ export class CommandService {
    * whatever the Game Coordinator says about its location (CSF-13). The same check runs again
    * at dispatch; here it keeps a known-invalid member from admitting the batch at all. A move
    * between units is judged as the store its second hop is: it never leaves the account, and
-   * `'transfer'` is the send to a CSFloat buyer (bulk storage plan D7).
+   * `'transfer'` is the send to a CSFloat buyer (bulk storage plan D7). A price change in place
+   * asks nothing here, as a retrieve does not: it puts nothing on a market that is not there
+   * already, so another venue's claim on the item is no more and no less in conflict after it,
+   * and how old another venue's reads are is no reason to keep a listing at the wrong price.
    */
   protected marketplaceProblem(kind: CommandKind, member: CommandMemberInput, item: ItemRow): string | null {
-    const purpose = kind === 'LIST' || kind === 'REPRICE' ? 'steam-list' : kind === 'RETRIEVE' ? null
+    const purpose = kind === 'LIST' || kind === 'RELIST' ? 'steam-list' : kind === 'RETRIEVE' || kind === 'REPRICE' ? null
       : kind === 'DELIST_TO_STORE' ? 'delist-to-store' : 'storage';
     if (!purpose) return null;
     const reason = marketplaceBlock(this.context.database, member.accountId, item.local_id, purpose, this.context.now(), '', kind === 'STORE' ? member.consent ?? [] : []);
@@ -929,7 +1211,7 @@ export class CommandService {
         const marketplace = this.marketplaceProblem(request.kind, member, item);
         if (marketplace) return marketplace;
       } else if (member.stackKey) {
-        if (DELIST_FIRST.includes(request.kind)) return 'A stack has no listing of its own to reprice or delist; cancel the listing itself';
+        if (DELIST_FIRST.includes(request.kind) || request.kind === 'REPRICE') return 'A stack has no listing of its own to reprice or delist; cancel the listing itself';
         if ((GC_COMMANDS.includes(request.kind) || (request.kind === 'LIST' && member.sourceCasketId)) && !gcUp(member.accountId)) return gcRefusal(member.accountId);
         const untradable = this.untradableProblem(request.kind, { stackKey: member.stackKey });
         if (untradable) return untradable;
@@ -977,8 +1259,12 @@ export class CommandService {
         return 'LIST requires a positive seller-receives price';
       }
       if (DELIST_FIRST.includes(request.kind)) {
-        const chain = this.delistChainProblem(request.kind, member, request.force ?? false);
+        const chain = this.delistChainProblem(request.kind, member, request.force ?? false, request.authority);
         if (chain) return chain;
+      }
+      if (request.kind === 'REPRICE') {
+        const edit = this.priceEditProblem(member, request.force ?? false, request.authority);
+        if (edit) return edit;
       }
     }
     for (const [accountId, extra] of retrievesByAccount) {
@@ -1016,8 +1302,17 @@ export class CommandService {
       const marketable = this.marketableProblem(item.account_id, item.asset_id);
       if (marketable) return `Item ${item.local_id} ${marketable}`;
     }
-    // A reprice or a delist-to-store needs an open listing, which `delistChainProblem` asks of the
-    // listing book. The item's location cannot answer it: a listed item is in main inventory.
+    // A reprice, a relist or a delist-to-store needs an open listing, which `priceEditProblem` and
+    // `delistChainProblem` ask of the listing book. The item's location cannot answer it: a listed
+    // item is in main inventory.
+    if (kind === 'REPRICE') {
+      // One price change per listing at a time, said in its own words before the attempt one of them
+      // has in flight is read as an attempt nobody can explain.
+      const listingId = this.openListingFor(item.account_id, item.local_id);
+      if (listingId && this.work.openForTarget(item.account_id, 'EDIT_PRICE', listingId).length) {
+        return `Item ${item.local_id} already has a price change waiting on its listing; stop it, or let it finish, before asking for another`;
+      }
+    }
     return null;
   }
 
@@ -1126,10 +1421,12 @@ export class CommandService {
       state: 'QUEUED',
       input_json: JSON.stringify(terms.input)
     };
-    const hops = this.hopsFor(kind, member, item).map((hopKind, ordinal) => this.work.insert({
-      id: commandHopId(commandId, item.local_id, ordinal), commandId, accountId: member.accountId, ordinal, kind: hopKind,
-      localId: item.local_id, params: this.hopParams(kind, hopKind, member, item), now
-    }));
+    const hops = this.hopsFor(kind, member, item).map((hopKind, ordinal) => {
+      const params = this.hopParams(kind, hopKind, member, item);
+      // A price change names the listing it changes, so the listing's reads find it by that id.
+      return this.work.insert({ id: commandHopId(commandId, item.local_id, ordinal), commandId, accountId: member.accountId, ordinal, kind: hopKind,
+        localId: item.local_id, ...(hopKind === 'EDIT_PRICE' && params.listingId ? { targetId: params.listingId } : {}), params, now });
+    });
     this.admitHop(kind, row, hops[0]!);
     return row;
   }
@@ -1142,14 +1439,17 @@ export class CommandService {
   /**
    * The hops a member's chain is made of, in order. A listing from a unit is retrieved first and
    * listed from main inventory once a walk shows it there, as a unit's listing always was; a
-   * loose item is listed in one hop. Isolated so a saboteur can list a crated item in place.
+   * loose item is listed in one hop. A reprice is one hop, the price changed on the listing as it
+   * stands; a relist is the cancel and the new listing a reprice used to be. Isolated so a saboteur
+   * can list a crated item in place.
    */
   protected hopsFor(kind: CommandKind, _member: CommandMemberInput, item: ItemRow): WorkStepKind[] {
     switch (kind) {
       case 'STORE': return ['STORE'];
       case 'RETRIEVE': return ['RETRIEVE'];
       case 'TRANSFER': return ['RETRIEVE', 'STORE'];
-      case 'REPRICE': return ['DELIST', 'LIST'];
+      case 'REPRICE': return ['EDIT_PRICE'];
+      case 'RELIST': return ['DELIST', 'LIST'];
       case 'DELIST_TO_STORE': return ['DELIST', 'STORE'];
       case 'LIST': return item.location === 'CASKET' ? ['RETRIEVE', 'LIST'] : ['LIST'];
     }
@@ -1161,12 +1461,24 @@ export class CommandService {
       case 'STORE': return { ...(member.destinationCasketId ? { casketId: member.destinationCasketId } : {}), ...(kind === 'STORE' && member.consent?.length ? { consent: member.consent } : {}) };
       case 'RETRIEVE': {
         const casketId = member.sourceCasketId ?? item.casket_id ?? undefined;
-        return { ...(casketId ? { casketId } : {}), ...(kind === 'LIST' || kind === 'REPRICE' ? { forListing: true } : {}) };
+        return { ...(casketId ? { casketId } : {}), ...(kind === 'LIST' || kind === 'RELIST' ? { forListing: true } : {}) };
       }
       case 'LIST': return { ...(member.priceReceiveCents ? { priceReceiveCents: member.priceReceiveCents } : {}) };
       case 'DELIST': {
         const listingId = this.openListingFor(member.accountId, item.local_id);
         return { ...(listingId ? { listingId } : {}) };
+      }
+      case 'EDIT_PRICE': {
+        // The listing as the book shows it now, and the wallet the price is in: what the change is
+        // sent with, and the two prices a later walk is read against.
+        const listing = new OrderStore(this.context.database).openSteamListingFor(member.accountId, item.local_id);
+        const currency = this.walletCurrency(member.accountId);
+        return {
+          ...(listing?.venue_order_id ? { listingId: listing.venue_order_id } : {}),
+          ...(member.priceReceiveCents ? { priceReceiveCents: member.priceReceiveCents } : {}),
+          ...(listing?.price_cents ? { fromPriceCents: listing.price_cents } : {}),
+          ...(currency !== null ? { currency } : {})
+        };
       }
       default: return {};
     }
@@ -1205,6 +1517,13 @@ export class CommandService {
         action = this.services.market.queueDelistStep(accountId, listingId, hop.id);
         break;
       }
+      case 'EDIT_PRICE': {
+        // Frozen at admission: the listing, both prices and the currency are the hop's own terms.
+        const { listingId, priceReceiveCents, fromPriceCents, currency } = params;
+        if (!listingId || !priceReceiveCents || !fromPriceCents || currency === undefined) throw new Error(`Item ${localId} has no open listing to change the price of`);
+        action = this.services.market.queuePriceUpdateStep(accountId, localId, { listingId, priceReceiveCents, fromPriceCents, currency } satisfies PriceUpdateParams, hop.id);
+        break;
+      }
       default:
         throw new Error(`Not a hop of a Steam command: ${hop.kind}`);
     }
@@ -1215,13 +1534,14 @@ export class CommandService {
   protected async executeMember(kind: CommandKind, action: ActionRow): Promise<MutationOutcome> {
     if (action.kind === 'CREATE_SELL_LISTING') return this.services.market.executeSellListing(action.id);
     if (action.kind === 'REMOVE_SELL_LISTING') return this.services.market.executeDelist(action.id);
+    if (action.kind === 'UPDATE_SELL_LISTING_PRICE') return this.services.market.executePriceUpdate(action.id);
     return (await this.sendMember(kind, action)).answer;
   }
 
   /**
    * Continues every chain of the account that can move, from a walk the loop made rather than one
    * the chain asked for. Called from `wakeDrivers` after every settled market, inventory or unit
-   * walk, so a reprice whose cancel a walk just proved takes its listing hop from that settle, and
+   * walk, so a relist whose cancel a walk just proved takes its listing hop from that settle, and
    * a store whose walk just showed the item in its unit reads complete, with nobody pressing
    * anything (SM-23).
    *
@@ -1240,16 +1560,29 @@ export class CommandService {
     const rows = database.raw().prepare(`SELECT DISTINCT c.id AS id, c.created_at AS created_at FROM command c JOIN work_step s ON s.command_id=c.id
       WHERE s.account_id=? AND s.state IN ${OPEN_STEP_STATES_SQL} AND c.kind IN ${DRIVEN_KINDS_SQL} AND ${DRIVEN_HOP_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL','COMPLETE') AND c.preparing=0
       ORDER BY c.created_at`).all(accountId) as Array<{ id: string }>;
-    for (const row of rows) {
-      // A pass of this command is still running: a wake pass yields between pages, and a walk that
-      // settles meanwhile is the proof its next hop needs. It is not lost: one more pass follows.
-      if (this.inflight.has(row.id)) { this.rewake.set(row.id, accountId); continue; }
-      this.track(row.id, this.context.locks.run(accountId, () => this.advanceMembers(row.id, accountId, { walk: false, locked: true }))
-        .then(() => this.finish(row.id))
-        .catch((error: unknown) => {
-          try { database.setCommandState(row.id, 'PARTIAL', String(error)); } catch { /* closed under us */ }
-        }));
-    }
+    for (const row of rows) this.advanceCommand(row.id, accountId);
+    // A walk can queue a discard (a lower price whose answer never came): it is sent from here.
+    void this.sendOwedDiscards(accountId);
+  }
+
+  /** The command still has an open hop for the account, by the same test `advanceSteps` selects with. */
+  private advanceable(commandId: string, accountId: AccountId): boolean {
+    return this.context.database.raw().prepare(`SELECT 1 FROM command c JOIN work_step s ON s.command_id=c.id
+      WHERE c.id=? AND s.account_id=? AND s.state IN ${OPEN_STEP_STATES_SQL} AND c.kind IN ${DRIVEN_KINDS_SQL} AND ${DRIVEN_HOP_SQL} AND c.state IN ('ADMITTED','RUNNING','PARTIAL','COMPLETE') AND c.preparing=0
+      LIMIT 1`).get(commandId, accountId) !== undefined;
+  }
+
+  /** One wake pass of one command, or, while a pass of it is running, the note that it owes one more. */
+  private advanceCommand(commandId: string, accountId: AccountId): void {
+    const { database } = this.context;
+    // A pass of this command is still running: a wake pass yields between pages, and a walk that
+    // settles meanwhile is the proof its next hop needs. It is not lost: one more pass follows.
+    if (this.inflight.has(commandId)) { this.rewake.set(commandId, accountId); return; }
+    this.track(commandId, this.context.locks.run(accountId, () => this.advanceMembers(commandId, accountId, { walk: false, locked: true }))
+      .then(() => this.finish(commandId))
+      .catch((error: unknown) => {
+        try { database.setCommandState(commandId, 'PARTIAL', String(error)); } catch { /* closed under us */ }
+      }));
   }
 
   /**
@@ -1394,7 +1727,8 @@ export class CommandService {
           OR (x.state='READY' AND x.resolution IS NULL)` : ''}
           OR (x.state='DONE' AND s.state<>'DONE') OR (x.state='FAILED' AND s.state<>'FAILED')
           OR (x.state='RUNNING' AND s.state<>'SENT') OR (x.state='AWAITING_OBSERVATION' AND s.state NOT IN ('AWAITING_OBSERVATION','RETRYING'))
-          OR (s.kind='DELIST' AND EXISTS (SELECT 1 FROM venue_order v WHERE v.account_id=s.account_id AND v.local_id=s.local_id AND v.side='SELL' AND v.state='ENDED_FILLED')))`})`;
+          OR (s.kind='EDIT_PRICE' AND x.state='AWAITING_OBSERVATION' AND x.resolution='AWAITING_CONFIRMATION')
+          OR (s.kind IN ('DELIST','EDIT_PRICE') AND EXISTS (SELECT 1 FROM venue_order v WHERE v.account_id=s.account_id AND v.local_id=s.local_id AND v.side='SELL' AND v.state='ENDED_FILLED')))`})`;
     let after = '';
     try {
       while (true) {
@@ -1437,6 +1771,10 @@ export class CommandService {
       const current = hops.find((hop) => !isSettled(hop));
       if (!current || (options.stage !== undefined && current.ordinal !== options.stage)) return;
       const action = current.action_id ? database.action(current.action_id) : undefined;
+      if (current.kind === 'EDIT_PRICE') {
+        await this.advancePriceEdit(command, member, hops, current, action, options, round);
+        return;
+      }
       if (action && action.state !== 'READY') {
         // A cancel in flight whose listing a sale took: nothing is left to reprice or store, and
         // the cancel will never be proved, so the chain ends here rather than waiting for ever.
@@ -1481,6 +1819,149 @@ export class CommandService {
       this.noteForProof(kind, member, current, action, round);
       return;
     }
+  }
+
+  /**
+   * Moves a price change in place as far as the evidence allows.
+   *
+   * A sale ends it, sent or not: there is nothing left to price. Sent, it is left to what settles
+   * it: its own answer when that answer stated the price, else a walk (`MarketService`); a lower
+   * price waiting for its confirmation is withdrawn at its deadline, and the account is woken for
+   * that moment. Unsent, or proved not applied and owed its one resend, it waits while its listing
+   * is gone from the book and not yet explained, because the walks that explain it may say sold;
+   * it is held while the record says Steam's cooldown on the listing is running
+   * (`priceEditHeldUntil`), and the account is woken when it ends; otherwise it is sent, judged
+   * against the price the record shows the listing at then, not the one it was admitted on
+   * (`refreezePriceEdit`). A send Steam refuses for the cooldown teaches the time and holds the
+   * change again. Each member is judged on its own listing, so one waiting never holds another.
+   */
+  protected async advancePriceEdit(command: CommandRow, member: CommandMemberRow, hops: readonly WorkStepRow[], hop: WorkStepRow,
+    action: ActionRow | undefined, options: Advance, round: StageRound): Promise<void> {
+    const kind = command.kind as CommandKind;
+    const { listingId } = this.work.params<CommandHopParams | null>(hop) ?? {};
+    if (!this.openListingFor(member.account_id, member.local_id) && this.saleEndedTheChain(member.account_id, member.local_id)) {
+      this.endBySale(member, hops);
+      return;
+    }
+    if (!action || !listingId) {
+      this.failHop(hop, `Item ${member.local_id} has no open listing to change the price of`);
+      return;
+    }
+    if (action.state !== 'READY') {
+      // Sent, and settled by its answer or by observation: nothing here hurries either, but a lower price has a deadline.
+      round.inFlight += 1;
+      await this.withdrawIfDue(command.id, hop, action);
+      return;
+    }
+    if (action.resolution === 'OBSERVED_NOT_APPLIED' && !this.resendDue(action)) return;
+    const listing = new OrderStore(this.context.database).steamListing(member.account_id, listingId);
+    if (listing && (listing.gone_obs !== null || listing.state.startsWith('ENDED_'))) {
+      // Gone and not yet explained: the walks that explain it wake this, and a sale ends it above.
+      if (this.listingGoneUnexplained(listing)) return;
+      this.context.database.setActionState(action.id, 'FAILED', this.context.now(), PRICE_CHANGE_LISTING_GONE);
+      this.failHop(hop, PRICE_CHANGE_LISTING_GONE);
+      return;
+    }
+    const held = this.priceEditHeldUntil(member.account_id, listingId);
+    if (held !== null) {
+      this.wakeAt(command.id, member.account_id, Date.parse(held));
+      return;
+    }
+    const picture = listing ? this.refreezePriceEdit(hop, action, listing, (command.authority ?? 'HUMAN') as CommandAuthority) : 'unchanged';
+    if (picture === 'already' || picture === 'moved') {
+      const reason = picture === 'already' ? priceAlreadyThere(member.local_id)
+        : strategyPriceMoved(member.local_id, (this.context.database.actionParams(action) as PriceUpdateParams).fromPriceCents, listing!.price_cents!);
+      this.context.database.setActionState(action.id, 'FAILED', this.context.now(), reason);
+      this.failHop(hop, reason);
+      return;
+    }
+    const outcome = await this.send(kind, hop, action, options.results);
+    // Stopped while it was on the wire, a lower price is withdrawn by its answer (D21): the discard goes once this pass lets go of the account.
+    void this.sendOwedDiscards(member.account_id);
+    if (outcome.kind === 'WAITING') { round.waiting.push(outcome.want); return; }
+    if (outcome.kind === 'DEFINITIVELY_REJECTED') {
+      // Refused for the cooldown and waiting again: woken at the time Steam named.
+      const again = this.priceEditHeldUntil(member.account_id, listingId);
+      if (again !== null && !isSettled(this.work.step(hop.id)!)) this.wakeAt(command.id, member.account_id, Date.parse(again));
+      return;
+    }
+    round.sent += 1;
+    // A lower price Steam now holds: woken at its deadline.
+    const sent = this.context.database.action(action.id);
+    if (sent) await this.withdrawIfDue(command.id, hop, sent);
+  }
+
+  /**
+   * Whether a listing gone from the book is still unexplained: a later walk of the history, or of
+   * the inventory, says whether it sold. Isolated so a saboteur can read gone as gone for good.
+   */
+  protected listingGoneUnexplained(listing: SteamListingRow): boolean {
+    return !listing.state.startsWith('ENDED_');
+  }
+
+  /**
+   * The listing a price change is about may have moved since the walk it was admitted on: its
+   * price changed on Steam's own page, seen by a walk while the change was held. `already` when the
+   * listing is now at the very price asked for, which nothing needs to send. A person's change is
+   * sent judged against the price the record shows now, so a raise that has become a lower price is
+   * a lower price in every decision that follows: its frozen `fromPriceCents`, on the hop and on its
+   * action, is set again from the record. A strategy's is not sent at all (`moved`, in-place reprice
+   * plan D23): it was decided against a price that is no longer there, a raise of automation's can
+   * have become a lower price that automation would confirm itself, undoing a person's own change,
+   * and the cadence it was admitted under was judged on the old picture; it fails, and the strategy
+   * asks again against the new one. Isolated so a saboteur can send on the stale picture, or refreeze
+   * a strategy's.
+   */
+  protected refreezePriceEdit(hop: WorkStepRow, action: ActionRow, listing: SteamListingRow, authority: CommandAuthority): 'unchanged' | 'refrozen' | 'already' | 'moved' {
+    const { database } = this.context;
+    const params = database.actionParams(action) as PriceUpdateParams;
+    if (listing.price_cents === null || listing.price_cents === params.fromPriceCents) return 'unchanged';
+    if (listing.price_cents === params.priceReceiveCents) return 'already';
+    if (authority === 'STRATEGY') return 'moved';
+    const fromPriceCents = listing.price_cents;
+    const terms = this.work.params<CommandHopParams | null>(hop) ?? {};
+    database.transaction(() => {
+      database.raw().prepare('UPDATE action SET params_json=? WHERE id=?').run(JSON.stringify({ ...params, fromPriceCents }), action.id);
+      this.work.update(hop.id, { params_json: JSON.stringify({ ...terms, fromPriceCents }) }, this.context.now());
+      database.addEvent(hop.account_id, 'price-change-refrozen', { stepId: hop.id, listingId: params.listingId, admittedAt: params.fromPriceCents, sentAt: fromPriceCents }, this.context.now());
+    });
+    return 'refrozen';
+  }
+
+  /**
+   * When Steam's cooldown on a listing's price ends, while the record says it is still running;
+   * `null` when it is over or not known, and the change may be sent. Unknown is sent: Steam
+   * answers a change inside the cooldown with the time left, and asking does not extend it.
+   * Isolated so a saboteur can send inside a cooldown the record knows of.
+   */
+  protected priceEditHeldUntil(accountId: AccountId, listingId: string): string | null {
+    const readyAt = new OrderStore(this.context.database).steamListing(accountId, listingId)?.reprice_ready_at ?? null;
+    return readyAt !== null && readyAt > this.context.now() ? readyAt : null;
+  }
+
+  /**
+   * Wakes the command's account at a moment a held hop waits for, with one pass over what can move
+   * then, as a settled walk would. One timer per command and account, for the earliest moment asked;
+   * a later one is asked for again by the pass that fires. Nothing is stored: a restart finds the
+   * hop unsent and the cooldown in the record, and `resume` asks again.
+   */
+  protected wakeAt(commandId: string, accountId: AccountId, atMs: number): void {
+    const key = `${commandId}\u0000${accountId}`;
+    const pending = this.wakes.get(key);
+    if (pending !== undefined && pending <= atMs) return;
+    this.wakes.set(key, atMs);
+    const delay = Math.max(0, atMs - this.context.ports.clock.now().getTime());
+    void this.context.ports.clock.sleep(delay).then(() => {
+      // An earlier wake was asked for meanwhile: that timer is the one that counts.
+      if (this.wakes.get(key) !== atMs) return;
+      this.wakes.delete(key);
+      if (this.shutDown) return;
+      try {
+        if (this.advanceable(commandId, accountId)) this.advanceCommand(commandId, accountId);
+      } catch {
+        // The runtime closed the record while the timer slept; `resume` finds the hop on the next open.
+      }
+    });
   }
 
   /**
@@ -1599,7 +2080,7 @@ export class CommandService {
     for (const action of waiting) {
       const policy = RETRY_POLICY[action.kind];
       if (!policy || policy.resend !== 'owner' || !RESENT_HERE.has(action.kind)) continue;
-      const plan = retryPlan(policy, attemptsMade(database, action.id), action.updated_at);
+      const plan = retryPlan(policy, sendsThatCouldLand(database, action.id), action.updated_at);
       if (plan.kind === 'again' && (earliest === null || plan.retryAt < earliest)) earliest = plan.retryAt;
     }
     return earliest;
@@ -1660,7 +2141,7 @@ export class CommandService {
       // one we cannot.
       if (this.openListingFor(accountId, localId)) return 'wait';
       if (this.saleEndedTheChain(accountId, localId)) return 'sold';
-      if (kind === 'REPRICE' && this.unexplainedOrderFor(accountId, localId)) return 'wait';
+      if (kind === 'RELIST' && this.unexplainedOrderFor(accountId, localId)) return 'wait';
       const cancel = previous.action_id ? database.action(previous.action_id) : undefined;
       if (cancel?.kind !== 'REMOVE_SELL_LISTING' || cancel.resolution !== 'OBSERVED_APPLIED') return 'wait';
     }
@@ -1679,7 +2160,7 @@ export class CommandService {
   protected resendDue(action: ActionRow): boolean {
     const policy = RETRY_POLICY[action.kind];
     if (!policy || policy.resend !== 'owner' || !RESENT_HERE.has(action.kind)) return false;
-    const plan = retryPlan(policy, attemptsMade(this.context.database, action.id), action.updated_at);
+    const plan = retryPlan(policy, sendsThatCouldLand(this.context.database, action.id), action.updated_at);
     return plan.kind === 'again' && Date.parse(plan.retryAt) <= Date.parse(this.context.now());
   }
 
@@ -1709,6 +2190,29 @@ export class CommandService {
    * proved not applied under a stopped command stops, because nothing will send it again.
    */
   protected reflect(hop: WorkStepRow): WorkStepRow {
+    if (hop.kind === 'EDIT_PRICE' && hop.action_id && !isSettled(hop)) {
+      const change = this.context.database.action(hop.action_id);
+      // A price change the market ended by its listing's sale, whatever its command's state: the
+      // member keeps the sale's word, as one the command's own pass ends does.
+      if (change?.state === 'FAILED' && change.error === SOLD_DURING_PRICE_CHANGE && hop.local_id) {
+        this.endBySale({ command_id: hop.command_id, account_id: hop.account_id, local_id: hop.local_id },
+          this.work.hopsOf(hop.command_id, hop.account_id, hop.local_id));
+        return this.work.step(hop.id)!;
+      }
+      // A lower price a person's Stop withdrew ends in the person's word, as every stopped hop does;
+      // one whose withdrawal Steam never heard ends stopped too, saying so (D27).
+      const stoppedWord = change?.state === 'FAILED' && (change.error === COMMAND_STOPPED
+        || (change.error === PRICE_WITHDRAWAL_UNHEARD && this.context.database.command(hop.command_id)?.state === 'STOPPED')) ? change.error : null;
+      if (stoppedWord !== null) {
+        const now = this.context.now();
+        this.context.database.transaction(() => {
+          this.work.settle(hop.id, 'STOPPED', change!.resolved_by_obs, now, stoppedWord);
+          this.work.stopLater(hop, now, stoppedWord);
+          if (hop.local_id) this.closeIfStopped(hop.command_id, hop.account_id, hop.local_id);
+        });
+        return this.work.step(hop.id)!;
+      }
+    }
     const before = hop.state;
     const after = this.work.reflectAction(hop, this.context.now());
     if (after.state === 'FAILED' && before !== 'FAILED') this.work.stopLater(after, this.context.now());
@@ -1725,20 +2229,23 @@ export class CommandService {
   }
 
   /**
-   * Ends a chain whose item sold while its cancel was in flight. There is nothing left to reprice
-   * or store: the delist hop is stopped with what happened to it and its action failed so nothing
+   * Ends a chain whose item sold while its cancel was in flight, or a price change whose listing
+   * sold before the change took. There is nothing left to reprice or store: the hop that was
+   * acting on the listing is stopped with what happened to it and its action failed so nothing
    * sends it again, the hops after it were never reached, and the member keeps the one word no hop
    * can say for it.
    */
-  protected endBySale(member: CommandMemberRow, hops: readonly WorkStepRow[]): void {
+  protected endBySale(member: Pick<CommandMemberRow, 'command_id' | 'account_id' | 'local_id'>, hops: readonly WorkStepRow[]): void {
     const { database } = this.context;
     const now = this.context.now();
     database.transaction(() => {
-      const delist = hops.find((hop) => hop.kind === 'DELIST');
+      const delist = hops.find((hop) => hop.kind === 'DELIST' || hop.kind === 'EDIT_PRICE');
       if (delist && !isSettled(delist)) {
+        const reason = delist.kind === 'EDIT_PRICE' ? SOLD_DURING_PRICE_CHANGE : SOLD_BEFORE_CANCEL;
         const action = delist.action_id ? database.action(delist.action_id) : undefined;
-        if (action && action.state !== 'DONE' && action.state !== 'FAILED') database.setActionState(action.id, 'FAILED', now, SOLD_BEFORE_CANCEL);
-        this.work.settle(delist.id, 'STOPPED', null, now, SOLD_BEFORE_CANCEL);
+        if (action && action.state !== 'DONE' && action.state !== 'FAILED') database.setActionState(action.id, 'FAILED', now, reason);
+        // On the evidence that graded the sale, where the market's reconcile ended it on that evidence.
+        this.work.settle(delist.id, 'STOPPED', action?.error === reason ? action.resolved_by_obs : null, now, reason);
       }
       for (const hop of hops) {
         if (hop.id !== delist?.id && !isSettled(hop)) this.work.settle(hop.id, 'STOPPED', null, now, SOLD_BEFORE_REACHED);
@@ -1789,15 +2296,15 @@ export class CommandService {
   }
 
   /** Both chains need an open listing to cancel and their own second-hop input. */
-  protected delistChainProblem(kind: CommandKind, member: CommandMemberInput, force: boolean): string | null {
+  protected delistChainProblem(kind: CommandKind, member: CommandMemberInput, force: boolean, authority?: CommandAuthority): string | null {
     if (!member.localId) return `${kind} needs an individual item`;
     const listing = new OrderStore(this.context.database).openSteamListingFor(member.accountId, member.localId);
     if (!listing) return `Item ${member.localId} has no open listing`;
-    if (kind === 'REPRICE' && !(member.priceReceiveCents && member.priceReceiveCents > 0)) {
-      return 'REPRICE requires a positive seller-receives price';
+    if (kind === 'RELIST' && !(member.priceReceiveCents && member.priceReceiveCents > 0)) {
+      return 'RELIST requires a positive seller-receives price';
     }
-    if (kind === 'REPRICE') {
-      const cadence = this.priceChangeProblem(listing, member.priceReceiveCents!, force);
+    if (kind === 'RELIST') {
+      const cadence = this.priceChangeProblem(listing, member.priceReceiveCents!, force, { inPlace: false, authority });
       if (cadence) return cadence;
     }
     if (kind === 'DELIST_TO_STORE' && !member.destinationCasketId) return 'DELIST_TO_STORE requires destinationCasketId';
@@ -1805,18 +2312,65 @@ export class CommandService {
   }
 
   /**
-   * The price-change cadence on a Steam listing (`kernel/price-cadence.ts`). A reprice is a new
-   * listing, so the open listing was last *changed* when its create attempt belonged to a `REPRICE`
-   * command; a first listing set its price and changed nothing, and a listing this app did not
-   * create has no attempt at all. The engine refuses only what it can date as a change.
+   * Why a price change in place is refused at admission, or `null`. Steam changes the price of a
+   * listing that is live, so one still waiting for its own confirmation, or on hold, is refused
+   * here rather than sent to be refused there; and it raises a price under the wallet's minimum,
+   * so its answer would name another price than the one asked for. The currency the change is
+   * sent in is the wallet's, which the record knows only once the wallet has been read. Every
+   * refusal is a sentence, because the window shows it as it is.
    */
-  protected priceChangeProblem(listing: SteamListingRow, priceReceiveCents: number, force: boolean): string | null {
+  protected priceEditProblem(member: CommandMemberInput, force: boolean, authority?: CommandAuthority): string | null {
+    if (!member.localId) return 'REPRICE needs an individual item';
+    if (!this.context.ports.market.updateListingPrice) return PRICE_EDIT_NOT_AVAILABLE_HERE;
+    const price = member.priceReceiveCents;
+    if (price === undefined || !Number.isInteger(price) || price <= 0) return 'REPRICE requires a positive seller-receives price';
+    const listing = new OrderStore(this.context.database).openSteamListingFor(member.accountId, member.localId);
+    if (!listing) return `Item ${member.localId} has no open listing`;
+    if (listing.raw_bucket === 'PENDING_CONFIRMATION') {
+      return `The listing of item ${member.localId} is still waiting for its confirmation in the Steam mobile app; its price can change once it is live`;
+    }
+    if (listing.raw_bucket !== 'ACTIVE') return `The listing of item ${member.localId} is on hold; its price can change once it is live`;
+    if (price === listing.price_cents) return priceAlreadyThere(member.localId);
+    const currency = this.walletCurrency(member.accountId);
+    if (currency === null) return `The wallet of ${member.accountId} has not been read yet, so the currency of its listings is not known; refresh the wallet and ask again`;
+    const lowest = quoteFromReceive('steam', price, this.walletFeeTerms(member.accountId, currency)).receiveCents;
+    if (lowest !== price) return `Steam's lowest seller price in this wallet is ${lowest} cents, and ${price} was asked for`;
+    return this.priceChangeProblem(listing, price, force, { inPlace: true, authority });
+  }
+
+  /**
+   * Fee terms for a price on the account's wallet, made now: the minimum its latest wallet read
+   * stated comes first, and the fee table answers only when no read has stated one
+   * (`kernel/wallet-terms.ts`).
+   */
+  protected walletFeeTerms(accountId: string, currency: number): FeeTerms {
+    return feeTermsNow(latestWalletStatement(this.context.database, accountId), this.context.now(), currency);
+  }
+
+  /** The account's wallet currency as Steam numbers it, from the last wallet read; `null` before the first. */
+  protected walletCurrency(accountId: string): number | null {
+    const row = this.context.database.raw().prepare('SELECT currency FROM wallet_snapshot WHERE account_id=? ORDER BY id DESC LIMIT 1').get(accountId) as { currency: number } | undefined;
+    return row?.currency ?? null;
+  }
+
+  /**
+   * The price-change cadence on a Steam listing (`kernel/price-cadence.ts`). Its price was last
+   * *changed* by the latest of two things: a price change in place that settled on it, or the
+   * relist that made it, when its create attempt belongs to a `RELIST` command. A first listing set
+   * its price and changed nothing, and a listing this app did not create has no attempt at all. The
+   * engine refuses only what it can date as a change. `terms` says how the price would change now
+   * and for whom: a change in place is not held to the interval, a relist is.
+   */
+  protected priceChangeProblem(listing: SteamListingRow, priceReceiveCents: number, force: boolean,
+    terms: { inPlace: boolean; authority?: CommandAuthority | undefined } = { inPlace: false }): string | null {
     const { database } = this.context;
     const attempt = listing.action_id ? database.action(listing.action_id) : undefined;
     const step = attempt?.step_id ? this.work.step(attempt.step_id) : undefined;
-    const relisted = step && database.command(step.command_id)?.kind === 'REPRICE';
-    return priceChangeRefusal({ venue: 'steam', lastChangedAt: relisted ? attempt!.created_at : null, currentCents: listing.price_cents ?? 0,
-      requestedCents: priceReceiveCents, now: this.context.now(), force });
+    const relistedAt = step && database.command(step.command_id)?.kind === 'RELIST' ? attempt!.created_at : null;
+    const editedAt = listing.venue_order_id ? this.work.lastDoneAt(listing.account_id, 'EDIT_PRICE', listing.venue_order_id) : null;
+    const lastChangedAt = relistedAt !== null && editedAt !== null ? (relistedAt > editedAt ? relistedAt : editedAt) : relistedAt ?? editedAt;
+    return priceChangeRefusal({ venue: 'steam', lastChangedAt, currentCents: listing.price_cents ?? 0,
+      requestedCents: priceReceiveCents, now: this.context.now(), force, authority: terms.authority, inPlace: terms.inPlace });
   }
 
   /** Destination exists, differs from source, and has a complete occupancy observation. */

@@ -11,6 +11,7 @@ import { FigureCard, type CardLine } from './FigureCard.js';
 import { pricingProgress } from './fill-label.js';
 import { slices } from './pie-math.js';
 import type { ValuationState } from './use-valuation.js';
+import { formatClock } from '../../lib/time.js';
 
 /**
  * What the inventory is worth (portfolio and pricing plan §5, §7): the market value at the mid
@@ -51,7 +52,7 @@ export function ValuePanel({ state, holdings }: { state: ValuationState; holding
           ? ' Float value is the same items with each skin at its own float on the Steam float curve, which CSlytics fits each day to Steam\'s listings, so two skins of one name can be worth different amounts. It sits beside the market value and never replaces it; the curves are in US dollars and convert at CSlytics\'s daily rate.'
           : ''}
         {answer?.prices
-          ? ` ${answer.prices.coveredKinds.toLocaleString()} of the kinds held are priced from CSlytics's hourly snapshot of Steam's books, in US dollars from ${new Date(answer.prices.generatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}${answer.base !== 'USD' ? `, converted to ${answer.base} at CSlytics's rate${answer.valuation?.fx ? ` of ${answer.valuation.fx.asOf}${answer.valuation.fx.stale ? ' (stale)' : ''}` : ''}` : ''}.`
+          ? ` ${answer.prices.coveredKinds.toLocaleString()} of the kinds held are priced from CSlytics's hourly snapshot of Steam's books, in US dollars from ${formatClock(answer.prices.generatedAt)}${answer.base !== 'USD' ? `, converted to ${answer.base} at CSlytics's rate${answer.valuation?.fx ? ` of ${answer.valuation.fx.asOf}${answer.valuation.fx.stale ? ' (stale)' : ''}` : ''}` : ''}.`
           : ''}
         {answer?.observedIn && answer.observedIn !== answer.base
           ? ` Steam prices read from this connection are in ${answer.observedIn}, converted to ${answer.base} at CSlytics's rate${answer.valuation?.fx ? ` of ${answer.valuation.fx.asOf}${answer.valuation.fx.stale ? ' (stale)' : ''}` : ''}; Steam converts at its own.`
@@ -92,7 +93,7 @@ export function ValuePanel({ state, holdings }: { state: ValuationState; holding
         ) : !answer.valued ? (
           <div className="value-pricing" data-testid="portfolio-value-pricing" role="status">
             {answer.fill === 'stopped'
-              ? <Notice tone="warn">Steam asked this machine to slow down; prices resume at {status.stoppedUntil ? new Date(status.stoppedUntil).toLocaleTimeString() : 'later'}.</Notice>
+              ? <Notice tone="warn">Steam asked this machine to slow down; prices resume at {status.stoppedUntil ? formatClock(status.stoppedUntil) : 'later'}.</Notice>
               : <Caption icon="loader" tone="quiet">{pricingProgress(answer)}</Caption>}
             <div className={`metrics value-cards${floats ? ' with-float' : ''}`} aria-hidden="true">
               {Array.from({ length: floats ? 5 : 4 }, (_, n) => n).map((n) => (
@@ -231,5 +232,5 @@ function signedPercent(value: number, of: number): string {
 }
 
 function time(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return formatClock(iso);
 }

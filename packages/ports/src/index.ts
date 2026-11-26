@@ -14,14 +14,17 @@ export type * from './vault.js';
 export type * from './steam/index.js';
 export type * from './csfloat/index.js';
 export { DEFAULT_AVATAR_HASH } from './steam/persona.js';
+export { LISTING_PRICE_COOLDOWN_MS, MARKET_ACTION_TIMEOUT_MS, listingPriceChangeAnswer, listingPriceInEffect } from './steam/market.js';
 export type { SteamCurrency } from './currency.js';
 export { CSFLOAT_CURRENCY, STEAM_CURRENCIES, STEAM_CURRENCY_CODES, currencyByCode, currencyById } from './currency.js';
-export type { FeeLine, MarketplaceFee, MarketplaceFeeSchedule, MarketplaceId, PriceQuote } from './fees.js';
-export { MARKETPLACE_FEES, buyerPaysFor, listPriceOf, quoteFromBuyer, quoteFromReceive, receiveFor } from './fees.js';
+export type { FeeLine, FeeTerms, MarketplaceFee, MarketplaceFeeSchedule, MarketplaceId, PriceQuote, TermsFor, WalletMinimum } from './fees.js';
+export { MARKETPLACE_FEES, buyerPaysFor, listPriceOf, quoteFromBuyer, quoteFromReceive, receiveFor, steamBuyOrderMinimumCents, steamFeeMinimumCents } from './fees.js';
+export { CSFLOAT_LISTING_RETURNED, csfloatListingAnswer, csfloatListingInEffect } from './csfloat/listings.js';
 export { KIT_ATTRIBUTES_BY_ITEM, KIT_ATTRIBUTES_BY_QUALITY, attributeValue, commodityMatchKey, kitToken, matchKey } from './item-key.js';
 export { STEAM_ID64_BASE, accountIdFromSteamId64, steamId64FromAccountId } from './steam-id.js';
+export { marketHistoryEventKey } from './history-key.js';
 export type { WearBand } from './wear.js';
-export { WEAR_TIERS, wearBand, wearBandSql } from './wear.js';
+export { WEAR_TIERS, kindKey, kindKeySql, wearBand, wearBandSql } from './wear.js';
 
 /**
  * What one Engine Runtime is composed from.

@@ -31,15 +31,22 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
         command.type === 'csfloat.reprice' ? command.priceCents : undefined, command.type === 'csfloat.reprice' ? command.force ?? false : false, command.authority ?? 'HUMAN');
       return { id: op.id, accountId: op.account_id, state: op.state };
     }
+    case 'csfloat.buyOrderCreate': {
+      // The reply is the admission, as for a change: the engine sends behind it, and the walk that
+      // shows the order links it to this command, which `buyOrders.read` then names (rule 1).
+      const op = await engine.csfloatBuying.submitCreate(command.accountId,command.commandId,
+        { marketHashName: command.marketHashName, maxPriceCents: command.maxPriceCents, quantity: command.quantity }, command.authority ?? 'HUMAN');
+      return { id: op.id, accountId: op.account_id, state: op.state };
+    }
     case 'csfloat.buyOrderEdit': {
       // The reply is the admission: the engine sends behind it, and the Buy orders row reads the
       // operation the way it reads a Steam cancel's action (rule 1).
       const op = await engine.csfloatBuying.submitEdit(command.accountId,command.commandId,command.orderId,{ maxPriceCents: command.maxPriceCents, quantity: command.quantity,
-        ...(command.constraints ? { constraints: command.constraints } : {}) });
+        ...(command.constraints ? { constraints: command.constraints } : {}) }, command.authority ?? 'HUMAN');
       return { id: op.id, accountId: op.account_id, state: op.state };
     }
     case 'csfloat.buyOrderCancel': {
-      const op = await engine.csfloatBuying.submitCancel(command.accountId,command.commandId,command.orderId);
+      const op = await engine.csfloatBuying.submitCancel(command.accountId,command.commandId,command.orderId,command.authority ?? 'HUMAN');
       return { id: op.id, accountId: op.account_id, state: op.state };
     }
     case 'csfloat.deliver': {
@@ -167,6 +174,7 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
     case 'inventory.page': {
       const rest = definedFields(command);
       if (rest.sort === 'name') throw new Error('inventory page reached the engine sorted by name; main must resolve a name sort to keyOrder');
+      if (rest.sort === 'price') throw new Error('inventory page reached the engine sorted by price; main must resolve a price sort to a kinds keyOrder');
       return engine.pageInventory({
         accountIds: rest.accountIds,
         ...(rest.pageSize !== undefined ? { pageSize: rest.pageSize } : {}),
@@ -203,7 +211,9 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
     case 'authority.read': return engine.views.holdingAuthority({ accountId: command.accountId, localIds: command.localIds });
     case 'authority.set': return engine.setAuthority(command.accountId, command.localIds, command.authority);
     case 'csfloat.eligibility': return engine.views.csfloatEligibility(command.accountId, command.localIds);
+    case 'inventory.accessories': return engine.views.holdingAccessories({ accountId: command.accountId, localIds: command.localIds });
     case 'history.page': return engine.pageHistory({ ...definedFields(command), ...(command.filter ? { filter: definedFields(command.filter) } : {}) });
+    case 'history.times': return engine.pageHistoryTimes({ ...definedFields(command), ...(command.filter ? { filter: definedFields(command.filter) } : {}) });
     case 'activity.page': return engine.pageActivity(definedFields(command));
     case 'storage.page': return engine.pageStorage(definedFields(command));
     case 'orders.page': return engine.pageOrders({ ...definedFields(command), ...(command.filter ? { filter: definedFields(command.filter) } : {}) });
@@ -387,8 +397,13 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
       quantity: command.quantity,
       tradeFeeTax: 0,
       billing: { state: command.billingState }
-    });
-    case 'buyOrders.read': return engine.views.buyOrders({ accountIds: command.accountIds });
+    }, { commandId: command.commandId, authority: command.authority });
+    case 'buyOrder.continue': return engine.continueBuyOrder(command.accountId, command.actionId);
+    case 'buyOrders.syncStatuses': {
+      await engine.syncBuyOrderStatuses(command.accountId);
+      return engine.views.buyOrders({ accountIds: [command.accountId] });
+    }
+    case 'buyOrders.read': return engine.views.buyOrders({ accountIds: command.accountIds, endedSince: command.endedSince });
     case 'buyOrders.refresh': {
       // Sequential, as `refresh.now` is: several accounts at once is several conversations at once.
       const read: Record<string, Partial<Record<'STEAM' | 'CSFLOAT', boolean>>> = {};
@@ -396,7 +411,10 @@ async function dispatch(command: RuntimeCommand): Promise<unknown> {
       return read;
     }
     case 'buyOrder.cancel': {
-      const action = engine.queueCancelBuyOrder(command.accountId, command.buyOrderId);
+      const action = engine.queueCancelBuyOrder(command.accountId, command.buyOrderId, { commandId: command.commandId, authority: command.authority });
+      // A cancel already sent under this command id is not sent again: its resend, if one is due,
+      // is the retry schedule's, and its outcome is the walk's.
+      if (engine.database.latestAttempt(action.id)) return { kind: 'SUBMITTED', evidence: 'replay-of-an-admitted-command', raw: { actionId: action.id, state: action.state } };
       return engine.executeCancelBuyOrder(action.id);
     }
     case 'portfolio.read': return engine.portfolio(command.accountIds);
@@ -497,15 +515,20 @@ function listingEngineFilter(filter: NonNullable<Extract<RuntimeCommand, { type:
   return rest;
 }
 
-/** The commands that only move items through this account's own units, which ask no venue anything before admission. */
-const MOVES_ONLY: ReadonlySet<CommandRequest['kind']> = new Set<CommandRequest['kind']>(['RETRIEVE', 'STORE', 'TRANSFER', 'DELIST_TO_STORE']);
+/**
+ * The commands whose admission asks no other venue anything: the ones that only move items through
+ * this account's own units, and a price change in place, which puts nothing on a market that is not
+ * there already.
+ */
+const MOVES_ONLY: ReadonlySet<CommandRequest['kind']> = new Set<CommandRequest['kind']>(['RETRIEVE', 'STORE', 'TRANSFER', 'DELIST_TO_STORE', 'REPRICE']);
 
 async function submitApprovedCommand(request: CommandRequest): Promise<unknown> {
   // A listing's preflight refuses a member whose CSFloat coverage has lapsed rather than read an
   // unwalked stall as an empty one (CSF-13), and it is synchronous by design, so the books have to
   // be current before it runs. A move between this account's inventory and its units asks no
   // venue's age (bulk storage plan D7): the store pre-check already named what the record holds,
-  // and a CSFloat read before every Store press is what made a store slow to start.
+  // and a CSFloat read before every Store press is what made a store slow to start. A price change
+  // in place asks none either: its item is on the Steam market before and after it.
   if (!MOVES_ONLY.has(request.kind)) {
     for (const accountId of commandAccounts(request)) {
       if (engine.marketplaceStatus(accountId).status !== 'CONNECTED') continue;

@@ -7,10 +7,10 @@ export class CsfloatTradeAdapter implements CsfloatTradePort {
   constructor(private readonly vault: CredentialVault, private readonly transport = new CsfloatTransport()) {}
   async getTrades(accountId: AccountId, credential: CsfloatCredentialRef, state: string) {
     const query = new URLSearchParams({ state, limit: '5000' });
-    return readResult(await this.transport.send({ accountId, method: 'GET', path: `/me/trades?${query}`, key: await requireKey(this.vault, credential) }), readTrades);
+    return readResult(await this.transport.send({ accountId, method: 'GET', path: `/me/trades?${query}`, key: await requireKey(this.vault, credential), essential: true }), readTrades);
   }
   async getTrade(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string) {
-    return readResult(await this.transport.send({ accountId, method: 'GET', path: `/trades/${encodeURIComponent(tradeId)}`, key: await requireKey(this.vault, credential) }), readTrade);
+    return readResult(await this.transport.send({ accountId, method: 'GET', path: `/trades/${encodeURIComponent(tradeId)}`, key: await requireKey(this.vault, credential), essential: true }), readTrade);
   }
   async accept(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string) {
     return mutationResult(await this.transport.send({ accountId, method: 'POST', path: '/trades/bulk/accept', key: await requireKey(this.vault, credential), body: { trade_ids: [tradeId] } }),
@@ -27,11 +27,11 @@ export class CsfloatTradeAdapter implements CsfloatTradePort {
       : { kind: 'AMBIGUOUS', cause: 'unclassified', raw: { status: result.status, unnamed: tradeId } }] as const));
   }
   async notifyOffer(accountId: AccountId, credential: CsfloatCredentialRef, offerId: string, assetIds: readonly string[]) {
-    return mutationResult(await this.transport.send({ accountId, method: 'POST', path: '/trades/steam-status/new-offer', key: await requireKey(this.vault, credential),
+    return mutationResult(await this.transport.send({ accountId, method: 'POST', path: '/trades/steam-status/new-offer', key: await requireKey(this.vault, credential), essential: true,
       body: { offer_id: offerId, given_asset_ids: assetIds, received_asset_ids: [] } }), body => record(body)?.['message'] === 'successfully updated offer state');
   }
   async cannotDeliver(accountId: AccountId, credential: CsfloatCredentialRef, tradeId: string) {
-    return mutationResult(await this.transport.send({ accountId, method: 'POST', path: `/trades/${encodeURIComponent(tradeId)}/cannot-deliver`, key: await requireKey(this.vault, credential) }),
+    return mutationResult(await this.transport.send({ accountId, method: 'POST', path: `/trades/${encodeURIComponent(tradeId)}/cannot-deliver`, key: await requireKey(this.vault, credential), essential: true }),
       body => record(body)?.['id'] === tradeId && record(body)?.['state'] === 'failed');
   }
 }

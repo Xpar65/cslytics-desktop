@@ -1,5 +1,5 @@
 import type { EngineDatabase } from '../db/database.js';
-import { CsfloatStore, type CsfloatTradeRow } from '../db/csfloat.js';
+import { CsfloatStore, salePastItsBuyerSql, type CsfloatTradeRow } from '../db/csfloat.js';
 import { MarketplaceStore } from '../db/marketplace.js';
 import { OrderStore } from '../db/orders.js';
 import { OPEN_STEP_STATES_SQL } from '../db/work.js';
@@ -76,6 +76,8 @@ export function marketplaceBlock(db: EngineDatabase, accountId: string, localId:
  * the venue's evidence to be fresh (XLIST-04). Under the cross-venue policy: with protection off
  * a live advertisement does not refuse a Steam listing (XLIST-03), and nothing else changes.
  */
+/** A sale the venue shows past its buyer: the offer accepted on Steam (3) or the verification window open. */
+const SALE_PAST_ITS_BUYER_SQL = salePastItsBuyerSql();
 export function csfloatClaim(db: EngineDatabase, accountId: string, localId: string, purpose: MarketplacePurpose, ownOperation = '', consent: readonly MarketplaceConsent[] = []): string | null {
   const store = new CsfloatStore(db), policy = store.policy();
   const assetId = db.itemByLocalId(accountId,localId)?.asset_id ?? '';
@@ -98,17 +100,22 @@ export function csfloatClaim(db: EngineDatabase, accountId: string, localId: str
   const ownAccounts = purpose === 'account-transfer';
   // An unresolved row could be any unit, so it refuses every unit — except a move between owned
   // accounts or into this account's own unit, which no CSFloat row can be about until it names one (D7).
+  // A sale past its buyer is owed nothing: the venue's copy shows the offer accepted (3) or the sale in
+  // its verification window, so its unit left with the buyer and an unresolved one names nothing this
+  // account still holds. An account that sold for months before the record began carries hundreds of
+  // those in `pending` until the venue verifies them, and each refused every delivery (2026-11-02).
   const venueBlind = ownAccounts || storesIt(purpose);
-  const unresolved = venueBlind ? '' : ' OR local_id IS NULL';
-  const contracts = store.standingContracts(accountId,localId,assetId,!venueBlind);
+  const unresolved = venueBlind ? '' : ` OR (local_id IS NULL AND NOT ${SALE_PAST_ITS_BUYER_SQL})`;
+  // Every standing contract the unit could be committed to, less the sold ones their sales settled: a sold listing is
+  // settled by its trade's ending, and one that names no unit of the record also by a sale past its buyer, which left
+  // with the buyer and is about nothing held here. One statement (`unsettledContracts`), not one per contract.
+  const contracts = store.unsettledContracts(accountId,localId,assetId,!venueBlind);
   const trades = db.raw().prepare(`SELECT * FROM csfloat_trade WHERE account_id=? AND seller_steam_id=? AND state_word NOT IN ('verified','failed','cancelled')
     AND (local_id=? OR asset_id=?${unresolved})`).all(accountId,db.account(accountId)?.steam_id64 ?? '',localId,assetId) as CsfloatTradeRow[];
   const pledged = trades.find(t => !ownTrades.has(t.trade_id));
   if (pledged && !despite('csfloat-owed')) return `Item is owed to a CSFloat buyer (trade ${pledged.trade_id})`;
   for (const contract of contracts) {
     if (ownListings.has(contract.listing_id)) continue;
-    const settled = contract.state === 'sold' && db.raw().prepare(`SELECT 1 FROM csfloat_trade WHERE account_id=? AND listing_id=? AND state_word IN ('verified','failed','cancelled')`).get(accountId,contract.listing_id);
-    if (settled) continue;
     if (purpose === 'steam-list' && !policy.preventDuplicates && contract.state === 'listed') continue;
     if (despite(contract.state === 'listed' ? 'csfloat-listed' : 'csfloat-owed')) continue;
     return contract.local_id === null ? `CSFloat listing ${contract.listing_id} has unresolved item identity`

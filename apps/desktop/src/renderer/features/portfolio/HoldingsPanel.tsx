@@ -18,6 +18,7 @@ import { Empty, Notice, Panel, Skeleton, Spinner } from '../../components/ui.js'
 import { fillLabel, pricingProgress, shortFill } from './fill-label.js';
 import { MoneyFigures, type Figure } from './money-figures.js';
 import type { ValuationState } from './use-valuation.js';
+import { formatClock } from '../../lib/time.js';
 
 /**
  * The first thing on the portfolio page: one "Total holdings" figure and the bar under it. The bar
@@ -100,7 +101,7 @@ export function HoldingsPanel({
   const unpriced = valued ? answer.valuation?.units.unpriced ?? 0 : 0;
   const readFailed = answer?.valuation?.unpricedUnitsByReason['read-failed'] ?? 0;
   const complete = valued && missing.length === 0 && readFailed === 0;
-  const stoppedAt = answer?.status.stoppedUntil ? new Date(answer.status.stoppedUntil).toLocaleTimeString() : 'later';
+  const stoppedAt = answer?.status.stoppedUntil ? formatClock(answer.status.stoppedUntil) : 'later';
   const inventoryLeftOut = answer === null || !valued || inventoryCents !== null ? null
     : answer.valuation === null && answer.needsFilter
       ? { chip: 'Inventory not valued', tip: `More than ${answer.needsFilter.cap.toLocaleString()} kinds in this scope. Open one account at a time to value its inventory.` }

@@ -11,6 +11,7 @@ import { formatAmount } from '../../lib/money.js';
 import { plural, type Tone } from '../../lib/labels.js';
 import { freshness, heldCounts } from '../../lib/portfolio.js';
 import type { AccountConnection, AccountHoldings } from '../../lib/types.js';
+import { formatClock } from '../../lib/time.js';
 
 /**
  * The Steam side of one account: the two sessions, the wallet, and who it is.
@@ -270,8 +271,7 @@ type HistoryState = { kind: 'unread' | 'reading' | 'paused' | 'stopped' | 'compl
 export function historyState(row: HistoryCoverageRow | undefined, scope: ScopeStatusRow | undefined): HistoryState {
   if (!row || row.observedAt === null) return { kind: 'unread', text: 'not read yet', tone: 'accent' };
   if (scope?.state === 'held' && scope.until) {
-    const until = new Date(scope.until);
-    const text = `paused until ${until.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    const text = `paused until ${formatClock(scope.until)}`;
     return { kind: 'paused', text, tone: 'warn', ...(scope.reason ? { detail: `Steam answered: ${scope.reason}. Reading carries on by itself.` } : {}) };
   }
   if (row.stopped) return { kind: 'stopped', text: 'stopped before the end', detail: `The older pages could not be followed (${row.stopped}). A later read of new entries starts them again.`, tone: 'warn' };

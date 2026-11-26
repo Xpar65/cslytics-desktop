@@ -13,8 +13,8 @@ export type MatchKey = string;
  * Where an image lives, stored rather than composed.
  *
  * `econ:<hash>` is a Steam economy image, which is the overwhelming majority and the only form
- * that can be asked for at an arbitrary size. An absolute URL covers what Steam does not host —
- * 85 of 110 collection icons, on the corpus measured 2026-09-13. Composition happens in exactly
+ * that can be asked for at an arbitrary size. An absolute URL covers what has no economy hash:
+ * every collection emblem, on Steam's CDN or in the catalogue's own store. Composition happens in exactly
  * one place (`images.ts`), so the host that serves the bytes is a constant rather than data.
  */
 export type ImageRef = string;
@@ -48,7 +48,17 @@ export type CatalogueEntry = {
   marketable?: boolean | null;
 };
 
-export type CatalogueCollection = { id: string; name: string; image: ImageRef | null };
+export type CatalogueCollection = {
+  id: string;
+  name: string;
+  /** Its emblem. Null when none is published, or when the one published is on no host this build loads from. */
+  image: ImageRef | null;
+  /**
+   * The day it was released, `YYYY-MM-DD`. Absent or null is no claim: a generation published
+   * before the field existed, one cached from it, or a collection with no release of its own.
+   */
+  releaseDate?: string | null;
+};
 
 export type ShardRef = { file: string; count: number; sha256: string };
 

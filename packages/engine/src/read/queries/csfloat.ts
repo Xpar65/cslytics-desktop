@@ -138,8 +138,10 @@ export function csfloatGroupEligibility(db: EngineDatabase, accountId: string, s
 
 /** One pass over the latest complete CSFloat read, answering per unit; null when there is none. */
 function venueVerdicts(db: EngineDatabase, accountId: string): ((localId: string) => { state: CsfloatEligibilityState; reason: string | null }) | null {
-  const observed = db.latestObservation(accountId, 'csfloat-inventory');
-  if (!observed || observed.complete !== 1 || observed.error !== null) return null;
+  // The latest complete read: a failed one after it, a 429 or a refused budget, says nothing, and
+  // must not turn every item unknown and take CSFloat off the window's actions (rule 5, CSF-60).
+  const observed = db.latestCompleteObservation(accountId, 'csfloat-inventory');
+  if (!observed) return null;
   const store = new CsfloatStore(db);
   const eligible = new Map<string, boolean>();
   const held = new Set<string>();

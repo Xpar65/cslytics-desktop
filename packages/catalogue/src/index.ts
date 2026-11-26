@@ -1,11 +1,12 @@
 import { attributeValue, commodityMatchKey, keyHash, kitToken, matchKey, KIT_ATTRIBUTES_BY_ITEM, KIT_ATTRIBUTES_BY_QUALITY } from './keys.js';
-import { displayName, marketHashName, qualityLabel, rawFallbackName, wearTier } from './names.js';
-import { imageUrl, cachedImageUrl, parseCachedImageUrl, resizedImageUrl, IMAGE_HOSTS, IMAGE_SCHEME, IMAGE_SIZES, isLoadableRef, ECON_IMAGE_HOST, STEAM_CDN_HOST, AVATAR_IMAGE_HOST, STEAM_MARKET_HOST, steamMarketListingUrl, steamProfileUrl } from './images.js';
-import { CatalogueParseError, isNewerRevision, parseEntry, parseIndex, parseShard, toWireEntry, toWireShard, SUPPORTED_SCHEMA } from './parse.js';
+import { displayName, isStockWeapon, marketHashName, qualityLabel, rawFallbackName, skinName, skinQuality, weaponName, wearTier, type SkinQuality } from './names.js';
+import { imageUrl, cachedImageUrl, parseCachedImageUrl, resizedImageUrl, IMAGE_HOSTS, EMBLEM_HOST, IMAGE_SCHEME, IMAGE_SIZES, isLoadableRef, ECON_IMAGE_HOST, STEAM_CDN_HOST, AVATAR_IMAGE_HOST, STEAM_MARKET_HOST, steamMarketListingUrl, steamProfileUrl } from './images.js';
+import { CatalogueParseError, isNewerRevision, parseCollections, parseEntry, parseIndex, parseShard, toWireEntry, toWireShard, SUPPORTED_SCHEMA } from './parse.js';
 import { CatalogueStore, MemoryCatalogueStore, type CatalogueStoreLike, type Miss, type StoredGeneration } from './store.js';
 import { CATALOGUE_BASE, CATALOGUE_HOST, HttpCatalogueSource, OracleCatalogueSource, type CatalogueSource } from './source.js';
 import { CSFLOAT_SCHEMA_HOST, CSFLOAT_SCHEMA_TTL_MS, CSFLOAT_SCHEMA_URL, CsfloatKindIndex, CsfloatKinds, fetchCsfloatSchema, parseCsfloatSchema, type CsfloatItemClass, type CsfloatKindsData, type CsfloatKindsRefresh, type CsfloatSupport } from './csfloat-kinds.js';
-import { prepare, rank, score, SUGGEST_THRESHOLD, type Prepared } from './suggest.js';
+import { prepare, rank, rankWords, score, startsWords, worded, SUGGEST_THRESHOLD, type Prepared, type Worded } from './suggest.js';
+import { byRelease, collectionKind, isBrowsable, rarityRank, skinsOf, type CollectionKind, type Skin } from './skins.js';
 import { wearBandsFor, normWindow, EQUALITY_TOLERANCE, type NormPredicate, type WearBand } from './bands.js';
 import { realToNorm, normToReal, type PaintRange } from './float.js';
 import type { CatalogueCollection, CatalogueEntry, MatchKey, Resolved, UnresolvedReason } from './types.js';
@@ -13,17 +14,19 @@ import type { CatalogueCollection, CatalogueEntry, MatchKey, Resolved, Unresolve
 export {
   matchKey, commodityMatchKey, keyHash, kitToken, attributeValue,
   KIT_ATTRIBUTES_BY_ITEM, KIT_ATTRIBUTES_BY_QUALITY,
-  displayName, marketHashName, rawFallbackName, wearTier, qualityLabel,
+  displayName, marketHashName, rawFallbackName, wearTier, qualityLabel, skinName, skinQuality, weaponName, isStockWeapon, isBrowsable,
   imageUrl, cachedImageUrl, parseCachedImageUrl, resizedImageUrl, isLoadableRef, IMAGE_HOSTS, IMAGE_SCHEME, IMAGE_SIZES, ECON_IMAGE_HOST, STEAM_CDN_HOST, AVATAR_IMAGE_HOST,
+  EMBLEM_HOST,
   STEAM_MARKET_HOST, steamMarketListingUrl, steamProfileUrl,
-  CatalogueParseError, isNewerRevision, parseEntry, parseIndex, parseShard, toWireEntry, toWireShard, SUPPORTED_SCHEMA,
+  CatalogueParseError, isNewerRevision, parseCollections, parseEntry, parseIndex, parseShard, toWireEntry, toWireShard, SUPPORTED_SCHEMA,
   CatalogueStore, MemoryCatalogueStore,
   HttpCatalogueSource, OracleCatalogueSource, CATALOGUE_BASE, CATALOGUE_HOST,
   CsfloatKinds, CsfloatKindIndex, fetchCsfloatSchema, parseCsfloatSchema, CSFLOAT_SCHEMA_HOST, CSFLOAT_SCHEMA_URL, CSFLOAT_SCHEMA_TTL_MS,
-  prepare, rank, score, SUGGEST_THRESHOLD, wearBandsFor, normWindow, EQUALITY_TOLERANCE,
+  prepare, rank, score, SUGGEST_THRESHOLD, worded, startsWords, rankWords, skinsOf, rarityRank, byRelease, collectionKind,
+  wearBandsFor, normWindow, EQUALITY_TOLERANCE,
   realToNorm, normToReal
 };
-export type { CatalogueSource, CatalogueStoreLike, Miss, StoredGeneration, Prepared, NormPredicate, WearBand, PaintRange, CsfloatItemClass, CsfloatKindsData, CsfloatKindsRefresh, CsfloatSupport };
+export type { CatalogueSource, CatalogueStoreLike, Miss, StoredGeneration, Prepared, Worded, Skin, SkinQuality, CollectionKind, NormPredicate, WearBand, PaintRange, CsfloatItemClass, CsfloatKindsData, CsfloatKindsRefresh, CsfloatSupport };
 export type * from './types.js';
 
 /** How long a key the server did not know is left alone before asking again. */
@@ -32,6 +35,18 @@ const MISS_BACKOFF_MS = [5 * 60_000, 30 * 60_000, 6 * 60 * 60_000, 24 * 60 * 60_
 export const RESOLVE_BATCH = 40;
 /** How many of the best-scoring item names are reordered by what the user holds. */
 export const HOLDINGS_CANDIDATES = 200;
+/** How many weapons one typed text offers to browse: `knife` names most of the knives, and a list is not a catalogue. */
+const BROWSE_WEAPONS = 6;
+/**
+ * The other words a trader types for a name that stands for many items. Kept to the ones heard
+ * daily: a list that tried to be complete would start matching things nobody meant.
+ */
+const BROWSE_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  'desert eagle': ['deagle'],
+  'ssg 08': ['scout'],
+  container: ['case'],
+  knife: ['knives']
+};
 
 export type SyncOutcome =
   | { kind: 'applied'; revision: string; entries: number }
@@ -45,6 +60,10 @@ export type SyncOutcome =
  * `items` are base names, which a chip carries as text and the mediator resolves back to keys.
  * `keywords` are the catalogue's own vocabulary — its categories and its rarity grades — so the
  * bar never offers a filter this generation cannot satisfy.
+ *
+ * Asked to browse, the answer also names `weapons`, and each weapon, collection and category says
+ * how many skins it holds (`skins`): those are the names that stand for many items, offered to a
+ * page that shows what is under one. They are matched by whole words then, never scattered letters.
  */
 export type CatalogueSuggestions = {
   /**
@@ -52,8 +71,21 @@ export type CatalogueSuggestions = {
    * match, which is what the list is ordered by.
    */
   items: Array<{ name: string; category: string; image: string | null; keys: number; owned?: number }>;
-  collections: Array<{ id: string; name: string }>;
-  keywords: Array<{ kind: 'item' | 'rarity'; text: string; label: string; rarityId?: string }>;
+  collections: Array<{ id: string; name: string; skins?: number }>;
+  keywords: Array<{ kind: 'item' | 'rarity'; text: string; label: string; rarityId?: string; skins?: number }>;
+  weapons?: Array<{ name: string; category: string; skins: number }>;
+};
+
+/** The names that stand for many items, as `suggest` matches them when asked to browse. */
+type BrowseIndex = {
+  weapons: Array<{ worded: Worded; value: { name: string; category: string; skins: number } }>;
+  collections: Array<{ worded: Worded; value: { id: string; name: string; skins: number } }>;
+  categories: Array<{ worded: Worded; value: { name: string; skins: number } }>;
+  rarities: Array<{ worded: Worded; value: { id: string; name: string; colour: string } }>;
+  /** Folded weapon name to every key of that weapon. */
+  weaponKeys: Map<string, MatchKey[]>;
+  /** Collection id to what the collection holds. */
+  collectionKinds: Map<string, CollectionKind>;
 };
 
 export type CatalogueStatus = {
@@ -91,6 +123,7 @@ export class Catalogue {
   private collectionIndex: Array<{ prepared: Prepared; value: { id: string; name: string } }> = [];
   private categoryIndex: Array<{ prepared: Prepared; value: string }> = [];
   private rarityIndex: Array<{ prepared: Prepared; value: { id: string; name: string; colour: string } }> = [];
+  private browseIndex: BrowseIndex = { weapons: [], collections: [], categories: [], rarities: [], weaponKeys: new Map(), collectionKinds: new Map() };
   private suggestBuiltAt = -1;
   private suggestBuiltFor: string | null = null;
   private etag: string | null = null;
@@ -232,6 +265,20 @@ export class Catalogue {
       .sort((left, right) => left.name.localeCompare(right.name));
   }
 
+  /**
+   * Every collection with something to browse under it, the newest release first, each with its
+   * emblem, how many skins it holds and what kind of collection it is: what a page lists before
+   * anything has been asked for. One with nothing a market sells is left out, by the rule that
+   * keeps it out of the suggestions.
+   */
+  browseCollections(): Array<CatalogueCollection & { skins: number; kind: CollectionKind }> {
+    this.rebuildSuggestIndex();
+    return byRelease(this.browseIndex.collections.flatMap(({ value }) => {
+      const collection = this.collections.get(value.id);
+      return collection ? [{ ...collection, skins: value.skins, kind: this.browseIndex.collectionKinds.get(value.id) ?? 'other' }] : [];
+    }));
+  }
+
   /** Every entry in the applied generation. The caller filters; this package holds no opinion. */
   allEntries(): CatalogueEntry[] {
     return [...this.entries.values()];
@@ -258,7 +305,7 @@ export class Catalogue {
    * round trip, no network. Items are deduplicated by their base name, because five wear tiers of
    * one skin are one thing a person meant to type, not five suggestions.
    */
-  suggest(text: string, limit = 8, holdings?: ReadonlyMap<MatchKey, number>): CatalogueSuggestions {
+  suggest(text: string, limit = 8, holdings?: ReadonlyMap<MatchKey, number>, browse = false): CatalogueSuggestions {
     const needle = text.trim();
     if (!needle) return { items: [], collections: [], keywords: [] };
     const bounded = Math.min(25, Math.max(1, Math.trunc(limit) || 8));
@@ -267,12 +314,33 @@ export class Catalogue {
     const items = holdings
       ? this.rankByHoldings(needle, bounded, holdings)
       : rank(needle, this.nameIndex, bounded).map((row) => ({ name: row.name, category: row.category, image: row.image, keys: row.keys }));
+    if (browse) {
+      return {
+        items,
+        weapons: rankWords(needle, this.browseIndex.weapons, BROWSE_WEAPONS),
+        collections: rankWords(needle, this.browseIndex.collections, Math.min(5, bounded)),
+        keywords: [
+          ...rankWords(needle, this.browseIndex.categories, 3).map((category) => ({ kind: 'item' as const, text: category.name, label: category.name, skins: category.skins })),
+          ...rankWords(needle, this.browseIndex.rarities, 3).map((rarity) => ({ kind: 'rarity' as const, text: rarity.name, label: rarity.name, rarityId: rarity.id }))
+        ]
+      };
+    }
     const collections = rank(needle, this.collectionIndex, Math.min(5, bounded));
     const keywords: CatalogueSuggestions['keywords'] = [
       ...rank(needle, this.categoryIndex, 3).map((category) => ({ kind: 'item' as const, text: category, label: category })),
       ...rank(needle, this.rarityIndex, 3).map((rarity) => ({ kind: 'rarity' as const, text: rarity.name, label: rarity.name, rarityId: rarity.id }))
     ];
     return { items, collections, keywords };
+  }
+
+  /**
+   * Every key of one weapon, by the name `suggest` offered it under: each of its skins in every
+   * quality, and not the weapon with no finish, which is no skin. `[]` for a name that is no weapon,
+   * which is "no row qualifies" and not "no filter", as `search` answers.
+   */
+  weaponKeys(name: string): MatchKey[] {
+    this.rebuildSuggestIndex();
+    return [...(this.browseIndex.weaponKeys.get(fold(name)) ?? [])];
   }
 
   /**
@@ -328,8 +396,55 @@ export class Catalogue {
     this.collectionIndex = this.collectionList().map((value) => ({ prepared: prepare(value.name), value }));
     this.categoryIndex = this.categories().map((value) => ({ prepared: prepare(value), value }));
     this.rarityIndex = this.rarities().map((value) => ({ prepared: prepare(value.name), value }));
+    this.browseIndex = this.buildBrowseIndex();
     this.suggestBuiltAt = this.entries.size;
     this.suggestBuiltFor = this.revision;
+  }
+
+  /**
+   * The names that stand for many items, each with how many skins are under it. A skin is counted
+   * once however many qualities and phases it is sold in, so the count is the number of tiles a
+   * person sees on picking the name.
+   */
+  private buildBrowseIndex(): BrowseIndex {
+    const weapons = new Map<string, { name: string; category: string; skins: Set<string>; keys: MatchKey[] }>();
+    const byCollection = new Map<string, Set<string>>();
+    const inCollection = new Map<string, CatalogueEntry[]>();
+    const byCategory = new Map<string, Set<string>>();
+    const count = (sets: Map<string, Set<string>>, key: string, skin: string): void => {
+      const held = sets.get(key);
+      if (held) held.add(skin);
+      else sets.set(key, new Set([skin]));
+    };
+    for (const entry of this.entries.values()) {
+      // Browsing is through what a market sells, by the rule the tiles themselves are kept by.
+      if (!isBrowsable(entry)) continue;
+      const skin = skinName(entry.marketHashNameBase);
+      if (entry.category) count(byCategory, entry.category, skin);
+      if (entry.collectionId) {
+        count(byCollection, entry.collectionId, skin);
+        const held = inCollection.get(entry.collectionId);
+        if (held) held.push(entry);
+        else inCollection.set(entry.collectionId, [entry]);
+      }
+      const weapon = weaponName(entry);
+      // A weapon called what its category is called (the default knife is a `Knife`) is the category.
+      if (!weapon || weapon === entry.category) continue;
+      const held = weapons.get(fold(weapon));
+      if (held) { held.skins.add(skin); held.keys.push(entry.key); }
+      else weapons.set(fold(weapon), { name: weapon, category: entry.category, skins: new Set([skin]), keys: [entry.key] });
+    }
+    const named = <T extends { name: string }>(value: T): { worded: Worded; value: T } => ({ worded: worded(value.name, BROWSE_ALIASES[fold(value.name)]), value });
+    // A name with nothing under it is not offered: picking it would show an empty page.
+    const stocked = <T extends { skins: number }>(rows: T[]): T[] => rows.filter((row) => row.skins > 0);
+    return {
+      weapons: [...weapons.values()].map((weapon) => named({ name: weapon.name, category: weapon.category, skins: weapon.skins.size })),
+      collections: stocked(this.collectionList().map((collection) => ({ ...collection, skins: byCollection.get(collection.id)?.size ?? 0 }))).map(named),
+      categories: stocked(this.categories().map((name) => ({ name, skins: byCategory.get(name)?.size ?? 0 }))).map(named),
+      rarities: this.rarities().map(named),
+      weaponKeys: new Map([...weapons.entries()].map(([key, weapon]) => [key, weapon.keys])),
+      collectionKinds: new Map([...inCollection.entries()].map(([id, entries]) => [id, collectionKind(entries)]))
+    };
   }
 
   /**

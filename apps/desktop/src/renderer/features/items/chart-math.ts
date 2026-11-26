@@ -1,3 +1,4 @@
+import { formatInZone } from '../../lib/time.js';
 /**
  * The arithmetic under the Items page's charts, kept apart from the component so it can be tested
  * in a node environment with no DOM: which point the pointer is over, where the gridlines go, and
@@ -66,9 +67,9 @@ export function timeTicks(min: number, max: number, count = 5): number[] {
 /** How an axis tick reads at a span: hours under two days, day and month under a year, else month and year. */
 export function formatTimeTick(at: number, spanMs: number): string {
   const date = new Date(at);
-  if (spanMs < 2 * DAY_MS) return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
-  if (spanMs < 365 * DAY_MS) return date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
-  return date.toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+  if (spanMs < 2 * DAY_MS) return formatInZone(date, { hour: '2-digit', minute: '2-digit' });
+  if (spanMs < 365 * DAY_MS) return formatInZone(date, { day: 'numeric', month: 'short' });
+  return formatInZone(date, { month: 'short', year: 'numeric' });
 }
 
 /**

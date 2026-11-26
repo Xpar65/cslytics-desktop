@@ -1,31 +1,43 @@
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { MARKETPLACE_FEES, listPriceOf, quoteFromBuyer, quoteFromReceive, type PriceQuote } from '@cslytics/ports';
-import { Button, Caption, IconButton, Thumbnail } from './ui.js';
+import { MARKETPLACE_FEES, listPriceOf, quoteFromBuyer, quoteFromReceive, steamFeeMinimumCents, type FeeTerms, type PriceQuote } from '@cslytics/ports';
+import { Button, Caption, IconButton, Select, Thumbnail } from './ui.js';
 import { Icon, type IconName } from './Icon.js';
 import { Tip } from './Tip.js';
 import { VenueMark } from './VenueMark.js';
 import { OrderBookLine } from './OrderBookLine.js';
+import { CompactAccessories } from './AccessoryStrip.js';
 import { useOutbox } from '../features/work/WorkIndicator.js';
 import { priceAtFloat } from '../features/items/curve-math.js';
 import { formatFloat, wearTier } from '../lib/format.js';
 import { convert, type BookLevel, type StoredCurve } from '@cslytics/market-data';
 import { parseMoney, plural } from '../lib/labels.js';
+import { useNowUntil } from '../lib/clock.js';
+import { feeTermsNow } from '../lib/wallet-minimums.js';
 import { useCurrency } from '../lib/currency.js';
 import { engine } from '../lib/engine.js';
 import { bookKey, useOrderBooks } from '../lib/order-books.js';
 import { useCslytics } from '../lib/cslytics.js';
 import { SignInLock } from './SignInLock.js';
 import { FEATURE_STEAM_MARKET, curveFeature, hasFeature, lockReason } from '../../shared/command-access.js';
-import { conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick } from '../lib/money.js';
+import { conversionNote, currencyCodeOf, formatAmount, formatConverted, formatTick, type CurrencyRef } from '../lib/money.js';
+import { extensions, type ListingStrategyPreview, type ListingStrategySend, type ListingStrategyView } from '../lib/extensions.js';
 import {
   EMPTY,
   bulkVenueOf,
   dollars,
+  heldSendOf,
+  LISTING_STRATEGY_KIND,
+  planRow,
   reduce,
+  rowListingStrategy,
+  sendsInLabel,
   venueCurrency,
   type Applied,
+  type CurrentListingStrategy,
+  type ListingStrategyOption,
   type PriceBasis,
+  type RowPlan,
   type StagedEntry,
   type StagedRow,
   type StrategyId,
@@ -36,6 +48,21 @@ import {
 } from './listing-workspace-store.js';
 import type { OutboxOutcome } from '../features/work/outbox.js';
 
+/**
+ * The listing strategies this build offers (`lib/extensions.ts`). The desktop offers none: no row
+ * shows the control, and every row is listed at the price typed, as it always was.
+ */
+const LISTING_STRATEGIES = extensions.listingStrategies;
+const NO_STRATEGY_VIEW: ListingStrategyView = { options: null, current: new Map(), reading: new Set(), previews: new Map(), error: null };
+function useNoListingStrategies(): ListingStrategyView {
+  return NO_STRATEGY_VIEW;
+}
+/** Chosen once, as the module loads, so every render calls the same hook. */
+const useListingStrategyView = LISTING_STRATEGIES?.useView ?? useNoListingStrategies;
+/** The select's value for none, and for the every-row control's "leave each row as it is". */
+const NO_STRATEGY = '';
+const KEEP_STRATEGY = '\u0000keep';
+
 /** What a venue is called on screen. What it charges is `MARKETPLACE_FEES`, and nowhere else. */
 const VENUE: Readonly<Record<Venue, { label: string; short: string }>> = {
   steam: { label: MARKETPLACE_FEES.steam.label, short: 'Steam' },
@@ -44,9 +71,13 @@ const VENUE: Readonly<Record<Venue, { label: string; short: string }>> = {
 
 /**
  * The least each venue lists at, in the figure its list call takes. CSFloat's is the `csfloat.list`
- * request schema's (`apps/desktop/src/shared/api.ts`); a Steam listing has to pay its seller a cent.
+ * request schema's (`apps/desktop/src/shared/api.ts`); a Steam listing has to pay its seller the
+ * wallet's minimum (`steamFeeMinimumCents`): what the wallet's own read stated, or by the fee table
+ * a cent, and 2¢ on an AUD wallet from 2026-11-21.
  */
-const MINIMUM_LIST_CENTS: Readonly<Record<Venue, number>> = { steam: 1, csfloat: 3 };
+function minimumListCents(venue: Venue, terms: FeeTerms): number {
+  return venue === 'steam' ? steamFeeMinimumCents(terms.walletCurrency, terms.at, terms.walletMinimumCents) : 3;
+}
 
 /**
  * `csfloat.list` takes at most 100 members (`apps/desktop/src/shared/api.ts`). The bound is shown
@@ -208,9 +239,24 @@ export function useListingWorkspace<E extends StagedEntry>(intent: WorkspaceInte
  * a retrieve before the listing, a phone confirmation, a listing the typed figure does not exist
  * at. The one thing printed in full is a refusal, because those are the engine's words.
  *
+ * **A row its venue is not taking yet says when it sends.** A Steam listing's price can change
+ * once every five minutes, and a row staged inside that time, once a new price is typed on it,
+ * carries a chip that counts down to it (`StagedEntry.heldUntil`, `heldSendOf`); a row still at
+ * the price it has sends nothing and says nothing about when. Staging the listing again reads the
+ * time again. Its button stays enabled: the engine holds a change sent early and sends it when the
+ * wait ends, and the work panel shows it waiting.
+ *
  * **Every row opens its Items page.** The press folds the panel, because the page is what the
  * price is decided against, and the page's float curve marks every unit of that name staged here
  * at the price typed for it (`features/items/staged-marks.ts`); the pill is the way back.
+ *
+ * **A build may offer listing strategies** (`lib/extensions.ts`), and the desktop offers none, so
+ * none of this shows there. With them, every row and the controls for every row have a *Listing
+ * strategy*: none, which is everything above (the price typed, sent by hand, and nothing reprices
+ * it), or a strategy the row is handed to, which lists it and keeps it listed. A row opens on what
+ * it is under now. One on a strategy that sets its own price shows what it would list at where the
+ * two fields were. What each press sends is `planRow`'s: a hand-over, a strategy letting go, the
+ * typed price, or a strategy letting go and then the typed price, in one send.
  */
 export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, onOpenItem }: {
   workspace: Workspace<E>;
@@ -247,6 +293,10 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
   const curves = useRef(new Map<string, StoredCurve | null>());
   const [curving, setCurving] = useState(false);
   const { fx } = useCurrency();
+  // What the build's listing strategies say about these rows: what each is under now, what can be
+  // chosen, and what a strategy that prices a row itself would list it at.
+  const strategyRows = useMemo(() => shown.map((row) => ({ key: row.key, entry: row.entry, venue: row.venue, chosen: row.listingStrategy })), [shown]);
+  const strategies = useListingStrategyView(strategyRows, open);
 
   // A press on the page behind the panel folds it: that page is the list a price is decided
   // against, and a panel that stayed over it had to be folded by hand before the list could be
@@ -273,9 +323,42 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
     const codes = new Set(rows.filter((row) => row.venue === venue).map((row) => currencyFor(venue, row.entry.accountId)));
     return codes.size === 1 ? [...codes][0]! : null;
   };
-  const sendable = useMemo(() => shown.filter((row) => priceOf(row, rowCurrency(row)) !== null), [shown, accounts]);
-  const steamRows = sendable.filter((row) => row.venue === 'steam');
-  const csfloatRows = sendable.filter((row) => row.venue === 'csfloat');
+  const options = strategies.options ?? [];
+  const currentOf = (row: StagedRow<StagedEntry>): CurrentListingStrategy | null => strategies.current.get(row.key) ?? null;
+  /** What a row's press sends (`planRow`). A row whose strategy is still being read sends nothing yet. */
+  const planOf = (row: StagedRow<StagedEntry>): RowPlan => {
+    if (LISTING_STRATEGIES && row.listingStrategy === undefined && strategies.reading.has(row.key)) return { kind: 'blocked', why: 'Reading its listing strategy.' };
+    const currency = rowCurrency(row);
+    const typed = pricing(row.venue, currency, row.price, row.basis);
+    return planRow({
+      chosen: row.listingStrategy,
+      current: currentOf(row),
+      options,
+      venue: row.venue,
+      priced: typed.listCents !== null,
+      changed: priceOf(row, currency) !== null,
+      buyerCents: typed.listCents !== null ? typed.quote?.buyerCents ?? null : null
+    });
+  };
+  const plans = new Map(shown.map((row) => [row.key, planOf(row)]));
+  const planFor = (row: StagedRow<StagedEntry>): RowPlan => plans.get(row.key) ?? planOf(row);
+  const sends = (plan: RowPlan): boolean => plan.kind === 'price' || plan.kind === 'release' || plan.kind === 'assign';
+  const sendable = shown.filter((row) => sends(planFor(row)));
+  const priceRows = sendable.filter((row) => planFor(row).kind === 'price');
+  const steamRows = priceRows.filter((row) => row.venue === 'steam');
+  const csfloatRows = priceRows.filter((row) => row.venue === 'csfloat');
+  // Rows handed to a strategy, or let go by one: no price of theirs is sent from here.
+  const strategyBound = sendable.length - priceRows.length;
+  /** The option a row is on, when it is one a row can be handed to. */
+  const optionOf = (row: StagedRow<StagedEntry>): ListingStrategyOption | null => {
+    const id = rowListingStrategy(row.listingStrategy, currentOf(row));
+    return id === null ? null : options.find((option) => option.id === id) ?? null;
+  };
+  /** The row is on a strategy that sets its price, so the price typed here is not what is sent. */
+  const pricedByStrategy = (row: StagedRow<StagedEntry>): boolean => {
+    if (rowListingStrategy(row.listingStrategy, currentOf(row)) === null) return false;
+    return !(optionOf(row)?.takesPrice ?? false);
+  };
   const overCsfloatBatch = csfloatRows.length > CSFLOAT_BATCH;
   const refused = shown.filter((row) => row.state === 'refused');
   const multiAccount = new Set(shown.map((row) => row.entry.accountId)).size > 1;
@@ -394,21 +477,45 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
    * good; refused, they return marked with its words and the panel opens on them.
    */
   function list(targets: ReadonlyArray<StagedRow<E>>): void {
-    if (targets.length === 0) return;
-    const byKey = new Map(targets.map((row) => [row.key, row]));
-    workspace.hand(targets.map((row) => row.key));
-    for (const batch of intent.batches(targets.map((row) => ({ entry: row.entry, venue: row.venue, cents: priceOf(row, rowCurrency(row))! })))) {
+    const planned = targets.map((row) => ({ row, plan: planFor(row) })).filter(({ plan }) => sends(plan));
+    if (planned.length === 0) return;
+    const byKey = new Map(planned.map(({ row }) => [row.key, row]));
+    workspace.hand(planned.map(({ row }) => row.key));
+    const priced = planned.filter(({ plan }) => plan.kind === 'price');
+    // A row a strategy held and a person now prices is let go first, in the same send, so the
+    // strategy never reprices what was just priced by hand, and a refusal of either returns it here.
+    const releaseFirst = new Set(planned.flatMap(({ row, plan }) => (plan.kind === 'price' && plan.release ? [row.key] : [])));
+    const batches: ListingStrategySend[] = intent.batches(priced.map(({ row }) => ({ entry: row.entry, venue: row.venue, cents: priceOf(row, rowCurrency(row))! }))).map((batch) => {
+      const releasing = batch.keys.filter((key) => releaseFirst.has(key)).map((key) => byKey.get(key)!.entry);
+      const ext = LISTING_STRATEGIES;
+      if (!ext || releasing.length === 0) return batch;
+      return { ...batch, send: async () => { await ext.release(releasing, 'none'); return batch.send(); } };
+    });
+    const ext = LISTING_STRATEGIES;
+    if (ext) {
+      for (const to of ['none', 'fallback'] as const) {
+        const rows = planned.flatMap(({ row, plan }) => (plan.kind === 'release' && plan.to === to ? [row] : []));
+        if (rows.length > 0) batches.push({ venue: rows[0]!.venue, kind: LISTING_STRATEGY_KIND, keys: rows.map((row) => row.key), send: () => ext.release(rows.map((row) => row.entry), to) });
+      }
+      const assigning = planned.flatMap(({ row, plan }) => (plan.kind === 'assign'
+        ? [{ entry: row.entry, venue: row.venue, strategy: plan.strategy, buyerCents: optionOf(row)?.takesPrice ? pricing(row.venue, rowCurrency(row), row.price, row.basis).quote?.buyerCents ?? null : null }]
+        : []));
+      if (assigning.length > 0) batches.push(...ext.assign(assigning));
+    }
+    for (const batch of batches) {
       outbox.enqueue({
         kind: batch.kind,
         items: batch.keys.map((key) => {
           const row = byKey.get(key)!;
+          const receive = receiveOf(row);
           return {
             key,
             accountId: row.entry.accountId,
             name: row.entry.name,
             imageUrl: row.entry.imageUrl,
             localId: row.entry.localId ?? null,
-            receiveCents: pricingOf(row, rowCurrency(row)).quote?.receiveCents ?? null
+            receiveCents: receive.cents,
+            currency: receive.currency
           };
         }),
         send: batch.send,
@@ -417,14 +524,29 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
     }
   }
 
+  /**
+   * What the seller receives for a row as it is sent, and the currency it is in: the typed price in
+   * the row's currency, or the strategy's in its own when it prices the row. The work panel prints
+   * the figure in that currency, since a row handed to a strategy names no marketplace to read it from.
+   */
+  function receiveOf(row: StagedRow<StagedEntry>): { cents: number | null; currency: CurrencyRef } {
+    if (!pricedByStrategy(row)) {
+      const currency = rowCurrency(row);
+      return { cents: pricing(row.venue, currency, row.price, row.basis).quote?.receiveCents ?? null, currency };
+    }
+    const preview = strategies.previews.get(row.key);
+    return preview?.state === 'priced' ? { cents: preview.receiveCents, currency: preview.currency } : { cents: null, currency: null };
+  }
+
   if (shown.length === 0) return null;
 
   const steamTotal = tally(steamRows, rowCurrency);
   const csfloatTotal = tally(csfloatRows, rowCurrency);
   const steamCurrency = currencyOfRows('steam', steamRows);
-  // A standing listing still at its own price is priced, just not worth sending. Only a row with
-  // no figure its venue would take is missing something.
-  const unchanged = shown.filter((row) => priceOf(row, rowCurrency(row)) === null && pricing(row.venue, rowCurrency(row), row.price, row.basis).listCents !== null).length;
+  // A standing listing still at its own price is priced, just not worth sending; so is a row left on
+  // the strategy it is under. Only a row with no figure its venue would take, or a choice that
+  // cannot be sent from it, is missing something.
+  const unchanged = shown.filter((row) => planFor(row).kind === 'unchanged').length;
   const unpriced = shown.length - sendable.length - unchanged;
   const bulkCurrency = currencyOfRows(bulkVenue, shown);
   const bulkPriced = pricing(bulkVenue, bulkCurrency, bulk.price, bulk.basis);
@@ -490,7 +612,7 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
             icon="x"
             size="sm"
             label="Close the listing workspace"
-            title="Close the listing workspace — unstages everything here. The items stay selected."
+            title="Close and unstage everything. The items stay selected."
             onClick={() => dispatch({ type: 'close' })}
           />
         </header>
@@ -576,16 +698,34 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
                       size="sm"
                       variant="default"
                       label="Apply to all rows"
-                      title="Apply to all rows — every row takes this price and marketplace, the ones priced by hand too"
+                      title="Every row takes this price and marketplace, including rows priced by hand"
                       onClick={() => dispatch({ type: 'apply' })}
                     />
                     <Tip label="How the controls for every row work" content="Type either figure and the other follows from that marketplace's fees. A row you price or route yourself keeps that until you apply to all." />
                   </span>
                 </div>
                 <NoteChips note={bulkPriced.note} />
+                {LISTING_STRATEGIES ? (
+                  <div className="listing-strategy-line">
+                    <span className="listing-control-label">Listing strategy</span>
+                    <StrategySelect
+                      label="Listing strategy for every row"
+                      keep
+                      value={bulk.listingStrategy === undefined ? KEEP_STRATEGY : bulk.listingStrategy.id ?? NO_STRATEGY}
+                      options={options}
+                      onChange={(next) => dispatch({
+                        type: 'listingStrategyAll',
+                        strategy: next === KEEP_STRATEGY ? undefined : next === NO_STRATEGY ? { id: null, venues: null } : { id: next, venues: options.find((option) => option.id === next)?.venues ?? null }
+                      })}
+                    />
+                    <Tip label="How the listing strategy for every row works" content="Written on every row that has not chosen its own and whose marketplace the strategy lists on. None lists each row at the price typed, and nothing reprices it after. Apply to all writes it on every row." />
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </section>
+
+          {strategies.error ? <Caption icon="alert-triangle" tone="warn">Listing strategies could not be read: {strategies.error}</Caption> : null}
 
           {overCsfloatBatch ? (
             <Caption icon="alert-triangle" tone="warn">
@@ -599,10 +739,19 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
               const { entry } = row;
               const currency = rowCurrency(row);
               const priced = pricingOf(row, currency);
-              const cents = priced.listCents;
               const tier = wearTier(entry.paintWear);
               const caption = entry.venueCaption?.[row.venue] ?? entry.caption;
               const quote = entry.marketHashName ? books.get(bookKey(entry.accountId, entry.marketHashName)) : undefined;
+              const plan = planFor(row);
+              const current = currentOf(row);
+              const byStrategy = pricedByStrategy(row);
+              // The price note is about the typed figure, which a strategy that sets the price ignores;
+              // and a row handed over or let go sends something even at the price it is listed at.
+              const note = byStrategy ? null : plan.kind === 'assign' || plan.kind === 'release' ? pricing(row.venue, currency, row.price, row.basis).note : priced.note;
+              const planChip = chipOfPlan(plan, current, intent.verb, labelOfStrategy(rowListingStrategy(row.listingStrategy, current), options, current));
+              const chosen = optionOf(row);
+              // "Sends in" only while the press would send a price the venue holds (`heldSendOf`).
+              const held = heldSendOf(entry, plan);
               return (
                 <li className="listing-row" key={row.key} data-state={row.state}>
                   <Thumbnail url={entry.imageUrl} name={entry.name} size={34} />
@@ -619,6 +768,9 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
                             </span>
                           </Tip>
                         ) : null}
+                        {/* What is applied is part of what is being priced: two copies at one float
+                            are not one price if one carries a sticker. */}
+                        <CompactAccessories accessories={entry.accessories} />
                         {multiAccount ? <span className="listing-row-account">{accountName(entry.accountId)}</span> : null}
                       </span>
                       {entry.marketHashName && !marketLocked ? (
@@ -631,10 +783,12 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
                     </span>
                     {/* What the row has to say beyond its figures, on a line of its own so the
                         facts and the book above it keep theirs. */}
-                    {caption || (priced.note && priced.note.short !== null) ? (
+                    {caption || held || (note && note.short !== null) || planChip ? (
                       <span className="listing-row-chips">
                         {caption ? <Chip icon={caption.icon} text={caption.text}>{caption.short}</Chip> : null}
-                        <NoteChips note={priced.note} />
+                        {held ? <HeldChip until={held.at} why={held.why} /> : null}
+                        <NoteChips note={note} />
+                        {planChip ? <Chip icon={planChip.icon} tone={planChip.tone} text={planChip.text}>{planChip.short}</Chip> : null}
                       </span>
                     ) : null}
                   </span>
@@ -662,15 +816,40 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
                     />
                   </span>
 
+                  {/* Who lists the row and keeps it listed: none (the price typed, by hand) or a
+                      strategy the build offers. It opens on what the row is under now. */}
+                  {LISTING_STRATEGIES ? (
+                    <div className="listing-strategy-line">
+                      <span className="listing-control-label">Listing strategy</span>
+                      <StrategySelect
+                        label={`Listing strategy for ${entry.name}`}
+                        value={rowListingStrategy(row.listingStrategy, current) ?? NO_STRATEGY}
+                        options={options}
+                        current={current}
+                        venue={row.venue}
+                        disabled={row.listingStrategy === undefined && strategies.reading.has(row.key)}
+                        onChange={(next) => dispatch({ type: 'listingStrategy', key: row.key, strategy: next === NO_STRATEGY ? null : next })}
+                      />
+                      {chosen ? <Tip label={`About ${chosen.label}`} content={chosen.title} /> : current && rowListingStrategy(row.listingStrategy, current) === current.id ? <Tip label={`About ${current.label}`} content={current.title} /> : null}
+                    </div>
+                  ) : null}
+
                   <div className="listing-controls">
-                    <PriceFields
-                      currency={currency}
-                      subject={entry.name}
-                      venue={row.venue}
-                      priced={priced}
-                      disabled={false}
-                      onChange={(price, basis) => dispatch({ type: 'price', key: row.key, price, basis })}
-                    />
+                    {byStrategy ? (
+                      <StrategyPrice
+                        label={labelOfStrategy(rowListingStrategy(row.listingStrategy, current), options, current)}
+                        preview={strategies.previews.get(row.key)}
+                      />
+                    ) : (
+                      <PriceFields
+                        currency={currency}
+                        subject={entry.name}
+                        venue={row.venue}
+                        priced={priced}
+                        disabled={false}
+                        onChange={(price, basis) => dispatch({ type: 'price', key: row.key, price, basis })}
+                      />
+                    )}
 
                     {/* Only the venues this row's own verdict allows can be chosen. A row Steam will
                         take and CSFloat will not is not a row to offer CSFloat on and refuse later —
@@ -689,7 +868,7 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
                       size="sm"
                       className="listing-row-act"
                       icon="tag"
-                      disabled={cents === null}
+                      disabled={!sends(plan)}
                       onClick={() => list([row])}
                     >
                       {intent.verb}
@@ -707,6 +886,11 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
           <span className="listing-total quiet">
             {steamRows.length > 0 ? <Tally venue="steam" count={steamRows.length} total={steamTotal} currency={steamCurrency} noun={intent.noun} /> : null}
             {csfloatRows.length > 0 ? <Tally venue="csfloat" count={csfloatRows.length} total={csfloatTotal} currency={1} noun={intent.noun} /> : null}
+            {strategyBound > 0 ? (
+              <span className="listing-tally" title={`${plural(strategyBound, intent.noun)} handed to a listing strategy, or let go by one: no price of theirs is sent from here`}>
+                <Icon name="route" size={12} />{strategyBound.toLocaleString()} to strategies
+              </span>
+            ) : null}
             {unpriced > 0 ? (
               <span className="listing-tally" data-tone="warn" title={`${plural(unpriced, intent.noun)} without a price`}><Icon name="alert-circle" size={12} />{unpriced.toLocaleString()} unpriced</span>
             ) : null}
@@ -727,6 +911,107 @@ export function ListingWorkspace<E extends StagedEntry>({ workspace, accounts, o
   </>;
 }
 
+/** What a strategy id is called: its option's label, else what the row is under now or goes back to. */
+function labelOfStrategy(id: string | null, options: readonly ListingStrategyOption[], current: CurrentListingStrategy | null): string {
+  if (id === null) return 'None';
+  const option = options.find((candidate) => candidate.id === id);
+  if (option) return option.label;
+  if (current?.id === id) return current.label;
+  if (current?.fallback?.id === id) return current.fallback.label;
+  return id;
+}
+
+/**
+ * The listing strategy control: none, what the row is under now when it is a default rather than
+ * a strategy it was handed to, what an assigned row goes back to, and every strategy on offer. One
+ * that does not list on the row's marketplace is shown, disabled, saying where it does.
+ */
+function StrategySelect({ label, value, options, current, venue, keep, disabled, onChange }: {
+  label: string;
+  value: string;
+  options: readonly ListingStrategyOption[];
+  current?: CurrentListingStrategy | null | undefined;
+  /** The row's marketplace; absent for the control over every row. */
+  venue?: Venue | undefined;
+  /** Offer "each row's own", which writes nothing: the control over every row. */
+  keep?: boolean | undefined;
+  disabled?: boolean | undefined;
+  onChange: (next: string) => void;
+}): React.JSX.Element {
+  const extra: Array<{ id: string; label: string }> = [];
+  if (current && !current.assigned) extra.push({ id: current.id, label: `${current.label} (now)` });
+  if (current?.assigned && current.fallback) extra.push({ id: current.fallback.id, label: current.fallback.label });
+  if (current?.assigned && !options.some((option) => option.id === current.id)) extra.push({ id: current.id, label: `${current.label} (now)` });
+  return (
+    <Select className="listing-strategy-select" label={label} value={value} disabled={disabled} onChange={onChange}>
+      {keep ? <option value={KEEP_STRATEGY}>Each row's own</option> : null}
+      <option value={NO_STRATEGY}>None: the price typed, by hand</option>
+      {extra.map((entry) => <option key={entry.id} value={entry.id}>{entry.label}</option>)}
+      {options.map((option) => {
+        const reachable = venue === undefined || option.venues.includes(venue);
+        const now = current?.assigned === true && current.id === option.id;
+        return (
+          <option key={option.id} value={option.id} disabled={!reachable}>
+            {option.label}{now ? ' (now)' : ''}{reachable ? '' : ` (${option.venues.map((name) => VENUE[name].short).join(', ')} only)`}
+          </option>
+        );
+      })}
+    </Select>
+  );
+}
+
+/** In place of the price fields, for a row on a strategy that sets its price: what it would list at now. */
+function StrategyPrice({ label, preview }: { label: string; preview: ListingStrategyPreview | undefined }): React.JSX.Element {
+  // The line is the width of the two fields it replaces, and the control above it names the
+  // strategy, so the line says the figures; the whole sentence is its tip.
+  let text = `${label} sets the price`;
+  let tip = `${label} sets the price, and changes it as it reprices.`;
+  let tone: 'warn' | undefined;
+  if (preview?.state === 'reading') {
+    text = 'Reading its price…';
+    tip = `Reading what ${label} would list it at now.`;
+  } else if (preview?.state === 'priced') {
+    const buyer = formatAmount(preview.buyerCents, preview.currency);
+    const receive = preview.receiveCents === null ? null : formatAmount(preview.receiveCents, preview.currency);
+    text = `Lists at ${formatTick(preview.buyerCents, preview.currency)}${preview.receiveCents === null ? '' : ` · you get ${formatTick(preview.receiveCents, preview.currency)}`}`;
+    tip = `${label} would list it now with the buyer paying ${buyer}${receive ? `, which pays you ${receive}` : ''}. It changes the price as it reprices.`;
+  } else if (preview?.state === 'waiting') {
+    text = `Waits: ${preview.why}`;
+    tip = `${label} would not list it yet: ${preview.why}. It lists it once it can.`;
+    tone = 'warn';
+  } else if (preview?.state === 'failed') {
+    text = 'Its price could not be read';
+    tip = `What ${label} would list it at could not be read: ${preview.why}`;
+    tone = 'warn';
+  }
+  return (
+    <span className="listing-strategy-price" data-tone={tone} data-testid="listing-strategy-price">
+      <Icon name="route" size={12} />
+      <span title={tip}>{text}</span>
+    </span>
+  );
+}
+
+/** What a row's plan has to say beyond its figures, as a chip; `null` when it is the ordinary one. */
+function chipOfPlan(plan: RowPlan, current: CurrentListingStrategy | null, verb: string, chosen: string): { icon: IconName; tone?: 'warn' | 'info'; short: string; text: string } | null {
+  switch (plan.kind) {
+    case 'blocked':
+      return { icon: 'alert-circle', tone: 'warn', short: 'Not sent', text: plan.why };
+    case 'assign':
+      return { icon: 'route', tone: 'info', short: 'Hands over', text: `${verb} hands it to ${chosen}, which lists it and keeps it listed from then on. Nothing is listed by hand from here.` };
+    case 'release':
+      return plan.to === 'fallback'
+        ? { icon: 'route', tone: 'info', short: 'Back to default', text: `${verb} takes it from ${current?.label ?? 'its strategy'}, and ${chosen} lists it again.` }
+        : { icon: 'route', tone: 'info', short: 'Lets go', text: `${verb} takes it from ${current?.label ?? 'its strategy'}. It stays at the price it is listed at, and nothing reprices it.` };
+    case 'price':
+      return plan.release
+        ? { icon: 'route', tone: 'info', short: 'Lets go', text: `It is under ${current?.label ?? 'a strategy'}, which lets it go first. Then it is listed at the price typed, and nothing reprices it.` }
+        : null;
+    default:
+      return null;
+  }
+}
+
 /** A word or two on the row, with the sentence behind it in a tip. */
 function Chip({ icon, text, tone, children }: { icon: IconName; text: string; tone?: 'warn' | 'info' | undefined; children: React.ReactNode }): React.JSX.Element {
   return (
@@ -734,6 +1019,16 @@ function Chip({ icon, text, tone, children }: { icon: IconName; text: string; to
       <span className="listing-chip" data-tone={tone}><Icon name={icon} size={11} />{children}</span>
     </Tip>
   );
+}
+
+/**
+ * The countdown on a row its venue is not taking yet: "Sends in 3:41", with why in its tip. It
+ * reads the clock itself, so the second that passes re-renders this chip and not the workspace,
+ * and it is gone, and done with the clock, once the wait is over.
+ */
+function HeldChip({ until, why }: { until: number; why: string }): React.JSX.Element | null {
+  const label = sendsInLabel(until, useNowUntil(until));
+  return label === null ? null : <span data-testid="listing-row-held"><Chip icon="clock" tone="info" text={why}>{label}</Chip></span>;
 }
 
 /** What a typed figure has to say for itself, as a chip; an unparsable figure is the field's own to show. */
@@ -797,7 +1092,7 @@ function VenueChoice({ label, value, venues, unavailable, onChange, className }:
             className="listing-venue-item"
             aria-checked={value === venue}
             disabled={why !== null}
-            title={why ? `${VENUE[venue].short} — ${why}` : VENUE[venue].label}
+            title={why ? `${VENUE[venue].short}: ${why}` : VENUE[venue].label}
             onClick={() => onChange(venue)}
           >
             <VenueMark venue={venue} size={14} decorative />
@@ -968,19 +1263,28 @@ type Pricing = {
   note: { tone: 'warn' | 'info'; short: string | null; text: string } | null;
 };
 
-/** A typed figure, read through one venue's fees. Every price on this screen goes through here. */
+/**
+ * A typed figure, read through one venue's fees. Every price on this screen goes through here. It
+ * is priced to list now from a wallet in `currency` (`FeeTerms`): Steam's minimum fee is the one
+ * the wallet's own read stated (`lib/wallet-minimums.ts`), and a wallet that has stated none is
+ * charged by the fee table.
+ */
 function pricing(venue: Venue, currency: number | null, text: string, basis: PriceBasis): Pricing {
+  const terms: FeeTerms = feeTermsNow(currency);
   const typed = parseMoney(text);
-  const quote = typed === null ? null : basis === 'receive' ? quoteFromReceive(venue, typed) : quoteFromBuyer(venue, typed);
+  const quote = typed === null ? null : basis === 'receive' ? quoteFromReceive(venue, typed, terms) : quoteFromBuyer(venue, typed, terms);
   const receiveText = basis === 'receive' ? text : quote ? dollars(quote.receiveCents) : '';
   const buyerText = basis === 'buyer' ? text : quote ? dollars(quote.buyerCents) : '';
   if (typed === null || quote === null) {
     return { basis, quote: null, listCents: null, receiveText, buyerText, note: { tone: 'warn', short: null, text: 'Not a price.' } };
   }
   const listCents = listPriceOf(venue, quote);
-  const minimum = MINIMUM_LIST_CENTS[venue];
-  if (listCents < minimum) {
-    const least = MARKETPLACE_FEES[venue].listPrice === 'receive' ? quoteFromReceive(venue, minimum) : quoteFromBuyer(venue, minimum);
+  const minimum = minimumListCents(venue, terms);
+  // Typed in the figure the venue lists at, a price under its minimum is under the cheapest
+  // listing: Steam would raise it to the minimum's listing, and a figure sent is never moved.
+  const asked = basis === MARKETPLACE_FEES[venue].listPrice ? typed : listCents;
+  if (Math.min(asked, listCents) < minimum) {
+    const least = MARKETPLACE_FEES[venue].listPrice === 'receive' ? quoteFromReceive(venue, minimum, terms) : quoteFromBuyer(venue, minimum, terms);
     return {
       basis, quote, listCents: null, receiveText, buyerText,
       note: {

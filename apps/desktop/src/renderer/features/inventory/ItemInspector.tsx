@@ -1,22 +1,28 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { StoragePageRow } from '@cslytics/engine';
-import { Button, Caption, Empty, Field, Select, Thumbnail } from '../../components/ui.js';
+import { Badge, Button, Caption, Empty, Field, IconButton, Select, Thumbnail } from '../../components/ui.js';
+import { Tip } from '../../components/Tip.js';
 import { Icon, type IconName } from '../../components/Icon.js';
-import { VenueMark } from '../../components/VenueMark.js';
 import { useWorkRefresh } from '../work/WorkIndicator.js';
 import { formatFloat, wearTier } from '../../lib/format.js';
-import { buyerPaysFor } from '@cslytics/ports';
+import { buyerPaysFor, steamFeeMinimumCents } from '@cslytics/ports';
+import { feeTermsNow, walletMinimumOf } from '../../lib/wallet-minimums.js';
 import { COMMAND_KIND, formatDate, locationLabel, lockLabel, parseMoney, plural } from '../../lib/labels.js';
 import { itemIsBusy } from '../work/work-busy.js';
 import { submitCommand, type CommandKind } from './commands.js';
 import type { StagedItem } from './list-intent.js';
-import { InspectorHero, InspectorKind, InspectorWear } from '../../components/InspectorParts.js';
+import { InspectorBusy, InspectorHero, InspectorKind, InspectorWear } from '../../components/InspectorParts.js';
+import { InspectorAccessories } from '../../components/AccessoryStrip.js';
 import { OrderBookLine } from '../../components/OrderBookLine.js';
-import { FloatPriceLine } from '../../components/FloatPriceLine.js';
+import { InspectorMarket } from '../../components/InspectorMarket.js';
+import { ListingMark, ListingMarks } from '../../components/ListingMark.js';
 import { bookKey, useOrderBooks } from '../../lib/order-books.js';
 import { useCslytics } from '../../lib/cslytics.js';
-import { SignInLock } from '../../components/SignInLock.js';
-import { FEATURE_CSFLOAT_CURVES, FEATURE_STEAM_MARKET, lockReason } from '../../../shared/command-access.js';
+import { FEATURE_STEAM_MARKET, lockReason } from '../../../shared/command-access.js';
+import { VENUE_ID, VENUE_LABEL } from '../../lib/marketplaces.js';
+import { repriceBlocked, stageListing, type StagedListing } from '../listings/listing-actions.js';
+import { Money, type NamedListing } from '../listings/listing-parts.js';
+import { listingsOf, useHoldingListings } from './holding-listings.js';
 import { UnitFill, UnitName } from './UnitParts.js';
 import { ItemMoreDetails } from './ItemMoreDetails.js';
 import { isStorageUnit, itemName, unitOfItem } from './storage-unit.js';
@@ -31,8 +37,8 @@ import {
   allowedActions,
   groupsFor,
   intersect,
+  listedVenues,
   lockOf,
-  venuesFor,
   type ActionGroup,
   type ActionKind,
   type CsfloatState
@@ -40,6 +46,7 @@ import {
 import { selectedRows, selectionKey, selectionQuantity, type InventorySelection } from './selection.js';
 import type { NamedItem } from './InventoryTiles.js';
 import type { Message } from '../../components/ui.js';
+import { extensions } from '../../lib/extensions.js';
 
 
 /**
@@ -88,10 +95,17 @@ const GROUP_META: Readonly<Record<ActionGroup, { label: string; icon: IconName; 
  * each roster card says what its own item could do on its own, and can drop it from the selection.
  * Store is the one exception (`PARTIAL_GROUPS`): it is offered when some of the selection can be
  * stored, and its panel ([StoreDetail](./StoreDetail.tsx)) sends only those and says what it leaves out.
+ *
+ * **A listed item is also a listing.** Its tile and its row carry a tag with the venue's mark in
+ * it (`ListingMark`), and the panel reads the listing itself from the Listings read
+ * (`useHoldingListings`): where it is, at what, and a way to it on the Listings page. *Reprice*
+ * stages that listing in the shell's reprice workspace, the dock the Listings page's pencil stages
+ * into (`stageListing`), so a new price is read through the venue's fees and sent the same way
+ * from either page.
  */
-export function ItemInspector({ accountIds, accounts, units, selection, subject, busyKeys, onMessage, destinations, onDestinations, price, onPrice, onSubmitted, onStage, onDeselect, onUnitRenamed, onOpenItem, onShowUnit }: {
+export function ItemInspector({ accountIds, accounts, units, selection, subject, busyKeys, onMessage, destinations, onDestinations, price, onPrice, onSubmitted, onStage, onReprice, onOpenListing, onDeselect, onUnitRenamed, onOpenItem, onShowUnit }: {
   accountIds: readonly string[];
-  accounts: ReadonlyArray<{ id: string; name: string; steamId64?: string | null | undefined }>;
+  accounts: ReadonlyArray<{ id: string; name: string; steamId64?: string | null | undefined; currency?: number | null | undefined }>;
   units: readonly StoragePageRow[];
   selection: InventorySelection;
   subject: NamedItem | null;
@@ -104,6 +118,10 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   onSubmitted?: (() => void) | undefined;
   /** Stage this selection for listing. The workspace itself belongs to the view, not to this panel. */
   onStage: (staged: readonly StagedItem[]) => void;
+  /** Stage these listings for a new price, in the workspace the Listings page reprices from. */
+  onReprice?: ((staged: readonly StagedListing[]) => void) | undefined;
+  /** Opens the Listings page on this listing. */
+  onOpenListing?: ((listing: NamedListing) => void) | undefined;
   /** Drop one handle from a multi-selection without clearing the rest. */
   onDeselect?: ((key: string) => void) | undefined;
   /** Opens the item page for the selected item's market name. */
@@ -144,20 +162,37 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   }
   const count = selectionQuantity(selection) || rows.length;
   const frozen = Boolean(selection.manifest);
-  // The Steam order book for the one item shown, or for the roster row open, read live while it is
-  // on screen and for no other row: a selection of hundreds costs the market nothing until a row
-  // opens. Asked with the account, so a wallet the anonymous book is not priced for sees its own.
-  const shownRow = single ?? rows.find((row) => selectionKey(row) === openRow) ?? null;
+  // The Steam order book for the roster row open, read live while it is on screen and for no other
+  // row: a selection of hundreds costs the market nothing until a row opens. One item alone reads
+  // its own in `InspectorMarket`. Asked with the account, so a wallet the anonymous book is not
+  // priced for sees its own.
+  const shownRow = single ? null : rows.find((row) => selectionKey(row) === openRow) ?? null;
   const bookAccount = shownRow?.accountId ?? null;
   const bookName = shownRow?.marketHashName ?? null;
   // Behind the CSlytics sign-in (pricing behind sign-in plan §7.6): while it is locked, or not yet
   // known, no book is asked for, so main is never sent the read it would refuse.
   const cslytics = useCslytics();
   const bookLocked = cslytics === null || lockReason(cslytics, FEATURE_STEAM_MARKET) !== null;
-  // The CSFloat float price beside the book, for one item with a float, while the grant holds the curves.
-  const csfloatCurveLocked = cslytics === null || lockReason(cslytics, FEATURE_CSFLOAT_CURVES) !== null;
   const bookKeys = useMemo(() => (!bookLocked && bookAccount !== null && bookName !== null ? [{ accountId: bookAccount, name: bookName }] : []), [bookLocked, bookAccount, bookName]);
   const books = useOrderBooks(bookKeys, true);
+
+  // The listings of whatever in the selection says it is listed, read as the Listings page reads
+  // them, so Reprice stages the very rows that page's pencil would.
+  const holdingListings = useHoldingListings(rows);
+  /** Every listing of the selection a reprice can change, staged as the Listings page stages one. */
+  const repriceable = useMemo(
+    () => rows.flatMap((row) => listingsOf(holdingListings, row)).filter((listing) => repriceBlocked(listing) === null),
+    [rows, holdingListings]
+  );
+  // Reprice pressed before the listings had been read stages them the moment they are, unless the
+  // selection changed first: a press is about what was selected when it was made.
+  const repriceWaiting = useRef(false);
+  useEffect(() => { repriceWaiting.current = false; }, [rows]);
+  useEffect(() => {
+    if (!repriceWaiting.current || holdingListings.byHolding === null) return;
+    repriceWaiting.current = false;
+    if (repriceable.length > 0) onReprice?.(repriceable.map(stageListing));
+  }, [holdingListings.byHolding, repriceable, onReprice]);
 
   // Whether the venue is connected at all, which is a different question from whether this item is
   // eligible on it. A disconnected venue hides the action; an unchecked item explains itself.
@@ -257,6 +292,9 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   const chosen = group && groups.allowed.includes(group) ? group : null;
   const busy = rows.some((row) => itemIsBusy(busyKeys, row));
   const priceCents = parseMoney(price);
+  // The wallet the selection lists from, when its accounts share one; `null` until a read names it.
+  const wallets = new Set(rows.map((row) => accounts.find((account) => account.id === row.accountId)?.currency ?? null));
+  const wallet = wallets.size === 1 ? [...wallets][0]! : null;
   const accountsWithUnits = [...new Set(rows.map((row) => row.accountId))];
   const unitsFor = (accountId: string): StoragePageRow[] => units.filter((unit) => unit.accountId === accountId);
   const otherAccounts = accounts.filter((account) => !rows.some((row) => row.accountId === account.id));
@@ -269,6 +307,13 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
     setGroup(next);
     onMessage(null);
     if (next === 'LIST' && workspaceAvailable && !busy) onStage(verdicts);
+    if (next === 'REPRICE' && workspaceAvailable && !busy) stageReprice();
+  }
+
+  /** The selection's listings into the reprice workspace, or as soon as they have been read. */
+  function stageReprice(): void {
+    if (holdingListings.byHolding === null) { repriceWaiting.current = true; return; }
+    if (repriceable.length > 0) onReprice?.(repriceable.map(stageListing));
   }
 
   async function run(kind: ActionKind): Promise<void> {
@@ -352,7 +397,11 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
     });
   }
 
-  /** The price field, shared by the frozen-selection List and by Reprice. */
+  /**
+   * The price field, shared by the frozen-selection List and by Reprice. The buyer's figure is the
+   * listing's now, on the selection's wallet: Steam's minimum fee is the wallet's at the time.
+   */
+  const leastFee = steamFeeMinimumCents(wallet, now, walletMinimumOf(wallet));
   const priceField = (label: string): React.JSX.Element => (
     <>
       <Field label={label}>
@@ -366,7 +415,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
       </Field>
       {priceCents !== null ? (
         <Caption icon="dollar-sign">
-          <span title="Steam adds its fee and the game's fee, each at least one cent.">buyer pays about {(buyerPaysFor('steam', priceCents) / 100).toFixed(2)}</span>
+          <span title={`Steam adds its fee and the game's fee, each at least ${leastFee === 1 ? 'one cent' : `${leastFee} cents`}.`}>buyer pays about {(buyerPaysFor('steam', priceCents, feeTermsNow(wallet, now)) / 100).toFixed(2)}</span>
         </Caption>
       ) : null}
     </>
@@ -415,18 +464,10 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
           </>
         );
       }
-      const venues = new Set(verdicts.flatMap(({ verdict }) => venuesFor(verdict)));
+      // The workspace is already open and says the rest on its rows: the price, the marketplaces
+      // each item can reach. What stays here is what the press costs before any listing is made.
       return (
         <>
-          <Caption icon="tag">
-            {plural(rows.length, 'item')} in the listing workspace, priced and sent from there.
-          </Caption>
-          <Caption icon="info">
-            {venues.has('steam') ? <><VenueMark venue="steam" size={12} /> Steam</> : null}
-            {venues.has('steam') && venues.has('csfloat') ? ' · ' : ''}
-            {venues.has('csfloat') ? <><VenueMark venue="csfloat" size={12} /> CSFloat</> : null}
-            {venues.size === 1 ? ' is the only marketplace this selection can reach.' : ' are both open to this selection.'}
-          </Caption>
           {chainCaption('LIST')}
           <Button size="sm" variant="primary" icon="tag" disabled={busy} onClick={() => onStage(verdicts)}>
             Open the listing workspace
@@ -484,15 +525,36 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
     }
 
     if (active === 'REPRICE') {
+      if (!workspaceAvailable) {
+        // A frozen selection has no listings here to stage: the engine holds its members.
+        return <>
+          {priceField('New price, seller receives')}
+          <Caption icon="info">The listing is removed and a new one created at the new price. Both steps are observed.</Caption>
+          {submitButton('REPRICE', priceCents === null)}
+        </>;
+      }
+      if (holdingListings.byHolding === null) {
+        return <Caption icon={holdingListings.failed ? 'info' : 'loader'}>{holdingListings.failed ? `The listing could not be read: ${holdingListings.reason ?? 'no answer'}. Reprice it from the Listings page.` : 'Reading the listing…'}</Caption>;
+      }
+      const found = rows.flatMap((row) => listingsOf(holdingListings, row));
+      const held = found.filter((listing) => repriceBlocked(listing) !== null);
+      const unread = rows.filter((row) => listedVenues(row).length > 0 && listingsOf(holdingListings, row).length === 0).length;
+      // The listings are in the workspace, which is open; only what could not be staged is said here.
       return <>
-        {priceField('New price, seller receives')}
-        <Caption icon="info">The listing is removed and a new one created at the new price. Both steps are observed.</Caption>
-        {submitButton('REPRICE', priceCents === null)}
+        {repriceable.length === 0 ? <Caption icon="info">Nothing here can be repriced from this app.</Caption> : null}
+        {held.length > 0 ? <Caption icon="info">{plural(held.length, 'listing')} cannot be repriced: {repriceBlocked(held[0]!)}.</Caption> : null}
+        {unread > 0 ? <Caption icon="info">{plural(unread, 'item')} {unread === 1 ? 'is' : 'are'} not on the Listings page yet. The next market walk finds {unread === 1 ? 'it' : 'them'}.</Caption> : null}
+        <div className="inspector-action">
+          <Button size="sm" variant="primary" icon="pencil" disabled={busy || repriceable.length === 0} onClick={stageReprice}>
+            Open the listing workspace
+          </Button>
+          {single ? <GoToListing listings={listingsOf(holdingListings, single)} onOpen={onOpenListing} /> : null}
+        </div>
       </>;
     }
 
     return <>
-      <Caption icon="download">Taken out of storage and back into main inventory. It needs {plural(rows.length, 'free inventory slot')}.</Caption>
+      <Caption icon="download">Needs {plural(rows.length, 'free inventory slot')}.</Caption>
       {submitButton('RETRIEVE')}
     </>;
   }
@@ -506,6 +568,8 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
         collection={single.collection}
         account={accountIds.length > 1 ? accountName(single.accountId) : undefined}
         heading={selectedUnit ? <UnitName key={`${selectedUnit.accountId}:${selectedUnit.casketId}`} unit={selectedUnit} onSettled={() => onUnitRenamed?.()} /> : undefined}
+        // What is applied comes on the row, as main attached it to the page.
+        beneath={<InspectorAccessories accessories={single.accessories} value={single.appliedValue} onOpen={onOpenItem} />}
       />
     ) : (
       <div className="inspector-hero">
@@ -524,27 +588,15 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
         action one item blocks is withheld for all of them. */}
     {/* The market the item is priced against, read live while it is shown: bid, mid and ask in
         the book's currency, the account's own read when its wallet is in another (plan D17), and,
-        for an item with a float, its float price on CSFloat's curve. To read, not to press: a price
-        is typed in the listing workspace, from the book on its row. */}
+        for an item with a float, its float price on CSFloat's curve. The listing inspector draws
+        the same block for the item behind a listing. */}
     {single && single.marketHashName ? (
-      <div className="inspector-book" data-testid="inspector-book">
-        {!bookLocked ? <OrderBookLine quote={books.get(bookKey(single.accountId, single.marketHashName))} /> : cslytics ? (
-          <SignInLock
-            status={cslytics}
-            feature={FEATURE_STEAM_MARKET}
-            shape="inline"
-            title="Order book"
-            tip="The highest buy order, the mid and the lowest listing for this item, read live from Steam."
-            testId="inspector-book-lock"
-          />
-        ) : null}
-        {!csfloatCurveLocked && single.paintWear !== null && single.paintWear !== undefined ? <FloatPriceLine name={single.marketHashName} float={single.paintWear} /> : null}
-        {onOpenItem && hasItemPage ? (
-          <Button size="sm" variant="ghost" icon="trending-up" data-testid="open-item-page" onClick={() => onOpenItem(single.marketHashName!)}>
-            Item page
-          </Button>
-        ) : null}
-      </div>
+      <InspectorMarket
+        accountId={single.accountId}
+        marketHashName={single.marketHashName}
+        paintWear={single.paintWear}
+        onOpenItem={hasItemPage ? onOpenItem : undefined}
+      />
     ) : null}
     <div className="inspector-actions">
       {selectedUnit && onShowUnit ? (
@@ -596,7 +648,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
         return (
           <Caption key={option} icon="info">
             {GROUP_META[option].label} unavailable: {plural(blocker.count, 'item')} {blocker.count === 1 ? 'is' : 'are'} {blocker.reason}
-            {' — '}<em>{blocker.first}</em>{blocker.count > 1 ? ` and ${blocker.count - 1} more` : ''}
+            {' ('}<em>{blocker.first}</em>{blocker.count > 1 ? ` and ${blocker.count - 1} more` : ''}{')'}
           </Caption>
         );
       }) : null}
@@ -604,13 +656,19 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
       {single && !combined.allowed.includes('CSFLOAT_LIST') && csfloatConnected && eligibility[single.localId] === 'unknown' ? (
         <Caption icon="info">Refresh eligibility on the CSFloat tab to see whether this item can be listed there.</Caption>
       ) : null}
+      {extensions.selectionActions?.({ rows, accountIds })}
     </div>
 
-    {/* True of the selection as a whole rather than of any one item in it. */}
+    {/* True of the selection as a whole rather than of any one item in it: a chip each, the
+        sentence in its tip. */}
     {frozen || busy ? (
-      <div className="inspector-where">
-        {frozen ? <Caption icon="lock">This selection is frozen: a later inventory change will not add to it.</Caption> : null}
-        {busy ? <Caption icon="hourglass">Busy: an open command already names {single ? 'this item' : 'one of these items'}. Its actions return when the work leaves the panel.</Caption> : null}
+      <div className="toolbar inspector-state">
+        {frozen ? (
+          <Tip content="This selection is frozen: a later inventory change will not add to it.">
+            <Badge tone="quiet" icon="lock">Frozen</Badge>
+          </Tip>
+        ) : null}
+        {busy ? <InspectorBusy several={!single} /> : null}
       </div>
     ) : null}
 
@@ -622,9 +680,31 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
             <Icon name={locationLabel(single.location).icon ?? 'package'} size={13} />
             {placeOf(single)}
           </span>
+          {/* Listed is said beside the place, never as one: the item is still in the inventory.
+              The venue's tag and the price are the whole line; the words are in its tip. */}
+          {listingsOf(holdingListings, single).map((listing) => (
+            <span className="inline inspector-listed" key={`${listing.venue}:${listing.listingId}`} data-testid="inspector-listed">
+              <Tip content={`Listed on ${VENUE_LABEL[listing.venue]}: what the buyer pays.`}>
+                <ListingMark venue={VENUE_ID[listing.venue]} size={14} />
+                <Money cents={listing.buyerPriceCents} currency={listing.currency} />
+              </Tip>
+              {listing.awaitingConfirmation === 1 ? (
+                <Tip content="Waiting for you to confirm in the Steam Mobile app. Until then it is not on the market.">
+                  <Icon name="smartphone" size={12} />
+                </Tip>
+              ) : null}
+              {onOpenListing ? (
+                <IconButton icon="arrow-up-right" size="sm" label={`Go to the ${VENUE_LABEL[listing.venue]} listing`} onClick={() => onOpenListing(listing)} />
+              ) : null}
+            </span>
+          ))}
+          {holdingListings.byHolding === null && listedVenues(single).length > 0 ? (
+            <span className="inline inspector-listed"><ListingMarks venues={listedVenues(single)} size={14} /></span>
+          ) : null}
           {lock ? <Caption icon="lock" tone="warn">{lockLabel(lock.kind, lock.until)}</Caption> : null}
           {selectedUnit ? <UnitFill unit={selectedUnit} /> : null}
         </div>
+        {extensions.inspectorPanels?.({ kind: 'item', row: single })}
         <ItemMoreDetails row={single} accounts={accounts} units={units} />
       </>
     ) : (
@@ -656,6 +736,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
                       {placeOf(row)}
                       {rowTier ? ` · ${rowTier.label}` : ''}
                       {wear !== null ? <> · <span className="num">{formatFloat(wear)}</span></> : null}
+                      <ListingMarks venues={listedVenues(row)} size={12} />
                     </span>
                   </span>
                   {rowBusy ? <Icon name="hourglass" size={12} className="roster-mark" /> : null}
@@ -684,6 +765,7 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
                     <InspectorKind rarity={row.rarity} collection={row.collection} />
                     {accountIds.length > 1 ? <div className="inspector-meta quiet">{accountName(row.accountId)}</div> : null}
                     <InspectorWear paintWear={wear} paintSeed={row.paintSeed} range={row} />
+                    <InspectorAccessories accessories={row.accessories} value={row.appliedValue} onOpen={onOpenItem} />
                     {row.marketHashName && !bookLocked ? <OrderBookLine quote={books.get(bookKey(row.accountId, row.marketHashName))} /> : null}
                     {rowLock ? <Caption icon="lock" tone="warn">{lockLabel(rowLock.kind, rowLock.until)}</Caption> : null}
                     {/* What this one allows, which is not always what the batch allows: it is how
@@ -705,6 +787,24 @@ export function ItemInspector({ accountIds, accounts, units, selection, subject,
   </aside>;
 }
 
+/**
+ * The way from an item to its listing on the Listings page: one button for one listing, one per
+ * marketplace, named by it, for an item listed on both.
+ */
+function GoToListing({ listings, onOpen }: {
+  listings: readonly NamedListing[];
+  onOpen?: ((listing: NamedListing) => void) | undefined;
+}): React.JSX.Element | null {
+  if (!onOpen || listings.length === 0) return null;
+  return <>
+    {listings.map((listing) => (
+      <Button key={`${listing.venue}:${listing.listingId}`} size="sm" icon="layers" data-testid="go-to-listing" onClick={() => onOpen(listing)}>
+        {listings.length === 1 ? 'Go to listing' : `Go to ${VENUE_LABEL[listing.venue]} listing`}
+      </Button>
+    ))}
+  </>;
+}
+
 /** The verb a kind belongs to. Only listing has more than one kind under it. */
 function groupOf(kind: ActionKind): ActionGroup {
   return GROUP_ORDER.find((group) => GROUP_KINDS[group].includes(kind)) ?? 'LIST';
@@ -719,7 +819,7 @@ function breakdown(rows: readonly NamedItem[], now: Date): string {
   const at = (location: string): number => rows.filter((row) => row.location === location).length;
   const main = at('MAIN');
   const stored = at('CASKET');
-  const listed = rows.filter((row) => row.steamListed).length;
+  const listed = rows.filter((row) => listedVenues(row).length > 0).length;
   const locked = rows.filter((row) => lockOf(row, now) !== null).length;
   if (main) parts.push(`${main} in inventory`);
   if (stored) parts.push(`${stored} in storage`);

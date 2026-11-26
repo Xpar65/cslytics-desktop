@@ -5,6 +5,7 @@ import { relativeTime } from '../../lib/format.js';
 import { NOTIFICATION_KINDS } from './kinds.js';
 import { useNotifications } from './NotificationProvider.js';
 import { centre, type Notification, type Route } from './model.js';
+import { formatClock } from '../../lib/time.js';
 
 /**
  * The record, behind the bell: what holds right now, then what happened earlier, newest first.
@@ -76,5 +77,5 @@ function Row({ row, onGo }: { row: Notification; onGo: (route: Route) => void })
 function clock(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return formatClock(date);
 }

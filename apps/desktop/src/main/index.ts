@@ -11,7 +11,7 @@ import { MarketDataHost, SYSTEM_CLOCK } from './market-data/host.js';
 import { AccountBooks } from './market-data/account-books.js';
 import { marketFetch, memberFetch } from './market-data/fetch.js';
 import { PricesRefresher } from './market-data/prices.js';
-import { itemCurve, itemHistory, itemPage, itemVariants, itemWatch, portfolioValuation } from './market-data/portfolio.js';
+import { inventoryPriceOrder, itemCurve, itemHistory, itemPage, itemVariants, itemWatch, portfolioValuation } from './market-data/portfolio.js';
 import { ImageCache } from './images/cache.js';
 import { imageFetch } from './images/fetch.js';
 import { ElectronCredentialVault } from './credential-vault.js';
@@ -24,6 +24,10 @@ import { CHANGE_CHANNEL, ENGINE_HOST_SURFACE, engineCommandSchema, type ChangeNo
 import { catalogueFetch, csfloatSchemaFetch } from './catalogue/fetch.js';
 import { CatalogueMediator } from './catalogue/mediator.js';
 import { HoldingCounts, type GroupPage } from './catalogue/holding-counts.js';
+import { attachAccessories, type AppliedRow } from './catalogue/attach-accessories.js';
+import { priceAccessories, type AppliedPricing } from './market-data/applied-value.js';
+import type { NamedHoldingAccessories } from '../shared/accessories.js';
+import type { HoldingAccessories } from '@cslytics/engine';
 import { openCheckout } from './checkout/checkout-window.js';
 import { enrichStoreSheet, resolveStoreLines } from './store-names.js';
 import { DESKTOP_PRELOAD_ENTRY, HOST_PAGE_PRELOAD_ENTRY } from '../shared/build-contract.js';
@@ -234,6 +238,15 @@ if (!acquiredLock) {
       ...(market.oracle ? { seeded: (accountId: string, name: string) => market.seededAccountBook(accountId, name) } : {})
     });
     const marketDeps = { host: market, catalogue, settings: () => settings.current(), invoke: invokeRuntime, accountBooks };
+    // What is applied to a holding: named by the catalogue, then priced from the snapshot already in
+    // the cache, with what the stickers and the charm add to the item (`priceAccessories`). The
+    // snapshot prices nothing without its feature in the grant, so signed out these are names alone.
+    const appliedPricing: AppliedPricing = {
+      rows: (names) => market.coveredRows(names),
+      fx: () => market.store.latestFx() ?? null,
+      settings: () => settings.current()
+    };
+    const applied = (held: HoldingAccessories[]): NamedHoldingAccessories[] => priceAccessories(appliedPricing, catalogue.nameAccessories(held));
     // CSFloat's own catalogue, which says why an item cannot go there (`csfloat-kinds.ts`): read at
     // start, then asked hourly and fetched once the copy held is four hours old. A failure keeps
     // the last copy; with none, rows carry no answer and the window says only what the read said.
@@ -394,6 +407,8 @@ if (!acquiredLock) {
       const cslyticsAnswer = answerCslytics(cslytics, cslyticsReady, command);
       if (cslyticsAnswer) return cslyticsAnswer;
       if (command.type === 'settings.currency') return settings.writeCurrency(command.currency);
+      if (command.type === 'settings.time') return settings.writeTime(command.time);
+      if (command.type === 'settings.appliedValue') return settings.writeAppliedValue(command.appliedValue);
       // The bell's watermarks: main's file, never the runtime's.
       if (command.type === 'notifications.state') return notificationsState.current();
       if (command.type === 'notifications.seen') return notificationsState.markSeen(command.accountId, command.watermark);
@@ -444,13 +459,23 @@ if (!acquiredLock) {
         };
       }
       if (command.type === 'catalogue.suggest') {
-        if (!command.accountIds) return catalogue.suggest(command.text, command.limit);
+        if (!command.accountIds) return catalogue.suggest(command.text, command.limit, undefined, command.browse);
         // Counts still loading: the plain order now, and `pending` asks the bar to ask again.
         const holdings = await holdingCounts.get(command.accountIds);
-        const answer = catalogue.suggest(command.text, command.limit, holdings.counts);
+        const answer = catalogue.suggest(command.text, command.limit, holdings.counts, command.browse);
         return holdings.pending ? { ...answer, pending: true } : answer;
       }
+      if (command.type === 'catalogue.skins') return catalogue.skins(command.chips, command.offset, command.limit);
+      if (command.type === 'catalogue.collections') return catalogue.collectionTiles();
       if (command.type === 'catalogue.accessories') return catalogue.accessories(command.family, command.text, command.limit);
+      if (command.type === 'inventory.accessories') {
+        // Names, pictures and prices: the engine answers each slot by kit id, the catalogue says what
+        // that sticker, patch or charm is (`nameAccessories`), and the snapshot says what it sells for.
+        const answer = await invokeRuntime(command);
+        if (!Array.isArray(answer)) return answer;
+        void resolvePendingAndNotify(catalogue);
+        return applied(answer as HoldingAccessories[]);
+      }
       // The window is the only thing that knows which account it is showing, and the tier hooks
       // above fire without it. Remembering the last scope it named is what lets a focus event
       // restore the right one rather than guessing.
@@ -506,7 +531,7 @@ if (!acquiredLock) {
         const answer = await invokeRuntime(forwarded) as { kind?: string; rows?: unknown[] };
         if (command.type === 'listings.page' && answer?.kind === 'page' && Array.isArray(answer.rows)) {
           void resolvePendingAndNotify(catalogue);
-          return { ...answer, rows: catalogue.enrich(answer.rows as Array<Record<string, unknown>>) };
+          return { ...answer, rows: await withAccessories(applied, catalogue.enrich(answer.rows as Array<Record<string, unknown>>)) };
         }
         return answer;
       }
@@ -523,7 +548,15 @@ if (!acquiredLock) {
           // same walk reuse it, so one walk has one order and its cursors stay valid.
           Object.assign(forwarded, {
             sort: 'keys',
-            keyOrder: await tileNameOrder(catalogue, command.accountIds, resolved, command.cursor === undefined)
+            keyOrder: await tileOrder('name', command.accountIds, resolved, command.cursor === undefined, () => tileNameOrder(catalogue, command.accountIds, resolved))
+          });
+        }
+        if (command.type === 'inventory.page' && command.sort === 'price') {
+          // And for the price cache: market kinds in the order of the price held for each
+          // (`inventoryPriceOrder`), kept for the walk the same way. No price reaches the engine.
+          Object.assign(forwarded, {
+            sort: 'kinds',
+            keyOrder: await tileOrder('price', command.accountIds, resolved, command.cursor === undefined, () => inventoryPriceOrder(marketDeps, command.accountIds, resolved))
           });
         }
         const answer = await invokeRuntime(forwarded);
@@ -533,7 +566,10 @@ if (!acquiredLock) {
           // A miss found while naming this page is worth one batched question later, never a
           // request per row or per render.
           void resolvePendingAndNotify(catalogue);
-          return { ...envelope, rows: catalogue.enrich(envelope.rows as Array<Record<string, unknown>>) };
+          const named = catalogue.enrich(envelope.rows as Array<Record<string, unknown>>);
+          // A row of items, not of groups, comes with what is applied to each: tiles and opened
+          // groups draw it, and the inspector reads it off the row it was handed.
+          return { ...envelope, rows: command.type === 'inventory.page' ? await withAccessories(applied, named) : named };
         }
         return answer;
       }
@@ -774,8 +810,26 @@ async function resolvePendingAndNotify(catalogue: CatalogueMediator): Promise<vo
   } catch { /* a lookup that failed is a miss with a backoff, not an error the window can act on */ }
 }
 
-/** The name order of the last tile walk, so turning its pages does not read the summary again. */
+/** The order of the last tile walk, so turning its pages does not work it out again. */
 let lastTileOrder: { key: string; order: string[] } | null = null;
+
+/**
+ * A tile walk's order, worked out on its first page and reused for the rest. The cursor binds the
+ * order it was made under, so a walk that changed order midway would go stale at the next page.
+ */
+async function tileOrder(
+  sort: 'name' | 'price',
+  accountIds: readonly string[],
+  filter: Record<string, unknown> | undefined,
+  fresh: boolean,
+  work: () => Promise<string[]>
+): Promise<string[]> {
+  const key = JSON.stringify([sort, accountIds, filter ?? null]);
+  if (!fresh && lastTileOrder?.key === key) return lastTileOrder.order;
+  const order = await work();
+  lastTileOrder = { key, order };
+  return order;
+}
 
 /** What each recently searched account set holds, so the filter bar can offer it first. */
 const holdingCounts = new HoldingCounts((accountIds, cursor) => invokeRuntime({
@@ -794,11 +848,8 @@ const holdingCounts = new HoldingCounts((accountIds, cursor) => invokeRuntime({
 async function tileNameOrder(
   catalogue: CatalogueMediator,
   accountIds: readonly string[],
-  filter: Record<string, unknown> | undefined,
-  fresh: boolean
+  filter: Record<string, unknown> | undefined
 ): Promise<string[]> {
-  const key = JSON.stringify([accountIds, filter ?? null]);
-  if (!fresh && lastTileOrder?.key === key) return lastTileOrder.order;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const rows: Array<Record<string, unknown>> = [];
     let cursor: string | undefined;
@@ -817,11 +868,9 @@ async function tileNameOrder(
     if (stale) continue;
     const named = new Map<string, string>();
     for (const row of catalogue.enrich(rows)) if (!named.has(row.matchKey)) named.set(row.matchKey, row.name);
-    const order = [...named.entries()]
+    return [...named.entries()]
       .sort(([leftKey, leftName], [rightKey, rightName]) => compareNames(leftName, rightName) || leftKey.localeCompare(rightKey))
       .map(([matchKey]) => matchKey);
-    lastTileOrder = { key, order };
-    return order;
   }
   throw new Error('The inventory kept changing while it was being put in name order. Try again in a moment.');
 }
@@ -901,6 +950,15 @@ function notifyMarketChanged(): void {
  * await it — the focus and wake hints — cannot become an uncaught exception in main. The local
  * transport waits out a remove or reset itself; the remote one answers with the host's sentence.
  */
+/** A page's rows with the stickers, patches and charm applied to each one's holding, named and priced (`attachAccessories`). */
+function withAccessories<T extends Record<string, unknown>>(applied: (held: HoldingAccessories[]) => NamedHoldingAccessories[], rows: readonly T[]): Promise<Array<T & AppliedRow>> {
+  return attachAccessories(
+    rows,
+    (accountId, localIds) => invokeRuntime({ type: 'inventory.accessories', accountId, localIds }),
+    applied
+  );
+}
+
 async function invokeRuntime(command: unknown): Promise<unknown> {
   const side = engineSide;
   if (!side) throw new Error('Engine Runtime is not running');

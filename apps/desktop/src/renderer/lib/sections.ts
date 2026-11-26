@@ -20,7 +20,9 @@ export const SECTION_IDS = [
   'settings',
   // A page a connected engine host serves, shown in a view (remote engine host plan D12). Which
   // one is the shell's state; the id is the slot they share.
-  'host-page'
+  'host-page',
+  // A page an extension supplies, shown in one slot; which one is the shell's state.
+  'extension'
 ] as const;
 
 export type Section = (typeof SECTION_IDS)[number];

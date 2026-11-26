@@ -41,8 +41,26 @@ export const STEAM_CDN_HOST = 'cdn.steamstatic.com';
  */
 export const AVATAR_IMAGE_HOST = 'avatars.steamstatic.com';
 
-/** Every host the renderer may load an image from. Mirrored in the CSP; guarded by `check:assets`. */
-export const IMAGE_HOSTS: readonly string[] = [ECON_IMAGE_HOST, STEAM_CDN_HOST, AVATAR_IMAGE_HOST];
+/**
+ * Where a collection's emblem is read from: the catalogue's own host.
+ *
+ * Steam serves the emblems of about a quarter of the collections. The rest ship only inside the
+ * game's files, so the catalogue keeps a copy of every emblem and names it as the collection's
+ * `icon`: one file to a picture, named for the SHA-256 of its bytes, a PNG or an SVG. On the
+ * corpus measured 2026-11-24 that is all 110 collections, 14 of them vector drawings, which is
+ * how the game has drawn every emblem since late 2024.
+ *
+ * The host serves the whole catalogue, so the path is the allowlist: that one folder and a name
+ * of that one shape, and nothing beside it. The name is derived from the picture, as an economy
+ * hash is, so a stored emblem is never stale: one that is redrawn is another name in a later
+ * catalogue. And the host is the one item names already come from (`CATALOGUE_HOST` in
+ * `source.ts`), so an emblem adds no host to the ones this app talks to.
+ */
+export const EMBLEM_HOST = 'api.cslytics.com';
+const EMBLEM_PATH = /^\/free\/v1\/catalogue\/emblems\/[0-9a-f]{64}\.(png|svg)$/;
+
+/** Every host a picture may be fetched from. `check:assets` keeps each of them out of the window's own policy. */
+export const IMAGE_HOSTS: readonly string[] = [ECON_IMAGE_HOST, STEAM_CDN_HOST, AVATAR_IMAGE_HOST, EMBLEM_HOST];
 
 /**
  * The Steam Community Market's page for one item, by its market hash name.
@@ -114,11 +132,14 @@ export function imageUrl(ref: ImageRef | null | undefined, size: ImageSize = 128
   if (!IMAGE_HOSTS.includes(parsed.hostname)) return null;
   if (parsed.search || parsed.hash || parsed.username || parsed.password || parsed.port) return null;
   // An allowlisted host is not an allowlisted path. Steam serves the whole store from these
-  // names; only the econ trees and the avatar tree are loadable.
+  // names; only the econ trees and the avatar tree are loadable. The emblems' host serves the
+  // whole catalogue and more, and one folder of it is loadable as a picture.
   if (parsed.hostname === AVATAR_IMAGE_HOST) {
     if (!/^\/[0-9a-f]{40}(_medium|_full)?\.jpg$/.test(parsed.pathname)) {
       return null;
     }
+  } else if (parsed.hostname === EMBLEM_HOST) {
+    if (!EMBLEM_PATH.test(parsed.pathname)) return null;
   } else if (!/^\/(economy\/image|apps\/730\/icons)\//.test(parsed.pathname)) {
     return null;
   }
@@ -179,8 +200,8 @@ export function cachedImageUrl(ref: ImageRef | null | undefined, size: ImageSize
   if (!ref || imageUrl(ref, size) === null) return null;
   if (ref.startsWith(AVATAR_PREFIX)) return `${IMAGE_SCHEME}://avatar/${ref.slice(AVATAR_PREFIX.length).toLowerCase()}/${size}`;
   if (ref.startsWith(ECON_PREFIX)) return `${IMAGE_SCHEME}://econ/${ref.slice(ECON_PREFIX.length)}/${size}`;
-  // An absolute reference on an allowlisted host: 85 of 110 collection icons are one of these
-  // rather than an economy hash, so the third form is not a corner case.
+  // An absolute reference on an allowlisted host: every collection emblem is one of these rather
+  // than an economy hash, so the third form is not a corner case.
   const parsed = new URL(imageUrl(ref, size)!);
   return `${IMAGE_SCHEME}://cdn/${parsed.hostname}${parsed.pathname}/${size}`;
 }

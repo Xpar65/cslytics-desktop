@@ -3,13 +3,13 @@ import type { NotificationApi } from '../NotificationProvider.js';
 import { browserSeenStore, failureKey, readSeenFailures } from '../../work/work-seen.js';
 
 /**
- * The engine's reason on a CSFloat listing from a storage unit that CSFloat never saw.
+ * The engine's reason on a CSFloat listing whose item CSFloat's copy of the inventory never showed.
  *
  * The same text as `CSFLOAT_VISIBILITY_TIMEOUT_REASON` in `packages/engine/src/policy/csfloat-selling.ts`.
  * The window imports the engine for types only, so the text is repeated here, and
  * `tests/unit/work-notifications.test.ts` fails if the two ever differ.
  */
-export const VISIBILITY_TIMEOUT_REASON = 'CSFloat did not show the item within 10 minutes; it stays in main inventory';
+export const VISIBILITY_TIMEOUT_REASON = 'CSFloat did not show the item in its inventory in time; it stays in main inventory';
 
 /** The part of a `work.open` row this producer reads. */
 export type WorkFailureRow = { accountId: string; commandId: string; commandKind: string; memberId: string; memberState: string; reason: string | null };

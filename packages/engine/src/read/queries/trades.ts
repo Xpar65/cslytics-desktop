@@ -421,7 +421,7 @@ function entriesSql(accounts: readonly string[], asOf: string, where: EntryFilte
 /** Steam's history lines once it has any for this trade; the offer's lines otherwise. Never both. */
 function lineScope(database: EngineDatabase, base: Pick<EntryBase, 'accountId' | 'offerId' | 'tradeId' | 'peerAccountId'>): LineScope | null {
   if (base.tradeId) {
-    const recorded = database.raw().prepare('SELECT 1 AS found FROM trade_line WHERE account_id=? AND trade_id=? LIMIT 1').get(base.accountId, base.tradeId);
+    const recorded = database.statement('SELECT 1 AS found FROM trade_line WHERE account_id=? AND trade_id=? LIMIT 1').get(base.accountId, base.tradeId);
     if (recorded) return { accountId: base.accountId, source: 'trade', id: base.tradeId, peerAccountId: base.peerAccountId };
   }
   if (base.offerId) return { accountId: base.accountId, source: 'offer', id: base.offerId, peerAccountId: base.peerAccountId };
@@ -526,19 +526,18 @@ function originOf(database: EngineDatabase, base: EntryBase, scope: LineScope | 
 
 function transferOf(database: EngineDatabase, base: EntryBase): TradeTransferLink | null {
   if (!base.offerId) return null;
-  const raw = database.raw();
   // The send hop that put the offer up, seen from either side; its transfer's words come from the
   // hops (`TransferStore.batch`).
   type SendRow = { command_id: string; account_id: string };
-  const named = raw.prepare(`SELECT s.command_id, s.account_id FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
+  const named = database.statement(`SELECT s.command_id, s.account_id FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
     WHERE s.kind='SEND' AND s.offer_id=? AND (s.account_id=? OR d.destination_account_id=?) LIMIT 1`).get(base.offerId, base.accountId, base.accountId) as SendRow | undefined;
   if (named) return linkOf(database, named, 'offer-id');
   // A send whose response was lost is correlated later, by the message it carried (`orchestrate/transfer.ts`).
   // Until then the offer is still this app's transfer, and saying "other" would be the wrong answer.
-  const offer = raw.prepare('SELECT message FROM trade_offer WHERE account_id=? AND offer_id=?').get(base.accountId, base.offerId) as { message: string | null } | undefined;
+  const offer = database.statement('SELECT message FROM trade_offer WHERE account_id=? AND offer_id=?').get(base.accountId, base.offerId) as { message: string | null } | undefined;
   const commandId = /^CSlytics transfer (\S+)$/.exec(offer?.message ?? '')?.[1];
   if (!commandId) return null;
-  const pending = raw.prepare(`SELECT s.command_id, s.account_id FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
+  const pending = database.statement(`SELECT s.command_id, s.account_id FROM work_step s JOIN transfer_detail d ON d.step_id=s.id
     WHERE s.kind='SEND' AND s.command_id=? AND s.offer_id IS NULL AND (s.account_id=? OR d.destination_account_id=?) LIMIT 1`).get(commandId, base.accountId, base.accountId) as SendRow | undefined;
   return pending ? linkOf(database, pending, 'message') : null;
 }
@@ -556,7 +555,6 @@ function linkOf(database: EngineDatabase, row: { command_id: string; account_id:
  * item's name, which two unrelated trades of the same skin share.
  */
 function csfloatLinksOf(database: EngineDatabase, base: EntryBase, scope: LineScope | null): TradeCsfloatLink[] {
-  const raw = database.raw();
   const ownSteamId = database.account(base.accountId)?.steam_id64 ?? null;
   const store = new CsfloatStore(database);
   const found = new Map<string, TradeCsfloatLink>();
@@ -567,15 +565,15 @@ function csfloatLinksOf(database: EngineDatabase, base: EntryBase, scope: LineSc
   };
   if (base.offerId) {
     // `csfloat_trade_offer` serves the lookup by the offer the venue named.
-    for (const row of raw.prepare(`SELECT trade_id, listing_id, asset_id, state_word AS state, seller_steam_id, data_json, offer_id FROM csfloat_trade
+    for (const row of database.statement(`SELECT trade_id, listing_id, asset_id, state_word AS state, seller_steam_id, data_json, offer_id FROM csfloat_trade
       WHERE account_id=? AND offer_id=? ORDER BY trade_id`).all(base.accountId, base.offerId) as CsfloatTradeRecord[]) add(row, 'offer-id');
-    for (const row of raw.prepare(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, c.offer_id
+    for (const row of database.statement(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, c.offer_id
       FROM work_step s JOIN csfloat_trade c ON c.account_id=s.account_id AND c.trade_id=s.target_id
       WHERE s.account_id=? AND s.kind='CSFLOAT_SEND' AND s.offer_id=? ORDER BY c.trade_id`).all(base.accountId, base.offerId) as CsfloatTradeRecord[]) add(row, 'own-delivery');
   }
   if (scope && base.counterpartySteamId64) {
     const lines = lineWhere(scope);
-    const rows = raw.prepare(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, c.offer_id, l.side AS side
+    const rows = database.statement(`SELECT c.trade_id, c.listing_id, c.asset_id, c.state_word AS state, c.seller_steam_id, c.data_json, c.offer_id, l.side AS side
       FROM trade_line l JOIN csfloat_trade c ON c.account_id=l.account_id AND c.asset_id=l.asset_id
       WHERE ${lines.sql} ORDER BY c.trade_id`).all(...lines.params) as Array<CsfloatTradeRecord & { side: TradeSide }>;
     for (const row of rows) {
@@ -621,11 +619,10 @@ function csfloatLink(row: CsfloatTradeRecord, ownSteamId: string | null, evidenc
  * its CSFloat trade if there was one. Anything less is not a check.
  */
 function csfloatCheckOf(database: EngineDatabase, accountId: string, since: string): CsfloatCheck {
-  const raw = database.raw();
-  const checked = raw.prepare(`SELECT started_at FROM observation WHERE account_id=? AND surface='csfloat-trades'
+  const checked = database.statement(`SELECT started_at FROM observation WHERE account_id=? AND surface='csfloat-trades'
     AND complete=1 AND error IS NULL ORDER BY id DESC LIMIT 1`).get(accountId) as { started_at: string } | undefined;
   if (checked && checked.started_at >= since) return 'unmatched';
-  const connection = raw.prepare(`SELECT status, credential_ref FROM venue_connection WHERE account_id=? AND venue='csfloat'`)
+  const connection = database.statement(`SELECT status, credential_ref FROM venue_connection WHERE account_id=? AND venue='csfloat'`)
     .get(accountId) as { status: string; credential_ref: string | null } | undefined;
   if (!connection?.credential_ref || connection.status === 'DISCONNECTED') return 'not-connected';
   const last = database.latestObservation(accountId, 'csfloat-trades');
@@ -644,7 +641,7 @@ function decorate(database: EngineDatabase, base: EntryBase): Decorated {
   let second: TradeItemRow | undefined;
   if (scope) {
     const lines = lineWhere(scope);
-    for (const side of database.raw().prepare(`SELECT side, SUM(quantity) AS quantity FROM trade_line l WHERE ${lines.sql} GROUP BY side`)
+    for (const side of database.statement(`SELECT side, SUM(quantity) AS quantity FROM trade_line l WHERE ${lines.sql} GROUP BY side`)
       .all(...lines.params) as Array<{ side: TradeSide; quantity: number }>) {
       if (side.side === 'GIVE') giveQuantity = side.quantity; else receiveQuantity = side.quantity;
     }
@@ -652,7 +649,7 @@ function decorate(database: EngineDatabase, base: EntryBase): Decorated {
     // the first that went out for a swap, else the first of another kind, else the next line: two
     // pictures say "more than one" best when they are not the same picture twice.
     const resolved = resolvedLinesSql(scope);
-    [first, second] = database.raw().prepare(`SELECT * FROM (
+    [first, second] = database.statement(`SELECT * FROM (
         SELECT r.*, ROW_NUMBER() OVER (PARTITION BY side ORDER BY lineKey) AS inSide,
           ROW_NUMBER() OVER (PARTITION BY side, groupKey ORDER BY lineKey) AS inGroup
         FROM (${resolved.sql}) r)
@@ -720,7 +717,7 @@ export function pageTradeEntries(database: EngineDatabase, request: TradeListReq
 export function summariseTrades(database: EngineDatabase, request: TradeSummaryRequest, asOf: string): TradeSummary {
   const accounts = assertAccountScope(database, request.accountIds);
   const { sql, params } = entriesSql(accounts, asOf, { collapse: true });
-  const counts = database.raw().prepare(`SELECT phase, stage, originClass AS origin, flow, COUNT(*) AS count FROM (${sql})
+  const counts = database.statement(`SELECT phase, stage, originClass AS origin, flow, COUNT(*) AS count FROM (${sql})
     GROUP BY phase, stage, originClass, flow ORDER BY phase, stage, originClass, flow`).all(...params) as TradeSummary['counts'];
   return bounded({ counts });
 }
@@ -729,12 +726,12 @@ export function summariseTrades(database: EngineDatabase, request: TradeSummaryR
 function entryBase(database: EngineDatabase, accountId: string, entryKey: string, asOf: string): EntryBase | undefined {
   let key = entryKey;
   if (key.startsWith('trade:')) {
-    const offer = database.raw().prepare('SELECT offer_id FROM trade_offer WHERE account_id=? AND trade_id=? ORDER BY offer_id LIMIT 1')
+    const offer = database.statement('SELECT offer_id FROM trade_offer WHERE account_id=? AND trade_id=? ORDER BY offer_id LIMIT 1')
       .get(accountId, key.slice('trade:'.length)) as { offer_id: string } | undefined;
     if (offer) key = `offer:${offer.offer_id}`;
   }
   const { sql, params } = entriesSql([accountId], asOf, { entry: { accountId, entryKey: key } });
-  return database.raw().prepare(sql).get(...params) as EntryBase | undefined;
+  return database.statement(sql).get(...params) as EntryBase | undefined;
 }
 
 /** One trade with everything the page shows beside its items: origin, coverage, timeline and groups. */
@@ -742,20 +739,19 @@ export function readTradeEntry(database: EngineDatabase, request: TradeEntryRequ
   const [accountId] = assertAccountScope(database, [request.accountId]) as [string];
   const base = entryBase(database, accountId, request.entryKey, asOf);
   if (!base) return null;
-  const raw = database.raw();
   const { row, scope, origin } = decorate(database, base);
   type OfferRow = { message: string | null; state_code: number; confirmation_method: number | null; expires_at: string | null;
     escrow_until: string | null; updated_at: string; first_seen_obs: number; last_seen_obs: number };
   type TradeRow = { status_code: number; initiated_at: string; updated_at: string | null; settled_at: string | null; first_seen_obs: number; last_seen_obs: number };
   const offer = base.offerId
-    ? raw.prepare('SELECT * FROM trade_offer WHERE account_id=? AND offer_id=?').get(accountId, base.offerId) as OfferRow | undefined
+    ? database.statement('SELECT * FROM trade_offer WHERE account_id=? AND offer_id=?').get(accountId, base.offerId) as OfferRow | undefined
     : undefined;
   const trade = base.tradeId
-    ? raw.prepare('SELECT * FROM executed_trade WHERE account_id=? AND trade_id=?').get(accountId, base.tradeId) as TradeRow | undefined
+    ? database.statement('SELECT * FROM executed_trade WHERE account_id=? AND trade_id=?').get(accountId, base.tradeId) as TradeRow | undefined
     : undefined;
   // One lookup per opened entry: the return of a reversed trade names it in `reverses_trade_id`.
   const reversedBy = base.tradeId && base.tradeStatus === 'REVERSED'
-    ? (raw.prepare('SELECT trade_id FROM executed_trade WHERE account_id=? AND reverses_trade_id=? ORDER BY initiated_at LIMIT 1').get(accountId, base.tradeId) as { trade_id: string } | undefined)?.trade_id ?? null
+    ? (database.statement('SELECT trade_id FROM executed_trade WHERE account_id=? AND reverses_trade_id=? ORDER BY initiated_at LIMIT 1').get(accountId, base.tradeId) as { trade_id: string } | undefined)?.trade_id ?? null
     : null;
   const seen = (id: number | undefined): string | null => (id === undefined ? null : database.observation(accountId, id)?.finished_at ?? null);
 
@@ -763,17 +759,17 @@ export function readTradeEntry(database: EngineDatabase, request: TradeEntryRequ
   let tradeProtectedUntil: string | null = null;
   if (scope) {
     const resolved = resolvedLinesSql(scope);
-    groups = raw.prepare(`SELECT accountId, side, groupKey, SUM(quantity) AS quantity, COUNT(*) AS lines,
+    groups = database.statement(`SELECT accountId, side, groupKey, SUM(quantity) AS quantity, COUNT(*) AS lines,
         MIN(paintWear) AS minWear, MAX(paintWear) AS maxWear, MAX(missing) AS missing, MIN(identitySource) AS identitySource,
         MAX(matchKey) AS matchKey, MAX(defIndex) AS defIndex, MAX(paintIndex) AS paintIndex, MAX(quality) AS quality,
         MAX(hashName) AS hashName
       FROM (${resolved.sql}) GROUP BY side, groupKey ORDER BY side, groupKey LIMIT ?`).all(...resolved.params, TRADE_GROUP_LIMIT + 1) as TradeItemGroup[];
-    tradeProtectedUntil = (raw.prepare(`SELECT MAX(tradeProtectedUntil) AS until FROM (${resolved.sql}) WHERE side='RECEIVE'`)
+    tradeProtectedUntil = (database.statement(`SELECT MAX(tradeProtectedUntil) AS until FROM (${resolved.sql}) WHERE side='RECEIVE'`)
       .get(...resolved.params) as { until: string | null }).until;
   }
   // One lookup per id, each on its own index (`trade_status_event_offer`, `trade_status_event_trade`);
   // a row that carries both ids is one row of the union.
-  const timeline = raw.prepare(`SELECT at, source, raw, status FROM (
+  const timeline = database.statement(`SELECT at, source, raw, status FROM (
       SELECT occurred_at AS at, CASE WHEN event_key LIKE 'offer:%' THEN 'offer' ELSE 'trade' END AS source, state_code AS raw, status, event_key
       FROM trade_status_event WHERE account_id=? AND offer_id=?
       UNION SELECT occurred_at, CASE WHEN event_key LIKE 'offer:%' THEN 'offer' ELSE 'trade' END, state_code, status, event_key

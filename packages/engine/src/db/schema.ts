@@ -13,7 +13,7 @@
  */
 import { ACTION_STATES, COMMAND_AUTHORITIES, COMMAND_MEMBER_STATES, COMMAND_STATES, EVIDENCE_SOURCES, EXECUTED_TRADE_STATUSES, ORDER_CONFIDENCES, ORDER_SIDES, ORDER_STATES, ORDER_VENUES, RESERVATION_STATES, STEAM_LISTING_BUCKETS, STORAGE_UNIT_STATES, STORE_SHEET_PARSE_STATES, TRADE_OFFER_STATUSES, TRADE_STATUS_EVENT_STATUSES, VENUE_CONNECTION_STATUSES, WORK_STEP_KINDS, WORK_STEP_STATES, sqlList } from './alphabets.js';
 
-export const SCHEMA_VERSION = 31;
+export const SCHEMA_VERSION = 36;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migration (
@@ -204,7 +204,10 @@ CREATE TABLE IF NOT EXISTS wallet_snapshot (
   observed_at TEXT NOT NULL,
   balance_cents INTEGER NOT NULL,
   delayed_balance_cents INTEGER NOT NULL,
-  currency INTEGER NOT NULL
+  currency INTEGER NOT NULL,
+  -- Steam's wallet_market_minimum as this read learned it, in whole cents: the least fee and the
+  -- least seller price on this wallet. NULL when the read learned none, and the fee table answers.
+  market_minimum_cents INTEGER
 );
 -- The latest balance, asked once per listing row on three pages.
 CREATE INDEX IF NOT EXISTS wallet_latest ON wallet_snapshot(account_id, id);
@@ -343,6 +346,19 @@ CREATE TABLE IF NOT EXISTS steam_order (
   order_id TEXT NOT NULL,
   buyer_price_cents INTEGER,
   raw_bucket TEXT CHECK(raw_bucket IN (${sqlList(STEAM_LISTING_BUCKETS)})),
+  -- Appended by migration 34 (in-place reprice plan D5, D6), both instants on the engine's clock,
+  -- ISO-8601 like every time in the record. reprice_ready_at: when Steam's price-change cooldown
+  -- on this listing ends, as far as the record can say; null is not known to be cooling down.
+  -- price_stated_at: when a venue answer last set this row's price. It is kept: a walk begun at or
+  -- before it, and no more than the guard's length before it, never restates the price, however
+  -- many later walks have. Null for a price no answer ever set.
+  reprice_ready_at TEXT,
+  price_stated_at TEXT,
+  -- Appended by migration 35 (in-place reprice plan D13). The seller price that answer stated,
+  -- held until the first walk begun after the answer has looked at the listing: that walk compares
+  -- it with what it shows, records a contradiction once when they differ, and clears it. Null
+  -- once a walk has looked, and for a price no answer set.
+  price_stated_cents INTEGER,
   PRIMARY KEY(account_id, order_id),
   FOREIGN KEY(account_id, order_id) REFERENCES venue_order(account_id, order_id) ON DELETE CASCADE
 ) STRICT;
@@ -487,6 +503,32 @@ CREATE TABLE IF NOT EXISTS market_history (
   PRIMARY KEY(account_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS market_history_page ON market_history(account_id, occurred_at, event_id);
+
+-- One row per sale or purchase as QueryMyHistory reported it, with the moment its listing went live
+-- (listing times plan D1-D4). Keyed by what both history routes can name, the listing and the event
+-- type, never by the old route's event id, so it holds what this route said whether or not the
+-- history walk has read the event; whether the two routes agree is judged at every read. The first
+-- walk to see an event writes it; a later one that reports another time marks it quarantined with
+-- its observation and what it said, and never writes over it. A listing of several units is not a
+-- key and is never written. Money is what the route named, evidence beside the ledger, never a
+-- posting.
+CREATE TABLE IF NOT EXISTS market_history_time (
+  account_id TEXT NOT NULL REFERENCES account(id),
+  listing_id TEXT NOT NULL,
+  event_type INTEGER NOT NULL CHECK(event_type IN (3, 4)),
+  occurred_at TEXT NOT NULL,
+  listed_at TEXT,
+  amount_cents INTEGER,
+  currency INTEGER,
+  hash_name TEXT,
+  observation_id INTEGER NOT NULL REFERENCES observation(id),
+  conflict_obs INTEGER REFERENCES observation(id),
+  conflict_occurred_at TEXT,
+  conflict_listed_at TEXT,
+  PRIMARY KEY(account_id, listing_id, event_type)
+) STRICT;
+CREATE INDEX IF NOT EXISTS market_history_time_page ON market_history_time(account_id, observation_id);
+CREATE INDEX IF NOT EXISTS market_history_time_conflict ON market_history_time(account_id, conflict_obs) WHERE conflict_obs IS NOT NULL;
 CREATE INDEX IF NOT EXISTS venue_order_page ON venue_order(account_id, opened_at, order_id);
 CREATE INDEX IF NOT EXISTS item_casket_page ON item(account_id,location,casket_id,local_id);
 CREATE INDEX IF NOT EXISTS item_identity_match ON item(account_id,(def_index || ':' || IFNULL(paint_index,'') || ':' || quality || ':' || IFNULL(kit,'')),local_id);
@@ -669,6 +711,8 @@ CREATE TABLE IF NOT EXISTS csfloat_trade (
   PRIMARY KEY(account_id,trade_id)
 );
 CREATE INDEX IF NOT EXISTS csfloat_trade_asset ON csfloat_trade(account_id,asset_id,state_word);
+-- Which trades sold a listing: the claim check asks it of every sold contract it judges.
+CREATE INDEX IF NOT EXISTS csfloat_trade_listing ON csfloat_trade(account_id,listing_id);
 -- Which CSFloat trade a Steam offer carried.
 CREATE INDEX IF NOT EXISTS csfloat_trade_offer ON csfloat_trade(account_id,offer_id);
 CREATE TABLE IF NOT EXISTS venue_conflict (

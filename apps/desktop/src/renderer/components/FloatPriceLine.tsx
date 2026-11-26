@@ -51,7 +51,6 @@ export function FloatPriceLine({ name, float }: { name: string; float: number })
       <span className="float-price" data-testid="inspector-float-price" data-state="priced" data-cents={cents} data-currency={doc.currency} data-float={float}>
         <VenueMark venue="csfloat" size={11} decorative />
         <span className="num">≈ {formatAmount(cents, doc.currency)}</span>
-        <span className="quiet">at {float.toFixed(4)}</span>
       </span>
     </Tip>
   );

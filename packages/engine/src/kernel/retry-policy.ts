@@ -70,6 +70,19 @@ export const RETRY_POLICY: Readonly<Record<string, RetryPolicy>> = {
   // action, convergence on its next tick for a goal and `CommandService.advanceSteps` at the
   // proof for a hop; the second proof parks the goal, or fails the hop.
   CREATE_SELL_LISTING: { resend: 'owner', owner: 'convergence for a goal, the command service for a hop', limit: 2 },
+  // A price change in place is settled by its own answer when that answer states the price, so a
+  // walk proves one absent only after an answer that said nothing usable. A raise proved absent is
+  // sent once more by the command service at the proof and then fails; a lower price is never sent
+  // again, because Steam may be holding it for a confirmation (`MarketService.reconcilePriceChanges`).
+  // A send Steam refused for its cooldown is not one of these attempts: it waits for the time Steam named.
+  UPDATE_SELL_LISTING_PRICE: { resend: 'owner', owner: 'the command service, for the hop', limit: 2 },
+  // A discard withdraws a lower price Steam holds for its confirmation, and its answer proves
+  // nothing either way: no walk can show whether a change still waits. So no walk ever sends it
+  // again: the walk begun after it decides the price change it withdrew. What sends it again is its
+  // own answer never coming back (a timeout, a lapsed session), up to `PRICE_DISCARD_SENDS` sends,
+  // because a discard of nothing changes nothing (`MarketService.recordDiscardAnswer`); that is not
+  // a resend on proof, and is not this table's.
+  DISCARD_SELL_LISTING_PRICE_CHANGE: { resend: 'never' },
   // One deliberate second try; a name Steam declines twice is a name, not a lost reply (STO-07).
   RENAME_CASKET: { resend: 'owner', owner: 'storage', limit: 2 },
   // A buy order is wallet money: proved never placed, it fails with the reason and the person

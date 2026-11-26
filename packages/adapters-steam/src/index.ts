@@ -6,7 +6,7 @@ export { ECON_ATTRIBUTES, ECON_ATTRIBUTE_COUNT, ECON_ATTRIBUTE_SCHEMA_COMMIT } f
 export type { EconAttributeDefinition } from './econ-attributes.generated.js';
 export { CLIENT_LOGON_TIMEOUT_MS, SteamClientSessionPool } from './client-session.js';
 export type { ConnectedSteamClient, SteamClient, SteamClientFactory, SteamClientWebSession } from './client-session.js';
-export { SteamMarketAdapter } from './market.js';
+export { QUERY_MY_HISTORY_TIMEOUT_MS, SteamMarketAdapter } from './market.js';
 export { SteamTradeAdapter, accessTokenFromCookies, tradeMutationOutcome } from './trade.js';
 export { OFFER_LIMIT_RETRY_MS } from './trade-outcome.js';
 export { MemoryCredentialVault, refreshTokenKey } from './vault.js';

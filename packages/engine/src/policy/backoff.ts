@@ -42,7 +42,14 @@ export const BLOCKED_ELSEWHERE_RETRY_MS = 60_000;
  */
 export const RATE_LIMIT_HOLD_MS = 10 * 60_000;
 
-/** Whether a walk's own words say the venue refused it for its pace: HTTP 429, or a port's rate-limit fault. */
+/**
+ * Whether a walk's own words say the venue refused it for its pace: HTTP 429, or a port's rate-limit fault.
+ *
+ * CSFloat's stall, buy-order and account surfaces write a 429 as `csfloat-throttled`, which this
+ * does not match, so they keep the ordinary backoff: they do not carry the venue's own wait, and the
+ * flat hold would keep a 30-second throttle of `/me` for ten minutes, refusing every listing for
+ * want of a fresh account read. CSFloat's inventory read carries its wait and says 429 (CSF-60).
+ */
 export function isRateLimitReason(reason: string): boolean {
   return /\b429\b|rate.?limit/i.test(reason);
 }
@@ -85,12 +92,16 @@ export class BackoffLedger {
     this.states.delete(this.key(accountId, surface));
   }
 
-  /** Records a read the venue refused for its pace: a flat hold nothing but time lifts, counted as a failure. */
-  rateLimit(accountId: string, surface: string, nowMs: number): BackoffState {
+  /**
+   * Records a read the venue refused for its pace: a flat hold nothing but time lifts, counted as a
+   * failure. `untilMs` is the moment the venue itself named (CSFloat's `x-ratelimit-reset`, or a spent
+   * daily budget's), held to exactly; without one, the hold is `RATE_LIMIT_HOLD_MS` and its jitter.
+   */
+  rateLimit(accountId: string, surface: string, nowMs: number, untilMs?: number): BackoffState {
     const previous = this.states.get(this.key(accountId, surface));
     const state = {
       consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
-      notBeforeMs: nowMs + RATE_LIMIT_HOLD_MS + this.jitter(RATE_LIMIT_HOLD_MS / 2),
+      notBeforeMs: untilMs !== undefined && untilMs > nowMs ? untilMs : nowMs + RATE_LIMIT_HOLD_MS + this.jitter(RATE_LIMIT_HOLD_MS / 2),
       rateLimited: true
     };
     this.states.set(this.key(accountId, surface), state);

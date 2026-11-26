@@ -9,6 +9,7 @@ import { Outbox, type OutboxSend } from './outbox.js';
 import { useWaiting } from './use-waiting.js';
 import { isOpenWork, WAITING_STATES } from './work-busy.js';
 import { acknowledgeSeen, browserSeenStore, readSeenFailures, unseenFailures, writeSeenFailures } from './work-seen.js';
+import type { CurrencyRef } from '../../lib/money.js';
 
 export { isOpenWork };
 
@@ -42,6 +43,18 @@ export type WorkRow = {
   retryAt: string | null;
   attempt: number | null;
   attemptLimit: number | null;
+  /**
+   * On an `AWAITING_VENUE` member, a CSFloat listing waiting for CSFloat's copy of the inventory:
+   * when it gives up, and when the account's reads of that copy resume while the day's are spent.
+   * `inventoryWaitPhrase` reads them, with `retryAt`. Absent from engines before CSF-58.
+   */
+  waitDeadline?: string | null | undefined;
+  readsPausedUntil?: string | null | undefined;
+  /**
+   * Why a member waits to be sent, so `retryPhrase` words a 429 as one and a Steam price change
+   * held for its listing's cooldown (`cooldown`) as that. Absent from engines before it.
+   */
+  retryCause?: 'inventory-lag' | 'rate-limit' | 'not-applied' | 'cooldown' | null | undefined;
   name: string;
   imageUrl: string | null;
   rarity: { id: string; name: string; colour: string } | null;
@@ -51,6 +64,8 @@ export type WorkRow = {
    * the window's to dismiss.
    */
   outbox?: true | undefined;
+  /** On an outbox row only: the currency its price was typed in (`OutboxItem.currency`). An engine row's is its marketplace's. */
+  currency?: CurrencyRef;
 };
 
 /** Command state changes raise no `changed` notice, so this polls — but only while work is open. */
@@ -198,6 +213,7 @@ function outboxWork(sends: readonly OutboxSend[], accountIds: readonly string[])
       stackKey: null,
       destinationCasketId: null,
       priceReceiveCents: item.receiveCents,
+      currency: item.currency,
       actionKind: null,
       actionState: null,
       retryAt: null,
@@ -223,7 +239,7 @@ function outboxWork(sends: readonly OutboxSend[], accountIds: readonly string[])
  */
 export function WorkIndicator({ accountIds, accounts, onOpenListings }: {
   accountIds: readonly string[];
-  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null }> | undefined;
+  accounts?: ReadonlyArray<{ id: string; name: string; avatarRef?: string | null; currency?: number | null | undefined }> | undefined;
   onOpenListings?: (() => void) | undefined;
 }): React.JSX.Element | null {
   const rows = useOpenWork(accountIds);

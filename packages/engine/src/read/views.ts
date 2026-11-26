@@ -1,10 +1,12 @@
 import type { AccountId } from '@cslytics/ports';
 import type { EngineDatabase, ItemRow } from '../db/database.js';
+import { admissionPolicy, commitmentCapCents, type BuyOrderAdmission } from '../kernel/context.js';
 import { steamListedSql } from '../db/commitment.js';
 import { pageCsfloat, csfloatOverview, csfloatEligibility, csfloatGroupEligibility, type CsfloatBook, type CsfloatEligibility, type CsfloatGroupEligibility } from './queries/csfloat.js';
 import { CSFLOAT_CURRENCY, pageListings as readListingsPage, summariseListings as readListingsSummary, type ListingPageRequest, type ListingPageRow, type ListingsSummary } from './queries/listings.js';
 import { pageWaiting as readWaiting, type WaitingPage } from './queries/waiting.js';
 import { readAuthority, type AuthorityPage } from './queries/authority.js';
+import { readAccessories, type HoldingAccessories } from './queries/accessories.js';
 import { historyCoverage as readHistoryCoverage, type HistoryCoverageRow } from './queries/coverage.js';
 import { readBuyOrders as readBuyOrderBook, type BuyOrderBook } from './queries/buy-orders.js';
 import type { PageEnvelope, ScopedPageRequest } from './queries/paging.js';
@@ -22,16 +24,20 @@ import {
 import {
   pageActivity as readActivityPage,
   pageHistory as readHistoryPage,
+  pageHistoryTimes as readHistoryTimesPage,
   pageLedger as readLedgerPage,
   pageOrders as readOrdersPage,
   pageTrades as readTradesPage,
   type HistoryPageRequest,
-  type HistoryPageRow
+  type HistoryPageRow,
+  type HistoryTimeRow,
+  type HistoryTimesPageRequest
 } from './queries/records.js';
 import { pageOpenWork as readOpenWork, type WorkPage } from './queries/work.js';
 import { factsSince as readFactsSince, type FactsPage, type FactsRequest } from './queries/facts.js';
 import { pageTradeEntries as readTradeEntries, pageTradeItems as readTradeItems, readTradeEntry as readOneTradeEntry, summariseTrades as readTradeSummary, type TradeEntry, type TradeEntryRequest, type TradeItemRow, type TradeItemsRequest, type TradeListRequest, type TradeListRow, type TradeSummary, type TradeSummaryRequest } from './queries/trades.js';
 import { LedgerStore } from '../db/ledger.js';
+import { statedMinimum } from '../kernel/wallet-terms.js';
 import { MarketplaceStore } from '../db/marketplace.js';
 
 
@@ -83,6 +89,12 @@ export type AccountHoldings = {
   /** The Steam wallet: `balanceCents` is spendable, `delayedBalanceCents` is what Steam shows as pending. */
   wallet: { balanceCents: number; delayedBalanceCents: number; observedAt: string } | null;
   /**
+   * The least fee, and the least price a listing pays its seller, on the Steam wallet, in its
+   * currency: Steam's `wallet_market_minimum` as the latest wallet read stated it. Null until a
+   * read has stated one; a fee preview then falls back on the fee table (`@cslytics/ports` `fees.ts`).
+   */
+  walletMinimumCents: number | null;
+  /**
    * The CSFloat balance as `/me` last named it, for the connection that exists now: spendable and
    * pending, in CSFloat's currency (US dollars). Null when no key is connected or none has been
    * read, and from the moment a disconnect replaces the generation it was read under (CSF-04).
@@ -105,6 +117,22 @@ export type AccountHoldings = {
    * simply unknown — that is the difference between an empty wallet and an unread one.
    */
   availableToCommitCents: number | null;
+  /**
+   * The multiple of the wallet standing buy orders may commit, as the composing host set it for
+   * this account (BUY-11); 1 where nothing set one, which with nothing set aside makes the two
+   * figures below equal to the balance and to `availableToCommitCents`.
+   */
+  commitmentMultiple: number;
+  /** The most every standing buy order together may commit: `floor(multiple × (balance − reserve) × safety)`. Null until a wallet has been observed. */
+  commitmentCapCents: number | null;
+  /** What is left under that cap for a new buy order: the cap less both commitments. Null until a wallet has been observed. */
+  commitmentHeadroomCents: number | null;
+  /** Wallet money the host sets aside for something else, kept out of the cap and out of what one unit may cost. */
+  reserveCents: number;
+  /** Steam buy orders standing now, anyone's, and creates of ours in flight: what the open-order cap counts. */
+  openOrderCount: number;
+  /** The most that may stand at once; null where nothing limits it. */
+  openOrderCap: number | null;
   /** Seller-receives across listings Steam showed as live. */
   listedReceiveCents: number;
   /** Seller-receives across listings Steam is holding. */
@@ -157,7 +185,11 @@ export class EngineViews {
    * `now` is the engine's clock. A trade's stage turns on whether its reversal period has ended, and
    * a read that took the wall clock would disagree with the engine that wrote the row under test.
    */
-  constructor(private readonly database: EngineDatabase, private readonly now: () => string = () => new Date().toISOString()) {}
+  constructor(
+    private readonly database: EngineDatabase,
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly buyOrderAdmission?: BuyOrderAdmission
+  ) {}
   csfloatPage(accountId: string, book: CsfloatBook, cursor?: string) { return pageCsfloat(this.database,accountId,book,cursor); }
   csfloatOverview(accountId: string) { return csfloatOverview(this.database,accountId); }
   /** Can these items be listed on CSFloat? `unknown` is not a refusal, and `absent` is a complete read without them. */
@@ -183,7 +215,7 @@ export class EngineViews {
   }
 
   pageOpenWork(request: { accountIds: readonly string[] }): WorkPage {
-    return readOpenWork(this.database, request);
+    return readOpenWork(this.database, request, this.now());
   }
 
   /**
@@ -196,7 +228,7 @@ export class EngineViews {
    * made. `queries/waiting.ts` has why the two sources are one list, and whose each row is.
    */
   pageWaiting(request: { accountIds: readonly string[] }): WaitingPage {
-    return readWaiting(this.database, request);
+    return readWaiting(this.database, request, this.now());
   }
 
   /** Who may act on each holding: a person, a strategy, or nobody yet (strategy authority plan D5). */
@@ -207,6 +239,11 @@ export class EngineViews {
 
   holdingAuthority(request: { accountId: string; localIds: readonly string[] }): AuthorityPage {
     return readAuthority(this.database, request);
+  }
+
+  /** The stickers, patches and charm applied to each holding, by kit id. Names are the host's job. */
+  holdingAccessories(request: { accountId: string; localIds: readonly string[] }): HoldingAccessories[] {
+    return readAccessories(this.database, request);
   }
 
   inventory(accountId: AccountId): ItemRow[] {
@@ -229,6 +266,11 @@ export class EngineViews {
 
   async pageHistory(request: HistoryPageRequest): Promise<PageEnvelope<HistoryPageRow>> {
     return readHistoryPage(this.database, request);
+  }
+
+  /** The listing time of each sale and purchase, as `QueryMyHistory` reported it, beside the old route's word (listing times plan D3, D4). */
+  async pageHistoryTimes(request: HistoryTimesPageRequest): Promise<PageEnvelope<HistoryTimeRow>> {
+    return readHistoryTimesPage(this.database, request);
   }
 
   async pageStorage(request: ScopedPageRequest) {
@@ -291,9 +333,10 @@ export class EngineViews {
   /**
    * Every buy order Steam is showing as open in a scope, with the money each still commits and
    * the walk it rests on. A cancel that was sent keeps its order here until a walk shows it gone;
-   * `queries/buy-orders.ts` has why that is a refusal rather than a delay.
+   * `queries/buy-orders.ts` has why that is a refusal rather than a delay. `endedSince` adds the
+   * orders that ended at or after it, with how they ended.
    */
-  async buyOrders(request: { accountIds: readonly string[] }): Promise<BuyOrderBook> {
+  async buyOrders(request: { accountIds: readonly string[]; endedSince?: string | undefined }): Promise<BuyOrderBook> {
     return readBuyOrderBook(this.database, request);
   }
 
@@ -333,7 +376,7 @@ export class EngineViews {
           v.filled AS purchased, CASE WHEN v.state NOT LIKE 'ENDED_%' THEN 1 ELSE 0 END AS active, v.state, v.first_seen_obs, v.last_seen_obs, v.gone_obs
         FROM venue_order v WHERE v.account_id=? AND v.venue='steam' AND v.side='BUY' AND v.venue_order_id IS NOT NULL ORDER BY v.venue_order_id`).all(accountId),
       wallet: raw.prepare(`
-        SELECT observed_at, balance_cents, delayed_balance_cents, currency
+        SELECT observed_at, balance_cents, delayed_balance_cents, currency, market_minimum_cents
         FROM wallet_snapshot WHERE account_id=? ORDER BY id DESC LIMIT 1
       `).get(accountId) ?? null,
       latestObservation: this.database.latestObservation(accountId, 'steam-market')
@@ -363,10 +406,10 @@ export class EngineViews {
     const raw = this.database.raw();
     const account = this.database.account(accountId);
     const wallet = raw.prepare(`
-      SELECT observed_at, balance_cents, delayed_balance_cents, currency
+      SELECT observed_at, balance_cents, delayed_balance_cents, currency, market_minimum_cents
       FROM wallet_snapshot WHERE account_id=? ORDER BY id DESC LIMIT 1
     `).get(accountId) as
-      { observed_at: string; balance_cents: number; delayed_balance_cents: number; currency: number } | undefined;
+      { observed_at: string; balance_cents: number; delayed_balance_cents: number; currency: number; market_minimum_cents: number | null } | undefined;
 
     // One pass per table rather than one per figure: these are all narrow, account-keyed
     // aggregates and a portfolio refresh reads them for every signed-in account.
@@ -396,6 +439,10 @@ export class EngineViews {
     // has committed but Steam has not yet shown back to it is still spent.
     const reservedCents = new LedgerStore(this.database).reservedWalletCents(accountId);
     const externalCommitmentCents = new LedgerStore(this.database).externalOrderCommitmentCents(accountId);
+    const policy = admissionPolicy(this.buyOrderAdmission, accountId);
+    const cap = wallet ? commitmentCapCents(wallet.balance_cents, policy) : null;
+    const standing = (raw.prepare(`SELECT COUNT(*) AS n FROM venue_order WHERE account_id=? AND venue='steam' AND side='BUY' AND state NOT LIKE 'ENDED_%'`)
+      .get(accountId) as { n: number }).n;
 
     const items = raw.prepare(`
       SELECT location, COUNT(*) AS count FROM item
@@ -423,6 +470,7 @@ export class EngineViews {
       accountName: account?.account_name ?? accountId,
       steamId64: account?.steam_id64 ?? '',
       currency: wallet?.currency ?? null,
+      walletMinimumCents: statedMinimum(wallet?.market_minimum_cents),
       wallet: wallet
         ? { balanceCents: wallet.balance_cents, delayedBalanceCents: wallet.delayed_balance_cents, observedAt: wallet.observed_at }
         : null,
@@ -430,6 +478,12 @@ export class EngineViews {
       reservedCents,
       externalCommitmentCents,
       availableToCommitCents: wallet ? wallet.balance_cents - reservedCents - externalCommitmentCents : null,
+      commitmentMultiple: policy.multiple,
+      commitmentCapCents: cap,
+      commitmentHeadroomCents: cap === null ? null : cap - reservedCents - externalCommitmentCents,
+      reserveCents: policy.reserveCents,
+      openOrderCount: standing,
+      openOrderCap: Number.isFinite(policy.maxOpenOrders) ? policy.maxOpenOrders : null,
       listedReceiveCents: listing('ACTIVE').receive,
       onHoldReceiveCents: listing('ON_HOLD').receive,
       awaitingConfirmationReceiveCents: listing('PENDING_CONFIRMATION').receive,

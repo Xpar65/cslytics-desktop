@@ -18,7 +18,10 @@ export function Tip({
   content,
   children,
   label = 'What this means',
-  wide = false
+  wide = false,
+  onPress,
+  pressLabel,
+  rise = 0
 }: {
   content: React.ReactNode;
   /** The thing explained. Without it the trigger is a small ⓘ, named by `label`. */
@@ -26,6 +29,20 @@ export function Tip({
   label?: string | undefined;
   /** For a tip that carries a breakdown rather than a sentence. */
   wide?: boolean | undefined;
+  /**
+   * Makes the thing explained a control too: a press, or Enter or Space on it, does this, and the
+   * tip closes. Hover and focus still open the tip, so what is pressed has said what it is first.
+   * One focus stop either way, which is why the press lives here and not on a button inside.
+   */
+  onPress?: (() => void) | undefined;
+  /** What the press does, as the control's name. */
+  pressLabel?: string | undefined;
+  /**
+   * How far, in pixels, the thing explained reaches above its own box while the tip is open: a
+   * picture that grows when hovered. The bubble opens that much higher, so it sits above what
+   * grew and never across it.
+   */
+  rise?: number | undefined;
 }): React.JSX.Element {
   const id = useId();
   const trigger = useRef<HTMLElement | null>(null);
@@ -42,11 +59,11 @@ export function Tip({
     const at = trigger.current.getBoundingClientRect();
     const size = bubble.current.getBoundingClientRect();
     const gap = 8;
-    const below = at.top - size.height - gap < gap;
-    const top = below ? at.bottom + gap : at.top - size.height - gap;
+    const below = at.top - rise - size.height - gap < gap;
+    const top = below ? at.bottom + gap : at.top - rise - size.height - gap;
     const left = Math.min(Math.max(gap, at.left + at.width / 2 - size.width / 2), window.innerWidth - size.width - gap);
     setPlace({ top, left, below });
-  }, [open]);
+  }, [open, rise]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -62,9 +79,23 @@ export function Tip({
     onPointerLeave: hide,
     onFocus: show,
     onBlur: hide,
-    // Opens, never toggles: a click is preceded by the focus that already opened it.
-    onClick: (event: React.MouseEvent) => { event.stopPropagation(); show(); }
+    // Opens, never toggles: a click is preceded by the focus that already opened it. A trigger
+    // that is a control does its work instead, and takes the tip with it.
+    onClick: (event: React.MouseEvent) => {
+      event.stopPropagation();
+      if (onPress) { hide(); onPress(); } else show();
+    }
   };
+  const pressKeys = onPress ? {
+    role: 'button',
+    'aria-label': pressLabel,
+    onKeyDown: (event: React.KeyboardEvent) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      hide();
+      onPress();
+    }
+  } : {};
 
   return (
     <>
@@ -80,7 +111,7 @@ export function Tip({
           <Icon name="info" size={13} />
         </button>
       ) : (
-        <span ref={(node) => { trigger.current = node; }} className="tip-target" tabIndex={0} aria-describedby={id} {...handlers}>
+        <span ref={(node) => { trigger.current = node; }} className="tip-target" tabIndex={0} aria-describedby={id} {...handlers} {...pressKeys}>
           {children}
         </span>
       )}

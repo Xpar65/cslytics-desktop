@@ -12,7 +12,11 @@ import {
   type Prepared,
   cachedImageUrl,
   rawFallbackName,
+  skinName,
+  skinQuality,
+  skinsOf,
   wearBandsFor,
+  type SkinQuality,
   type CatalogueEntry,
   type CatalogueSource,
   type CatalogueStatus,
@@ -23,6 +27,9 @@ import {
   type SyncOutcome
 } from '@cslytics/catalogue';
 import { WEAR_TIERS } from '@cslytics/ports';
+import type { AppliedAccessory, AppliedKit, AppliedRequirement } from '@cslytics/engine';
+import type { AccessoryFamily, NamedAccessory } from '../../shared/accessories.js';
+import type { CollectionRef, CollectionTile, ItemQuality, SkinPage, SkinTile } from '../../shared/market.js';
 import { buyOrderMatches, floatWindow, type BuyOrderFacets, type ResolvedBuyOrderFilter } from './buy-order-match.js';
 
 /**
@@ -92,18 +99,37 @@ export type CatalogueVariants = {
   minFloat: number | null;
   maxFloat: number | null;
   variants: CatalogueVariant[];
+  /**
+   * The qualities this skin is sold in, when there is more than one: each with the market name
+   * that is the same wear in it, or its first where it has no such wear. Empty for an item sold
+   * one way.
+   */
+  qualities: ItemQuality[];
+  /** The name the skin's tile carries on a grid, whatever quality this base name is. */
+  skin: string;
+  /** The collection it is part of, with its emblem, or `null` for an item in none. */
+  collection: CollectionRef | null;
 };
 
-/** A sticker, a patch or a charm, as a buy-order filter names it. */
-export type AccessoryFamily = 'sticker' | 'patch' | 'charm';
+/** The most skins one `skins` page carries, whatever is asked for. */
+export const SKIN_PAGE_MAX = 120;
+/** The last page may run over by one part in this many of a page, rather than leave that few for a page of their own. */
+export const SKIN_PAGE_TAIL = 5;
+
+const QUALITY_LABEL: Readonly<Record<SkinQuality, string>> = { normal: 'Normal', stattrak: 'StatTrak™', souvenir: 'Souvenir' };
+const QUALITY_ORDER: readonly SkinQuality[] = ['normal', 'stattrak', 'souvenir'];
+
+export type { AccessoryFamily };
 export type AccessorySuggestion = { id: number; name: string; imageUrl: string | null };
 
 /** How the catalogue keys a sticker, a patch and a charm: the item family, and the attribute carrying the definition id. */
 const STICKER_KEY = { defIndex: 1209, attribute: 113 } as const;
 const PATCH_KEY = { defIndex: 4609, attribute: 113 } as const;
 const CHARM_KEY = { defIndex: 1355, attribute: 299 } as const;
+/** The tournament highlight a souvenir charm plays: the second attribute the catalogue keys a charm by. */
+const CHARM_HIGHLIGHT_ATTRIBUTE = 314;
 const ACCESSORY_KEYS: Readonly<Record<AccessoryFamily, { defIndex: number; attribute: number }>> = { sticker: STICKER_KEY, patch: PATCH_KEY, charm: CHARM_KEY };
-/** Every sticker and charm entry in the catalogue is econ quality 4 (measured over the 2026-09-13 revision). */
+/** Every sticker, patch and plain charm entry in the catalogue is econ quality 4 (measured over the 2026-09-13 revision). */
 const ACCESSORY_QUALITY = 4;
 
 /**
@@ -123,6 +149,45 @@ function accessoryKeys(filter: Record<string, unknown>): Array<{ keys: MatchKey[
     keys: kind.families.map((family) => commodityMatchKey({ defIndex: family.defIndex, quality: ACCESSORY_QUALITY, kit: `${family.attribute}=${String(entry[kind.id])}` })),
     entry
   }));
+}
+
+/** A souvenir charm, the kind that plays a tournament highlight, is econ quality 12 and keyed by its highlight too. */
+const SOUVENIR_QUALITY = 12;
+
+/**
+ * The catalogue keys an applied accessory may be, likeliest first, each with the family it would be.
+ *
+ * A sticker slot holds a sticker on a weapon and a patch on an agent, and the slot does not say
+ * which, so its kit is tried as both, as a buy-order filter's is. A charm is keyed by its kit, and
+ * by its highlight when it plays one: a highlight charm is a different item per highlight, at
+ * souvenir quality.
+ */
+function appliedKeys(accessory: AppliedAccessory): Array<{ family: AccessoryFamily; key: MatchKey }> {
+  if (accessory.kind === 'sticker-slot') {
+    return ([['sticker', STICKER_KEY], ['patch', PATCH_KEY]] as const).map(([family, at]) => ({
+      family,
+      key: commodityMatchKey({ defIndex: at.defIndex, quality: ACCESSORY_QUALITY, kit: `${at.attribute}=${accessory.kitId}` })
+    }));
+  }
+  const kit = accessory.highlight === null
+    ? `${CHARM_KEY.attribute}=${accessory.kitId}`
+    : `${CHARM_KEY.attribute}=${accessory.kitId},${CHARM_HIGHLIGHT_ATTRIBUTE}=${accessory.highlight}`;
+  const qualities = accessory.highlight === null ? [ACCESSORY_QUALITY, SOUVENIR_QUALITY] : [SOUVENIR_QUALITY, ACCESSORY_QUALITY];
+  return qualities.map((quality) => ({ family: 'charm' as const, key: commodityMatchKey({ defIndex: CHARM_KEY.defIndex, quality, kit }) }));
+}
+
+/** The sticker sealed in a sticker-slab charm, as the sticker item itself is keyed. */
+function wrappedStickerKey(accessory: AppliedAccessory): MatchKey | null {
+  if (accessory.kind !== 'charm-slot' || accessory.wrappedKitId === null) return null;
+  return commodityMatchKey({ defIndex: STICKER_KEY.defIndex, quality: ACCESSORY_QUALITY, kit: `${STICKER_KEY.attribute}=${accessory.wrappedKitId}` });
+}
+
+/**
+ * A sticker slab's market name, from its sticker's: `Sticker Slab | Crown (Foil)` holds
+ * `Sticker | Crown (Foil)`. Two slabs in a CSFloat listings capture of 2026-08-11 were named so.
+ */
+function slabName(stickerName: string): string {
+  return `Sticker Slab | ${stickerName.replace(/^Sticker \| /, '')}`;
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -191,6 +256,8 @@ export class CatalogueMediator {
     const next: Record<string, unknown> = { ...rest };
     if (host.matchKeys !== undefined) next.matchKeys = host.matchKeys;
     if (host.wearBands !== undefined) next.wearBands = host.wearBands;
+    // "Has stickers" arrives already decided; a sticker by name is resolved here into the kits it is.
+    if (host.applied !== undefined) next.applied = [...(Array.isArray(rest['applied']) ? rest['applied'] as AppliedRequirement[] : []), ...host.applied];
     if (excludeDisplayOnly === true || rest.tradableOnly === true) {
       // What nothing may act on, in the two halves only each side knows: the kinds the catalogue
       // says are never market items, and the units the engine itself sees marked `cannot trade`.
@@ -229,9 +296,63 @@ export class CatalogueMediator {
     return this.catalogue.collectionList();
   }
 
-  /** `holdings` orders the item suggestions by what the user holds; see `HoldingCounts`. */
-  suggest(text: string, limit?: number, holdings?: ReadonlyMap<string, number>): ReturnType<Catalogue['suggest']> {
-    return this.catalogue.suggest(text, limit, holdings);
+  /**
+   * `holdings` orders the item suggestions by what the user holds; see `HoldingCounts`. `browse`
+   * is the Items page asking for the names it can show everything under, weapons among them.
+   */
+  suggest(text: string, limit?: number, holdings?: ReadonlyMap<string, number>, browse?: boolean): ReturnType<Catalogue['suggest']> {
+    return this.catalogue.suggest(text, limit, holdings, browse);
+  }
+
+  /**
+   * Every collection with something to browse, the newest release first: what the Items page
+   * lists before anything is asked for. Each row's `skins` is the number of tiles its chip shows,
+   * counted by the rule the tiles are kept by.
+   */
+  collectionTiles(): CollectionTile[] {
+    return this.catalogue.browseCollections().map((collection) => ({
+      ...emblemOf(collection),
+      skins: collection.skins,
+      releaseDate: collection.releaseDate ?? null,
+      kind: collection.kind
+    }));
+  }
+
+  private skinsFor: string | null = null;
+  private skinsRows: SkinTile[] = [];
+
+  /**
+   * One page of the skins the Items page's chips name: a weapon, a type, a collection, a grade,
+   * together or alone, resolved by the rule an inventory filter's chips are (`resolveHostChips`).
+   *
+   * One row per skin, whatever qualities, phases and wears it is sold in, the rarest first. The
+   * whole list is built once per set of chips and catalogue generation and then sliced, so the
+   * window scrolling on asks for the next page and nothing is sorted again. No chips is no skins:
+   * the page shows this only once something is asked, and the whole catalogue is not an answer.
+   *
+   * A page is `limit` skins, and the last may run a fifth over: a handful left behind would be a
+   * page of their own, shown only after a scroll for two tiles. Fifty-two AWPs asked for fifty at a
+   * time are one page.
+   */
+  skins(chips: readonly unknown[], offset: number, limit: number): SkinPage {
+    const status = this.catalogue.status();
+    const asked = `${status.revision ?? ''}:${status.entries}:${JSON.stringify(chips)}`;
+    if (asked !== this.skinsFor) {
+      const keys = resolveHostChips(this.catalogue, { search: '', category: '', chips: [...chips] }).matchKeys ?? [];
+      // `skinsOf` keeps what a market sells: a coin or a weapon with no finish has no page worth
+      // opening, so it is no tile, by the rule the count beside the name was made with.
+      const entries = keys.flatMap((key) => {
+        const found = this.catalogue.lookup(key);
+        return found.kind === 'entry' ? [found.entry] : [];
+      });
+      this.skinsRows = skinsOf(entries).map((skin) => ({ name: skin.name, category: skin.category, rarity: skin.rarity, imageUrl: cachedImageUrl(skin.image) }));
+      this.skinsFor = asked;
+    }
+    const start = Math.min(Math.max(0, Math.trunc(offset) || 0), this.skinsRows.length);
+    const size = Math.min(SKIN_PAGE_MAX, Math.max(1, Math.trunc(limit) || SKIN_PAGE_MAX));
+    const full = Math.min(this.skinsRows.length, start + size);
+    const end = this.skinsRows.length - full <= Math.floor(size / SKIN_PAGE_TAIL) ? this.skinsRows.length : full;
+    return { total: this.skinsRows.length, skins: this.skinsRows.slice(start, end), next: end < this.skinsRows.length ? end : null };
   }
 
   /**
@@ -374,6 +495,56 @@ export class CatalogueMediator {
       const pending = pendingOf(row);
       return { ...row, filters: nameList(row.filters), ...(pending ? { editPending: { ...pending, filters: nameList(pending['filters']) } } : {}) };
     });
+  }
+
+  /**
+   * An `inventory.accessories` answer with a name and a picture on every sticker, patch and charm.
+   *
+   * The engine answers with kit ids, which are the attribute the catalogue keys each family by, so
+   * an applied sticker is resolved as the sticker item itself would be: one batch for the whole
+   * answer, and a kit the catalogue lacks is a miss like any other, asked about later and shown
+   * meanwhile by its id. A sticker slab is the exception. Every slab is one charm kit, which the
+   * catalogue does not hold, and what tells two apart is the sticker inside, so a slab is named
+   * and pictured from that sticker and notes no miss.
+   *
+   * Each one leaves here with the market name its reference price is asked by and none yet: the
+   * catalogue holds no price, and main's market side fills it in from the snapshot (`priceAccessories`).
+   */
+  nameAccessories<T extends { accessories: readonly AppliedAccessory[] }>(rows: readonly T[]): Array<Omit<T, 'accessories'> & { accessories: NamedAccessory[] }> {
+    const applied = rows.flatMap((row) => row.accessories);
+    const resolved = this.catalogue.resolveAll(new Set(applied.flatMap((accessory) => {
+      const wrapped = wrappedStickerKey(accessory);
+      return [...appliedKeys(accessory).map(({ key }) => key), ...(wrapped === null ? [] : [wrapped])];
+    })));
+    const entryAt = (key: MatchKey | null): CatalogueEntry | null => {
+      const result = key === null ? undefined : resolved.get(key);
+      return result?.kind === 'entry' ? result.entry : null;
+    };
+    const named = (accessory: AppliedAccessory): NamedAccessory => {
+      const sticker = entryAt(wrappedStickerKey(accessory));
+      if (sticker) {
+        const name = slabName(displayName(sticker, null));
+        return { ...accessory, family: 'charm', name, marketHashName: name, imageUrl: cachedImageUrl(sticker.image), referencePrice: null };
+      }
+      const candidates = appliedKeys(accessory);
+      for (const { family, key } of candidates) {
+        const entry = entryAt(key);
+        if (!entry) continue;
+        return {
+          ...accessory, family, name: displayName(entry, null),
+          marketHashName: entry.marketable === false ? null : marketHashName(entry, null),
+          imageUrl: cachedImageUrl(entry.image),
+          referencePrice: null
+        };
+      }
+      // Noted under its first reading, as a buy-order filter's is: a kit that is a patch is not a
+      // sticker the server has never heard of.
+      const first = candidates[0]!;
+      const miss = resolved.get(first.key);
+      if (miss?.kind === 'unresolved') this.catalogue.noteMiss(first.key, miss.reason);
+      return { ...accessory, family: first.family, name: null, marketHashName: null, imageUrl: null, referencePrice: null };
+    };
+    return rows.map((row) => ({ ...row, accessories: row.accessories.map(named) }));
   }
 
   /**
@@ -524,15 +695,44 @@ export class CatalogueMediator {
    * New page. Anything else is one name. A Doppler's phases share one market name, as `enrich`
    * spells them; the phase only picks the picture. A name the catalogue does not know is still
    * offered as itself, unknown, because Steam may well know it.
+   *
+   * A skin sold in more than one quality also names each (`qualities`): StatTrak™ and Souvenir are
+   * base names of their own, and the browse grid shows a skin once, so the page is where a person
+   * steps from one to the other. Each opens at the wear the page is on, where that quality has it.
    */
   variantsOf(name: string): CatalogueVariants {
+    const alone = this.variantsAlone(name);
+    const bases = alone.known ? this.skinBases().get(fold(skinName(alone.base))) ?? [] : [];
+    // The tile a grid shows for this skin is named for its normal quality where it has one, which
+    // is the first of its base names; a page of the StatTrak™ copy is still that tile.
+    const own = { ...alone, skin: bases[0] ?? alone.base };
+    if (!own.known) return { ...own, qualities: [] };
+    if (bases.length < 2) return { ...own, qualities: [] };
+    const wear = WEAR_SUFFIX.exec(name.split(' — ')[0]!.trim())?.[1] ?? null;
+    return {
+      ...own,
+      qualities: bases.map((base) => {
+        const sibling = base === own.base ? own : this.variantsAlone(base);
+        const quality = skinQuality(base);
+        return {
+          id: quality,
+          label: QUALITY_LABEL[quality],
+          name: (sibling.variants.find((variant) => variant.label !== null && variant.label === wear) ?? sibling.variants[0]!).name,
+          current: base === own.base
+        };
+      })
+    };
+  }
+
+  /** `variantsOf` for one base name on its own, without the other qualities of its skin. */
+  private variantsAlone(name: string): Omit<CatalogueVariants, 'qualities' | 'skin'> {
     const [plain, phase] = name.split(' — ');
     const base = stripWearTier(plain!.trim());
     const entries = (this.nameKeys().get(fold(base)) ?? [])
       .map((key) => this.catalogue.lookup(key))
       .flatMap((result) => (result.kind === 'entry' ? [result.entry] : []));
     if (entries.length === 0) {
-      return { base: plain!.trim(), known: false, category: null, rarity: null, imageUrl: null, marketable: null, minFloat: null, maxFloat: null, variants: [{ name: plain!.trim(), tier: null, label: null, band: null, keys: [] }] };
+      return { base: plain!.trim(), known: false, category: null, rarity: null, imageUrl: null, marketable: null, minFloat: null, maxFloat: null, collection: null, variants: [{ name: plain!.trim(), tier: null, label: null, band: null, keys: [] }] };
     }
     const pictured = (phase ? entries.find((entry) => entry.phase === phase.trim() && entry.image) : undefined)
       ?? entries.find((entry) => entry.image) ?? entries[0]!;
@@ -557,6 +757,7 @@ export class CatalogueMediator {
       marketable: entries.every((entry) => entry.marketable === false) ? false : entries.some((entry) => entry.marketable === true) ? true : null,
       minFloat,
       maxFloat,
+      collection: emblemOf(this.catalogue.collection(entries.find((entry) => entry.collectionId)?.collectionId ?? null)),
       variants
     };
   }
@@ -583,6 +784,7 @@ export class CatalogueMediator {
   private nameIndexFor: string | null = null;
   private nameIndexEntries = new Map<string, CatalogueEntry>();
   private nameIndexKeys = new Map<string, MatchKey[]>();
+  private nameIndexSkins = new Map<string, string[]>();
 
   /** Base name to entry, rebuilt when the catalogue generation changes and never per row. */
   private nameIndex(): Map<string, CatalogueEntry> {
@@ -591,7 +793,16 @@ export class CatalogueMediator {
     if (generation === this.nameIndexFor) return this.nameIndexEntries;
     const next = new Map<string, CatalogueEntry>();
     const keys = new Map<string, MatchKey[]>();
+    const skins = new Map<string, string[]>();
     for (const entry of this.catalogue.allEntries()) {
+      // The base names one skin is sold under, one per quality, the ordinary one first.
+      const skin = fold(skinName(entry.marketHashNameBase));
+      const bases = skins.get(skin);
+      if (!bases) skins.set(skin, [entry.marketHashNameBase]);
+      else if (!bases.includes(entry.marketHashNameBase)) {
+        bases.push(entry.marketHashNameBase);
+        bases.sort((left, right) => QUALITY_ORDER.indexOf(skinQuality(left)) - QUALITY_ORDER.indexOf(skinQuality(right)));
+      }
       // Five wear tiers share one base, and so do the Doppler phases, which differ only in
       // picture: any entry with a picture will do, and the first with one is kept.
       const key = fold(entry.marketHashNameBase);
@@ -602,8 +813,15 @@ export class CatalogueMediator {
     }
     this.nameIndexEntries = next;
     this.nameIndexKeys = keys;
+    this.nameIndexSkins = skins;
     this.nameIndexFor = generation;
     return next;
+  }
+
+  /** A skin, by its normal quality's folded base name, to every base name it is sold under. */
+  private skinBases(): Map<string, string[]> {
+    this.nameIndex();
+    return this.nameIndexSkins;
   }
 
   /** Base name to every catalogue key that carries it, from the same generation-guarded pass. */
@@ -640,9 +858,36 @@ type HostChip = {
   value?: unknown;
 };
 
+/**
+ * The kits a set of catalogue keys names, as an applied filter takes them: a sticker or a patch by
+ * its sticker kit, a charm by its charm kit and, for a souvenir charm, its highlight. Every other
+ * key is not something applied to an item, and names no kit.
+ */
+export function appliedKits(keys: readonly string[]): AppliedKit[] {
+  const kits: AppliedKit[] = [];
+  for (const key of keys) {
+    const [def, , , kit = ''] = key.split(':');
+    const values = new Map(kit.split(',').map((pair) => pair.split('=') as [string, string]));
+    const id = (attribute: number): number | undefined => {
+      const value = Number(values.get(String(attribute)));
+      return Number.isSafeInteger(value) ? value : undefined;
+    };
+    if (def === String(STICKER_KEY.defIndex) || def === String(PATCH_KEY.defIndex)) {
+      const kitId = id(STICKER_KEY.attribute);
+      if (kitId !== undefined) kits.push({ slot: 'sticker-slot', kitId });
+    } else if (def === String(CHARM_KEY.defIndex)) {
+      const kitId = id(CHARM_KEY.attribute);
+      const highlight = id(CHARM_HIGHLIGHT_ATTRIBUTE);
+      if (kitId !== undefined) kits.push({ slot: 'charm-slot', kitId, ...(highlight === undefined ? {} : { highlight }) });
+    }
+  }
+  return kits;
+}
+
 function resolveHostChips(catalogue: Catalogue, input: { search: string; category: string; chips: unknown[] }): {
   matchKeys?: string[];
   wearBands?: ReturnType<typeof wearBandsFor>;
+  applied?: AppliedRequirement[];
 } {
   const chips = input.chips.filter((row): row is HostChip => Boolean(row) && typeof row === 'object');
   const knownCategories = new Set(catalogue.categories());
@@ -651,7 +896,9 @@ function resolveHostChips(catalogue: Catalogue, input: { search: string; categor
   const qualities: Array<'stattrak' | 'souvenir' | 'normal'> = [];
   const rarityIds: string[] = [];
   const collectionNames: string[] = [];
+  const weaponNames: string[] = [];
   const norms: Array<{ op: '>' | '>=' | '<' | '<=' | '='; value: number }> = [];
+  const applied: AppliedRequirement[] = [];
 
   const search = input.search.trim();
   const category = input.category.trim();
@@ -678,12 +925,24 @@ function resolveHostChips(catalogue: Catalogue, input: { search: string; categor
       else if (text) rarityIds.push(`unknown-rarity:${text}`);
     } else if (kind === 'collection' && text) {
       collectionNames.push(text);
+    } else if (kind === 'weapon' && text) {
+      // A weapon by its exact name, every skin of it: `AWP` is the rifle, where the same letters
+      // typed as a name would also find the sticker that has them.
+      weaponNames.push(text);
+    } else if (kind === 'type' && text) {
+      // A category said as one, so it is never weighed as a name the way an `item` chip's text is.
+      categoryTerms.push(text);
     } else if (kind === 'norm' && (chip.op === '>' || chip.op === '>=' || chip.op === '<' || chip.op === '<=' || chip.op === '=') && typeof chip.value === 'number') {
       norms.push({ op: chip.op, value: chip.value });
+    } else if (kind === 'applied' && text) {
+      // A sticker, patch or charm by name: each chip is one requirement, and a name that is none of
+      // them is `kits: []`, which matches nothing rather than dropping the filter. It never narrows
+      // what the item itself is, so it adds nothing to `matchKeys`.
+      applied.push({ kits: appliedKits(catalogue.search(text)) });
     }
   }
 
-  const hostAsked = nameTerms.length + categoryTerms.length + qualities.length + rarityIds.length + collectionNames.length > 0;
+  const hostAsked = nameTerms.length + categoryTerms.length + qualities.length + rarityIds.length + collectionNames.length + weaponNames.length > 0;
   let keys: string[] | undefined;
   const union = (sets: string[][]): string[] => [...new Set(sets.flat())];
   const intersect = (left: string[], right: string[]): string[] => {
@@ -697,6 +956,10 @@ function resolveHostChips(catalogue: Catalogue, input: { search: string; categor
   const typed = categoryTerms.length ? union(categoryTerms.map((term) => catalogue.search('', term))) : undefined;
   if (named && typed) keys = intersect(named, typed);
   else keys = named ?? typed;
+  if (weaponNames.length) {
+    const weaponKeys = union(weaponNames.map((name) => catalogue.weaponKeys(name)));
+    keys = keys ? intersect(keys, weaponKeys) : weaponKeys;
+  }
   if (rarityIds.length) {
     const rarityKeys = catalogue.allEntries().filter((entry) => entry.rarity && rarityIds.includes(entry.rarity.id)).map((entry) => entry.key);
     keys = keys ? intersect(keys, rarityKeys) : rarityKeys;
@@ -718,8 +981,19 @@ function resolveHostChips(catalogue: Catalogue, input: { search: string; categor
   const wearBands = norms.length ? wearBandsFor(catalogue.floatEntries(), norms, restrict) : undefined;
   return {
     ...(hostAsked || keys ? { matchKeys: keys ?? [] } : {}),
-    ...(wearBands ? { wearBands } : {})
+    ...(wearBands ? { wearBands } : {}),
+    ...(applied.length ? { applied } : {})
   };
+}
+
+/**
+ * A collection as a page names it. Its emblem is asked for at the largest list size: an emblem is
+ * a file of one size whatever is asked, and the box that draws one is wider than a skin's.
+ */
+function emblemOf(collection: { id: string; name: string; image: string | null }): CollectionRef;
+function emblemOf(collection: { id: string; name: string; image: string | null } | null): CollectionRef | null;
+function emblemOf(collection: { id: string; name: string; image: string | null } | null): CollectionRef | null {
+  return collection ? { id: collection.id, name: collection.name, imageUrl: cachedImageUrl(collection.image, 256) } : null;
 }
 
 function matchesQuality(name: string, quality: 'stattrak' | 'souvenir' | 'normal'): boolean {
@@ -738,7 +1012,10 @@ function foldIncludes(haystack: string, needle: string): boolean {
   return fold(haystack).includes(fold(needle));
 }
 
+/** The wear a market name ends in, as Steam writes it. */
+const WEAR_SUFFIX = / \((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/;
+
 /** `AK-47 | Redline (Field-Tested)` → `AK-47 | Redline`: the catalogue's base name, which a picture belongs to. */
 function stripWearTier(name: string): string {
-  return name.replace(/ \((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)$/, '');
+  return name.replace(WEAR_SUFFIX, '');
 }

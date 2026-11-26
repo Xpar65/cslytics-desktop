@@ -1,50 +1,58 @@
 import React, { useState } from 'react';
-import { FilterBar } from '../../components/FilterBar.js';
-import type { ChipKind, FilterChip } from '../../components/filter-grammar.js';
+import { browseRows, FilterBar } from '../../components/FilterBar.js';
+import { addChip, ITEM_BROWSE_CHIP_KINDS, type FilterChip } from '../../components/filter-grammar.js';
 import { engine } from '../../lib/engine.js';
-import { defaultVariant } from './variants.js';
+import { marketNameOf } from './variants.js';
 
 /**
- * Inventory's search bar, as a launcher: the same chips, suggestions and keys, but picking a name
- * opens that item's page instead of narrowing a list, and the bar empties again.
+ * Inventory's search bar, over the catalogue instead of over holdings: the same suggestions and
+ * keys, and two things a pick can do.
  *
- * A suggestion is a base name and a page is one market name, so a pick asks main for the names the
- * item is sold under and opens the one the scope holds most of, or the first. Free text that no
- * suggestion claimed is answered by the catalogue's best match for it.
+ * A pick that names one item opens that item's page, and the bar keeps nothing of it. A suggestion
+ * is a base name and a page is one market name, so main is asked for the names the item is sold
+ * under and the one the scope holds most of is opened, or the first.
+ *
+ * A pick that names many items (a weapon, a type, a collection, a grade) stays in the bar as a
+ * chip, and the chips are what the grid under the bar shows. They narrow together as they do on
+ * every other page: AWP beside Covert is the covert AWPs.
+ *
+ * Text typed and entered before any suggestion arrived is answered the way the list would have
+ * been: by the first row the catalogue gives for it, a name that stands for many before an item.
  */
 
-const KINDS: ReadonlySet<ChipKind> = new Set<ChipKind>(['item', 'name']);
-
-export function ItemSearch({ accountIds, onPick }: { accountIds: readonly string[]; onPick: (name: string) => void }): React.JSX.Element {
+export function ItemSearch({ accountIds, chips, onChips, onPick }: {
+  accountIds: readonly string[];
+  /** The chips the grid is showing; none on an item's page, where the bar only launches. */
+  chips: readonly FilterChip[];
+  onChips: (next: FilterChip[]) => void;
+  onPick: (name: string) => void;
+}): React.JSX.Element {
   const [missing, setMissing] = useState<string | null>(null);
 
-  const open = async (chip: FilterChip): Promise<void> => {
+  const change = async (next: FilterChip[]): Promise<void> => {
     setMissing(null);
-    let text = chip.text;
-    if (chip.kind === 'name') {
-      // Typed and not picked: the catalogue's best name for it, held ones first.
-      const answer = await engine.suggestItems(chip.text, accountIds).catch(() => null);
-      const top = answer?.items?.[0]?.name;
-      if (!top) { setMissing(chip.text); return; }
-      text = top;
-    }
-    const variants = await engine.itemVariants(text, accountIds).catch(() => null);
-    onPick(variants ? defaultVariant(variants) : text);
+    const kept = next.filter((chip) => chip.kind !== 'item' && chip.kind !== 'name');
+    const picked = next.find((chip) => chip.kind === 'item' || chip.kind === 'name');
+    if (!picked) { onChips(kept); return; }
+    if (picked.kind === 'item') { onPick(await marketNameOf(picked.text, accountIds)); return; }
+    // Typed and not picked: what the list's first row would have been.
+    const answer = await engine.suggestBrowse(picked.text, accountIds).catch(() => null);
+    const first = browseRows(answer)[0]?.chip;
+    if (!first) setMissing(picked.text);
+    else if (first.kind === 'item') onPick(await marketNameOf(first.text, accountIds));
+    else onChips(addChip(kept, first));
   };
 
   return (
     <div className="items-search" data-testid="items-search">
       <FilterBar
-        chips={[]}
-        kinds={KINDS}
-        itemsOnly
+        chips={chips}
+        kinds={ITEM_BROWSE_CHIP_KINDS}
+        browse
         holdingsOf={accountIds}
         label="Find an item"
-        placeholder="Find an item: ak redline, karambit doppler, revolution case"
-        onChange={(next) => {
-          const chip = next[next.length - 1];
-          if (chip) void open(chip);
-        }}
+        placeholder="Find an item, or browse: ak redline, awp, pistol, huntsman collection"
+        onChange={(next) => { void change(next); }}
       />
       {missing ? <div className="items-search-missing" role="status">No item called “{missing}”.</div> : null}
     </div>

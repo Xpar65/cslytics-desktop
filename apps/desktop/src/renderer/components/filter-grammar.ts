@@ -19,7 +19,9 @@
  */
 
 export type ChipOperator = '>' | '>=' | '<' | '<=' | '=';
-export type ChipKind = 'item' | 'name' | 'wear' | 'float' | 'norm' | 'seed' | 'category' | 'rarity' | 'collection' | 'where' | 'tradable' | 'lock' | 'unit' | 'account';
+export type ChipKind = 'item' | 'name' | 'wear' | 'float' | 'norm' | 'seed' | 'category' | 'rarity' | 'collection' | 'where' | 'tradable' | 'lock' | 'unit' | 'account' | 'applied'
+  /** Every skin of one weapon, and every item of one catalogue category: what the Items page browses by. */
+  | 'weapon' | 'type';
 
 export type FilterChip = {
   kind: ChipKind;
@@ -38,6 +40,11 @@ export type FilterChip = {
   /** An `account` chip's account, or the account that owns a `unit` chip's storage unit. */
   accountId?: string;
   casketId?: string;
+  /**
+   * An `applied` chip that asks for anything in a kind of slot: a sticker (or patch) or a charm.
+   * Without it an `applied` chip names one sticker, patch or charm, which only the host can resolve.
+   */
+  accessory?: 'sticker' | 'charm';
 };
 
 /** `=` on a float is a tolerance, never an equality: the stored wear is a 32-bit float. */
@@ -98,6 +105,19 @@ const LOCKS: ReadonlyArray<{ lock: 'market' | 'trade'; tokens: readonly string[]
   { lock: 'market', tokens: ['market-locked', 'marketlocked', 'market locked'] },
   { lock: 'trade', tokens: ['trade-protected', 'tradeprotected', 'trade protected', 'locked'] }
 ];
+/**
+ * What is applied to an item, asked without naming it: anything in its sticker slots, which on an
+ * agent are its patches, or a charm. `sticker` on its own is not here, because it is the catalogue's
+ * category of items that *are* stickers; `stickered` is the item that wears one.
+ */
+const APPLIED: ReadonlyArray<{ accessory: 'sticker' | 'charm'; tokens: readonly string[] }> = [
+  { accessory: 'sticker', tokens: ['stickered', 'stickers applied', 'sticker applied', 'with stickers', 'with sticker', 'has stickers', 'has sticker'] },
+  { accessory: 'charm', tokens: ['charmed', 'charm applied', 'with charm', 'with a charm', 'has charm', 'has a charm'] }
+];
+
+function appliedChip(accessory: 'sticker' | 'charm'): FilterChip {
+  return { kind: 'applied', text: accessory === 'sticker' ? 'stickers' : 'charm', accessory };
+}
 const RARITIES: ReadonlyArray<{ name: string; tokens: readonly string[] }> = [
   { name: 'Consumer Grade', tokens: ['consumer'] },
   { name: 'Industrial Grade', tokens: ['industrial'] },
@@ -160,6 +180,7 @@ function claimAt(tokens: readonly string[], index: number): Claim | null {
     ?? claimQuality(tokens, index)
     ?? claimLock(tokens, index)
     ?? claimWhere(tokens, index)
+    ?? claimApplied(tokens, index)
     ?? claimRarity(tokens, index);
 }
 
@@ -284,6 +305,17 @@ function claimWhere(tokens: readonly string[], index: number): Claim | null {
   return null;
 }
 
+function claimApplied(tokens: readonly string[], index: number): Claim | null {
+  // Longest first, so `with a charm` is one chip and not `with a` left over for the names.
+  for (const span of [3, 2, 1]) {
+    if (index + span > tokens.length) continue;
+    const typed = tokens.slice(index, index + span).join(' ');
+    const entry = APPLIED.find((row) => row.tokens.includes(typed));
+    if (entry) return { chip: appliedChip(entry.accessory), length: span };
+  }
+  return null;
+}
+
 function claimRarity(tokens: readonly string[], index: number): Claim | null {
   const one = tokens[index]!;
   const two = tokens[index + 1] ? `${one} ${tokens[index + 1]}` : '';
@@ -321,9 +353,40 @@ function wearChip(tier: (typeof WEAR_TIERS)[number]): FilterChip {
  * A draft may be just a kind and a text, and goes through the same grammar as typing does, so
  * there is one filter model rather than two that can disagree.
  */
+/**
+ * A suggestion list with each chip offered once. The grammar and the catalogue can both read one
+ * word as the same chip (`classified` is a rarity to each), and two rows that add one filter read
+ * as two filters. The first row keeps its place; when a later one names the same chip with the
+ * rarity id the first lacks, the later chip is kept in that place, the id being the more exact of
+ * the two. Grades that share a name under different ids, and accounts or units of one name, are
+ * different filters and all stay. Rows without a chip (a form to finish) are never merged.
+ */
+export function distinctSuggestions<T extends { chip?: FilterChip | undefined }>(rows: readonly T[]): T[] {
+  const out: T[] = [];
+  for (const row of rows) {
+    const chip = row.chip;
+    const same = chip ? out.findIndex((kept) => kept.chip !== undefined && sameChip(kept.chip, chip)) : -1;
+    if (!chip || same === -1) {
+      out.push(row);
+      continue;
+    }
+    const kept = out[same]!;
+    if (!kept.chip!.rarityId && chip.rarityId) out[same] = { ...kept, chip };
+  }
+  return out;
+}
+
+function sameChip(left: FilterChip, right: FilterChip): boolean {
+  if (left.kind !== right.kind || fold(left.text) !== fold(right.text)) return false;
+  if (left.rarityId && right.rarityId && left.rarityId !== right.rarityId) return false;
+  const rest = ({ text: _text, rarityId: _rarityId, ...others }: FilterChip): string =>
+    JSON.stringify(Object.entries(others).filter(([, value]) => value !== undefined).sort(([a], [b]) => a.localeCompare(b)));
+  return rest(left) === rest(right);
+}
+
 export function addChip(chips: readonly FilterChip[], draft: FilterChip | { kind: ChipKind; text: string }): FilterChip[] {
   const chip = 'minWear' in draft || 'op' in draft || 'quality' in draft || 'location' in draft || 'lock' in draft || 'rarityId' in draft
-    || 'accountId' in draft || 'casketId' in draft
+    || 'accountId' in draft || 'casketId' in draft || 'accessory' in draft
     ? draft as FilterChip
     : completeChip(draft.kind, draft.text);
   const kept = withoutOwnerConflict(
@@ -404,7 +467,8 @@ const WORDS: ReadonlyArray<{ tokens: readonly string[]; chip: FilterChip }> = [
   ...QUALITY.map((entry) => ({ tokens: entry.tokens, chip: { kind: 'category' as const, text: entry.quality, quality: entry.quality } })),
   ...WHERE.map((entry) => ({ tokens: entry.tokens, chip: { kind: 'where' as const, text: entry.tokens[0]!, ...whereOf(entry) } })),
   ...LOCKS.map((entry) => ({ tokens: entry.tokens, chip: { kind: 'lock' as const, text: entry.lock, lock: entry.lock } })),
-  { tokens: ['tradable'], chip: { kind: 'tradable', text: 'tradable' } }
+  { tokens: ['tradable'], chip: { kind: 'tradable', text: 'tradable' } },
+  ...APPLIED.map((entry) => ({ tokens: entry.tokens, chip: appliedChip(entry.accessory) }))
 ];
 
 /**
@@ -478,7 +542,7 @@ export function completions(text: string): { chips: FilterChip[]; fills: Complet
 
 /** What a chip filters by, so two chips that ask the same question are one suggestion. */
 function filterKey(chip: FilterChip): string {
-  const by = chip.kind === 'where' ? (chip.listed ? 'listed' : chip.location) : chip.quality ?? chip.lock ?? chip.text;
+  const by = chip.kind === 'where' ? (chip.listed ? 'listed' : chip.location) : chip.quality ?? chip.lock ?? chip.accessory ?? chip.text;
   return `${chip.kind}:${by ?? chip.text}`;
 }
 
@@ -506,6 +570,11 @@ export function completeChip(kind: ChipKind, text: string): FilterChip {
     return { kind, text: folded, ...(entry ? { quality: entry.quality } : {}) };
   }
   if (kind === 'seed') return { kind, text: folded, value: Number(folded) };
+  if (kind === 'applied') {
+    // A word for anything in a slot, or a sticker, patch or charm by its catalogue name.
+    const entry = APPLIED.find((row) => row.tokens.includes(folded) || appliedChip(row.accessory).text === folded);
+    return entry ? appliedChip(entry.accessory) : { kind, text: text.trim() };
+  }
   // `item`, `name`, `rarity` and `collection` keep the text they were given: only the host, which
   // holds the catalogue, can turn any of them into identity keys. A `unit` or `account` draft with
   // no id stays inert — `ownedSuggestions` is the only thing that knows which one a name means.
@@ -597,6 +666,7 @@ export function chipsToFilter(chips: readonly FilterChip[]): {
   maxWear?: number;
   paintSeed?: number;
   lock?: 'market' | 'trade';
+  applied?: AppliedSlotFilter[];
   chips: Array<{ kind: string; text: string; rarityId?: string; quality?: string; op?: ChipOperator; value?: number }>;
 } {
   let minWear: number | undefined;
@@ -607,6 +677,7 @@ export function chipsToFilter(chips: readonly FilterChip[]): {
   let casketId: string | undefined;
   let lock: 'market' | 'trade' | undefined;
   let tradableOnly: boolean | undefined;
+  const applied: AppliedSlotFilter[] = [];
   const hostChips: Array<{ kind: string; text: string; rarityId?: string; quality?: string; op?: ChipOperator; value?: number }> = [];
 
   for (const chip of chips) {
@@ -650,6 +721,14 @@ export function chipsToFilter(chips: readonly FilterChip[]): {
       case 'collection':
         hostChips.push({ kind: chip.kind, text: chip.text });
         break;
+      case 'applied': {
+        // Anything in a slot is decided here; a sticker by name is the host's, like an item name.
+        // Each chip is one more thing the item must carry, so two of them ask for both.
+        if (!chip.accessory) { hostChips.push({ kind: 'applied', text: chip.text }); break; }
+        const slot = chip.accessory === 'sticker' ? 'sticker-slot' : 'charm-slot';
+        if (!applied.some((entry) => entry.slot === slot)) applied.push({ slot });
+        break;
+      }
     }
   }
 
@@ -662,9 +741,13 @@ export function chipsToFilter(chips: readonly FilterChip[]): {
     ...(maxWear !== undefined ? { maxWear } : {}),
     ...(paintSeed !== undefined ? { paintSeed } : {}),
     ...(lock ? { lock } : {}),
+    ...(applied.length ? { applied } : {}),
     chips: hostChips
   };
 }
+
+/** "Anything in this kind of slot", as the engine's applied filter takes it. */
+export type AppliedSlotFilter = { slot: 'sticker-slot' | 'charm-slot' };
 
 /**
  * The chips a Listings bar can hold: the inventory's, less every question a listed item cannot
@@ -672,7 +755,7 @@ export function chipsToFilter(chips: readonly FilterChip[]): {
  * worth asking about, and a bar that offered them would offer filters that match nothing.
  */
 export const LISTING_CHIP_KINDS: ReadonlySet<ChipKind> = new Set<ChipKind>([
-  'item', 'name', 'wear', 'float', 'norm', 'seed', 'category', 'rarity', 'collection', 'account'
+  'item', 'name', 'wear', 'float', 'norm', 'seed', 'category', 'rarity', 'collection', 'account', 'applied'
 ]);
 
 /**
@@ -687,6 +770,24 @@ export const BUY_ORDER_CHIP_KINDS: ReadonlySet<ChipKind> = new Set<ChipKind>([
 ]);
 
 /**
+ * The chips the Items page's bar can hold. `item` and `name` open one item's page and never stay
+ * in the bar. The rest are the names that stand for many items, which stay as chips and narrow the
+ * grid of skins beneath: a weapon, a type, a collection, a grade. Nothing about one unit is here
+ * (wear, float, pattern, where it is), because a skin on that grid is not a unit.
+ */
+export const ITEM_BROWSE_CHIP_KINDS: ReadonlySet<ChipKind> = new Set<ChipKind>(['item', 'name', 'weapon', 'type', 'collection', 'rarity']);
+
+/** The Items page's chips that stay in its bar, as `catalogue.skins` takes them. */
+export type BrowseChip = { kind: 'weapon' | 'type' | 'collection' | 'rarity'; text: string; rarityId?: string };
+
+/** The chips that narrow the Items page's grid, less anything that opens a page instead. */
+export function browseChips(chips: readonly FilterChip[]): BrowseChip[] {
+  return chips.flatMap((chip) => (chip.kind === 'weapon' || chip.kind === 'type' || chip.kind === 'collection' || chip.kind === 'rarity'
+    ? [{ kind: chip.kind, text: chip.text, ...(chip.rarityId ? { rarityId: chip.rarityId } : {}) }]
+    : []));
+}
+
+/**
  * The chips, as a listings filter — or a buy-order one, which is the same shape over fewer kinds.
  *
  * `chipsToFilter`, less the kinds `kinds` leaves out, and with one change of hands: a typed name
@@ -699,9 +800,10 @@ export function chipsToListingFilter(chips: readonly FilterChip[], kinds: Readon
   maxWear?: number;
   paintSeed?: number;
   search?: string[];
+  applied?: AppliedSlotFilter[];
   chips?: Array<{ kind: string; text: string; rarityId?: string; quality?: string; op?: ChipOperator; value?: number }>;
 } {
-  const { minWear, maxWear, paintSeed, chips: host } = chipsToFilter(chips.filter((chip) => kinds.has(chip.kind)));
+  const { minWear, maxWear, paintSeed, applied, chips: host } = chipsToFilter(chips.filter((chip) => kinds.has(chip.kind)));
   const search = host.filter((chip) => chip.kind === 'name').map((chip) => chip.text);
   const resolved = host.filter((chip) => chip.kind !== 'name');
   return {
@@ -709,6 +811,7 @@ export function chipsToListingFilter(chips: readonly FilterChip[], kinds: Readon
     ...(maxWear !== undefined ? { maxWear } : {}),
     ...(paintSeed !== undefined ? { paintSeed } : {}),
     ...(search.length ? { search } : {}),
+    ...(applied ? { applied } : {}),
     ...(resolved.length ? { chips: resolved } : {})
   };
 }

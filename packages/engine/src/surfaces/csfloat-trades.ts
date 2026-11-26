@@ -7,6 +7,9 @@ import type { EngineContext } from '../kernel/context.js';
 export const CSFLOAT_TRADE_STATES = ['queued','pending','verified','failed','cancelled'] as const;
 /** The states a sale this app must act on is in. The other three are the venue's history. */
 export const OPEN_CSFLOAT_TRADE_STATES: readonly string[] = ['queued','pending'];
+/** The venue's history: read when a sale this record holds open has left the open states, and at least this often (CSF-69). */
+export const HISTORY_CSFLOAT_TRADE_STATES: readonly string[] = ['verified','failed','cancelled'];
+export const CSFLOAT_TRADE_HISTORY_EVERY_MS = 60 * 60_000;
 /** One state the venue returned fewer rows for than it counted, with the counts. */
 export type TruncatedTradeState = { state: string; count: number; rows: number };
 export class CsfloatTradeService {
@@ -19,23 +22,29 @@ export class CsfloatTradeService {
     let error: string | undefined, pagesWalked = 0;
     if (!before?.credential_ref || before.status === 'DISCONNECTED' || !ports.csfloat) error = 'Connect CSFloat to observe sales';
     else {
-      try {
-        for (const state of CSFLOAT_TRADE_STATES) {
-          const result = await ports.csfloat.trades.getTrades(accountId,before.credential_ref,state);
-          pagesWalked++;
-          if (result.kind !== 'ok') { error = `CSFloat ${state} trades unavailable`; break; }
-          if (result.value.count !== result.value.trades.length) {
-            const cut: TruncatedTradeState = { state, count: result.value.count, rows: result.value.trades.length };
-            error = this.truncationError(cut);
-            if (error) break;
-            truncated.push(cut);
-          }
-          for (const trade of result.value.trades) {
-            if (trade.state !== state || rows.has(trade.tradeId) || (trade.sellerSteamId !== before.remote_steam_id && trade.buyerSteamId !== before.remote_steam_id)) { error = 'CSFloat trade coverage changed'; break; }
-            rows.set(trade.tradeId,trade);
-          }
-          if (error) break;
+      const read = async (state: string): Promise<boolean> => {
+        const result = await ports.csfloat!.trades.getTrades(accountId,before.credential_ref!,state);
+        pagesWalked++;
+        if (result.kind !== 'ok') { error = `CSFloat ${state} trades unavailable`; return false; }
+        if (result.value.count !== result.value.trades.length) {
+          const cut: TruncatedTradeState = { state, count: result.value.count, rows: result.value.trades.length };
+          error = this.truncationError(cut);
+          if (error) return false;
+          truncated.push(cut);
         }
+        for (const trade of result.value.trades) {
+          if (trade.state !== state || rows.has(trade.tradeId) || (trade.sellerSteamId !== before.remote_steam_id && trade.buyerSteamId !== before.remote_steam_id)) { error = 'CSFloat trade coverage changed'; return false; }
+          rows.set(trade.tradeId,trade);
+        }
+        return true;
+      };
+      try {
+        let ok = true;
+        for (const state of OPEN_CSFLOAT_TRADE_STATES) if (ok) ok = await read(state);
+        // The history only when it can say something new: a sale held open here has left the open states (it ended, so
+        // its end is among the newest history rows), or the last read of the history is an hour old. A sale in its
+        // reversal period is still `pending` and comes with the open read; the 5,000 rows of `verified` do not (CSF-69).
+        if (ok && this.historyDue(accountId, rows)) for (const state of HISTORY_CSFLOAT_TRADE_STATES) if (ok) ok = await read(state);
       } catch { error = 'CSFloat trades unavailable'; }
     }
     if (connectionStore.connection(accountId,'csfloat')?.generation !== before?.generation) error = 'CSFloat connection changed';
@@ -49,6 +58,24 @@ export class CsfloatTradeService {
     });
     this.context.signals.emit({ kind: 'observed', accountId, surface: 'csfloat-trades', complete: !error, observationId: id });
     return id;
+  }
+
+  /**
+   * Whether this walk reads the history states too: a sale the record holds `queued` or `pending` is missing from the
+   * open states just read, or no complete walk has read the history for `CSFLOAT_TRADE_HISTORY_EVERY_MS`. Nothing ends a
+   * trade on its absence, so a walk that skips the history concludes nothing; it only learns a sale's end a walk later
+   * than it could have, and a sale that left the open states is exactly the one whose end is read at once. Isolated so a
+   * saboteur can read the history every walk, or never.
+   */
+  protected historyDue(accountId: AccountId, open: ReadonlyMap<string, CsfloatTrade>): boolean {
+    const db = this.context.database;
+    const held = db.raw().prepare(`SELECT trade_id FROM csfloat_trade WHERE account_id=? AND state_word IN ('queued','pending')`).all(accountId) as Array<{ trade_id: string }>;
+    if (held.some((row) => !open.has(row.trade_id))) return true;
+    const last = db.raw().prepare(`SELECT started_at FROM observation WHERE account_id=? AND surface='csfloat-trades' AND complete=1 AND pages_walked>=?
+      ORDER BY id DESC LIMIT 1`).get(accountId, CSFLOAT_TRADE_STATES.length) as { started_at: string } | undefined;
+    if (!last) return true;
+    const age = Date.parse(this.context.now()) - Date.parse(last.started_at);
+    return !(age >= 0 && age < CSFLOAT_TRADE_HISTORY_EVERY_MS);
   }
 
   /**

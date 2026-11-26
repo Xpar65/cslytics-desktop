@@ -127,7 +127,17 @@ export const MUTATION_BUDGET: Readonly<Record<string, { key: string; capacity: n
   // A confirmation's targets are pressed by one call, which the confirmation service paces at one
   // per account per minute (strategy authority and confirmations plan D12); each target's attempt
   // is bookkeeping after that call, and is not paced again.
-  CONFIRM: { key: 'CONFIRM', capacity: 25, refillPerSecond: 25 }
+  CONFIRM: { key: 'CONFIRM', capacity: 25, refillPerSecond: 25 },
+  // A price change in place: two at once, then one every five seconds per account. Slower than the
+  // default on purpose: how many Steam takes across an account's listings has not been measured.
+  UPDATE_SELL_LISTING_PRICE: { key: 'UPDATE_SELL_LISTING_PRICE', capacity: 2, refillPerSecond: 0.2 },
+  // A CSFloat reprice keeps the pace reprices have always run at, now that nothing else spaces
+  // them. Every reprice of a pass used to be followed by a read of its listing before the next was
+  // sent, so a pass went out at the pace of that read: four at once, then one every five seconds
+  // for the account, the listing read's own bucket (`TRANSPORT_BUDGET.csfloat.perScope`). A
+  // reprice is settled on its own answer now and followed by no read, so that pace is written here
+  // rather than left to the default, which is quicker than reprices have ever gone out.
+  CSFLOAT_REPRICE: { key: 'CSFLOAT_REPRICE', capacity: 4, refillPerSecond: 0.2 }
 };
 
 /**
@@ -188,6 +198,16 @@ export const TRADE_HISTORY_PAGE_BUDGET: BucketSpec = { capacity: 1, refillPerSec
  */
 export const MARKET_HISTORY_SHARED_BUDGET: BucketSpec = { capacity: 4, refillPerSecond: 0.2 };
 
+/**
+ * A page of `QueryMyHistory`: one every ten seconds per account, and two then one every six seconds
+ * across accounts (listing times plan D5). Its own pace and its own breaker, never the history's:
+ * whether Steam counts this route against `myhistory`'s 429 is unknown (corpus
+ * `steamcommunity.market.query-my-history`), so it is kept slower than the history and alone, and
+ * a refusal of it holds only its own scope.
+ */
+export const LISTING_TIMES_PAGE_BUDGET: BucketSpec = { capacity: 1, refillPerSecond: 0.1 };
+export const LISTING_TIMES_SHARED_BUDGET: BucketSpec = { capacity: 2, refillPerSecond: 1 / 6 };
+
 /** How often a read waiting for its token asks whether to hand its lane back: the longest a person then waits behind it. */
 export const HAND_BACK_POLL_MS = 500;
 
@@ -210,7 +230,8 @@ export const TRANSPORT_BUDGET: TransportBudget = {
     perScope: { capacity: 4, refillPerSecond: 0.2 }, shared: { capacity: 8, refillPerSecond: 2 },
     scopes: {
       'steam-trade-history': { perScope: TRADE_HISTORY_PAGE_BUDGET, sharedPerScope: TRADE_HISTORY_PAGE_BUDGET },
-      'steam-market-history': { sharedPerScope: MARKET_HISTORY_SHARED_BUDGET }
+      'steam-market-history': { sharedPerScope: MARKET_HISTORY_SHARED_BUDGET },
+      'steam-market-listing-times': { perScope: LISTING_TIMES_PAGE_BUDGET, sharedPerScope: LISTING_TIMES_SHARED_BUDGET }
     }
   },
   csfloat: { perScope: { capacity: 4, refillPerSecond: 0.2 }, shared: { capacity: 8, refillPerSecond: 2 } }

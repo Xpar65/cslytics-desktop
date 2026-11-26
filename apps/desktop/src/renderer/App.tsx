@@ -9,12 +9,14 @@ import type {
   ConnectionReport
 } from './lib/types.js';
 import { formatAmount } from './lib/money.js';
+import { noteWalletMinimums } from './lib/wallet-minimums.js';
 import { describeConnection } from './lib/connection.js';
 import { plural } from './lib/labels.js';
 import { heldCounts } from './lib/portfolio.js';
 import { refreshCurrency } from './lib/currency.js';
 import { PortfolioPage } from './features/portfolio/PortfolioPage.jsx';
 import { ItemsView } from './features/items/ItemsView.jsx';
+import type { FilterChip } from './components/filter-grammar.js';
 import { SignInPrompt } from './features/onboarding/SignInPrompt.js';
 import { CslyticsIndicator } from './components/CslyticsIndicator.js';
 import { Walled } from './components/SignInLock.js';
@@ -27,6 +29,7 @@ import type { AccountCard } from './features/accounts/account-card.js';
 import { InventoryView, emptyInventorySelection, selectionQuantity, type InventorySelection } from './features/inventory/InventoryView.js';
 import { LIST_INTENT, stageItems } from './features/inventory/list-intent.js';
 import { REPRICE_INTENT } from './features/listings/listing-actions.js';
+import type { NamedListing } from './features/listings/listing-parts.js';
 import { ListingWorkspace, useListingWorkspace } from './components/ListingWorkspace.js';
 import { RecordsView } from './features/records/RecordsView.js';
 import { ListingsView } from './features/listings/ListingsView.js';
@@ -42,10 +45,12 @@ import { NotificationProvider } from './features/notifications/NotificationProvi
 import { NotificationBell } from './features/notifications/NotificationBell.js';
 import { NotificationStack } from './features/notifications/NotificationStack.js';
 import type { Route } from './features/notifications/model.js';
-import { RECORD_TABS, type RecordTab, type Section } from './lib/sections.js';
+import { RECORD_TABS, SECTION_IDS, type RecordTab, type Section } from './lib/sections.js';
+import { checkExtensions, extensionSection, extensions, type ExtensionSection } from './lib/extensions.js';
 import { setUpByAccount, type VenueId } from './lib/marketplaces.js';
 import { TradesView } from './features/trades/TradesView.js';
 import { HostPageView } from './features/host/HostPageView.js';
+import { formatClock, useTimeZone } from './lib/time.js';
 
 type Status = { tone: 'idle' | 'busy' | 'error'; message: string };
 const ENGINE_WAIT: Status = { tone: 'busy', message: 'Waiting for the Engine Runtime to answer.' };
@@ -94,6 +99,16 @@ const WALLED_SECTIONS: Partial<Record<Section, Feature>> = { items: FEATURE_STEA
 const SETTINGS: SectionEntry = { id: 'settings', label: 'Settings', icon: 'settings', perAccount: false, group: 'Settings', blurb: 'This window, and the selected account with its marketplaces' };
 
 const GROUPS = ['Overview', 'Markets', 'Activity'] as const;
+
+/** The sidebar label over the pages a build's extensions supply, when it names none itself. */
+const EXTENSIONS_GROUP = 'Tools';
+// A section that took a window page's id would be picked by the sidebar and shown by neither.
+checkExtensions(extensions, SECTION_IDS);
+
+/** An extension's page as a section entry, so the sidebar and the header name it like any other page. */
+function extensionEntryOf(ext: ExtensionSection): SectionEntry {
+  return { id: 'extension', label: ext.label, icon: ext.icon, perAccount: ext.perAccount ?? false, group: extensions.group ?? EXTENSIONS_GROUP, blurb: ext.blurb };
+}
 const SIDEBAR_KEY = 'cslytics.sidebar';
 const SIDEBAR_PIN_KEY = 'cslytics.sidebar.pinned';
 
@@ -120,6 +135,10 @@ function describeHold(hold: RefreshStatusRow): string {
   if (hold.reason === 'blocked-elsewhere') return 'CS2 is open on another computer';
   if (hold.reason === 'gc-disconnected') return 'reconnecting to the Game Coordinator';
   const surface = hold.heldSurface ? HELD_SURFACE_WORDS[hold.heldSurface] ?? hold.heldSurface : undefined;
+  // A venue's daily allowance is spent: nothing is failing, and reads resume at a known time (CSF-61).
+  if (hold.heldUntil && /daily read limit/.test(hold.reason ?? '')) {
+    return `${surface ?? 'reads'} paused until ${formatClock(hold.heldUntil)} (${hold.reason})`;
+  }
   return surface ? `${surface} is retrying after ${hold.reason}` : `retrying after ${hold.reason}`;
 }
 
@@ -142,7 +161,9 @@ export function App(): React.JSX.Element {
    * The Items page's open market name, and the page it was opened from, which is where its Back
    * goes. `from` is null when the page was reached from the sidebar: there is nowhere to go back to.
    */
-  const [itemView, setItemView] = useState<{ name: string | null; from: Section | null }>({ name: null, from: null });
+  // Items: the market name open, the page it was opened from, and the chips its grid of skins is of.
+  // The chips outlast an item opened from the grid, which is what Back there returns to.
+  const [itemView, setItemView] = useState<{ name: string | null; from: Section | null; chips: FilterChip[] }>({ name: null, from: null, chips: [] });
   /** The Records page's open tab. Kept here rather than in the page, which remounts on every scope change. */
   const [recordTab, setRecordTab] = useState<RecordTab>('orders');
   const [signingIn, setSigningIn] = useState<SignInTarget | null>(null);
@@ -167,6 +188,8 @@ export function App(): React.JSX.Element {
   const [settings, setSettings] = useState<DesktopSettings | null>(null);
   // The CSlytics sign-in, for the walls on Items and Portfolio and the locks in the navigation.
   const cslytics = useCslytics();
+  // Subscribed here so a time zone chosen in Settings repaints every date in the window at once.
+  useTimeZone();
   /**
    * Which engine this window drives (remote engine host plan D5, D6, D12): `null` until main has
    * answered. A host owns its sessions, so with a remote engine the launch sweep does not run and
@@ -176,6 +199,8 @@ export function App(): React.JSX.Element {
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [hostPages, setHostPages] = useState<HostPage[]>([]);
   const [hostPage, setHostPage] = useState<HostPage | null>(null);
+  /** The open extension page, by id (`'extension'` is the slot they share); `null` until one is picked. */
+  const [extensionId, setExtensionId] = useState<string | null>(null);
   const remote = engineStatus?.kind === 'remote';
   const [inventorySelection, setInventorySelection] = useState<InventorySelection>(emptyInventorySelection);
   /**
@@ -195,6 +220,8 @@ export function App(): React.JSX.Element {
     });
   });
   const reprice = useListingWorkspace(REPRICE_INTENT);
+  /** A listing the Listings page is to open on, until it has: the item inspector's *Go to listing*. */
+  const [listingFocus, setListingFocus] = useState<NamedListing | null>(null);
   const [sidebarPinned, setSidebarPinned] = useState(
     () => typeof localStorage !== 'undefined' && localStorage.getItem(SIDEBAR_PIN_KEY) === '1'
   );
@@ -228,7 +255,7 @@ export function App(): React.JSX.Element {
   );
   /** Both workspaces' rows as the Items page marks them on a float curve, priced as what the buyer pays. */
   const stagedForCurve = useMemo(
-    () => stagedUnits([...listing.state.rows, ...reprice.state.rows], accountNames),
+    () => stagedUnits([...listing.state.rows, ...reprice.state.rows], accountNames, new Date()),
     [listing.state.rows, reprice.state.rows, accountNames]
   );
   const activeAccount = accounts.find((entry) => entry.accountId === scope) ?? null;
@@ -245,6 +272,7 @@ export function App(): React.JSX.Element {
   /** Holdings and connection state for every known account. Both reach no network. */
   const refreshPortfolio = useCallback(async (ids: readonly string[]): Promise<void> => {
     if (ids.length === 0) {
+      noteWalletMinimums([]);
       setHoldings([]);
       setConnections([]);
       return;
@@ -254,6 +282,8 @@ export function App(): React.JSX.Element {
       engine.readConnections(ids),
       Promise.all(ids.map((id) => engine.marketplaceStatus(id).then((status) => [id, status] as const).catch(() => null)))
     ]);
+    // Before the holdings are stored, so the render they cause prices with what was just read.
+    noteWalletMinimums(nextHoldings);
     setHoldings(nextHoldings);
     setConnections(nextConnections);
     setVenues(Object.fromEntries(nextVenues.filter((entry): entry is readonly [string, MarketplaceStatus] => entry !== null)));
@@ -278,7 +308,7 @@ export function App(): React.JSX.Element {
     try {
       const outcome = await work();
       await refresh();
-      setStatus({ tone: 'idle', message: outcome ?? `${label} — done` });
+      setStatus({ tone: 'idle', message: outcome ?? `${label}: done` });
     } catch (error) {
       setStatus({ tone: 'error', message: error instanceof Error ? error.message : String(error) });
       // A failed operation is very often *about* the connection — the CS2 session was taken by
@@ -581,6 +611,7 @@ export function App(): React.JSX.Element {
     items: 0,
     settings: 0,
     'host-page': 0,
+    extension: 0,
     portfolio: accounts.length,
     inventory: totals.items
   };
@@ -594,7 +625,11 @@ export function App(): React.JSX.Element {
   const hostEntry: SectionEntry | null = hostPage
     ? { id: 'host-page', label: hostPage.title, icon: 'globe', perAccount: false, group: 'Host', blurb: `A page served by ${engineStatus?.kind === 'remote' ? engineStatus.label : 'the engine host'}` }
     : null;
-  const current = (section === 'host-page' && hostEntry) ? hostEntry : [...SECTIONS, SETTINGS].find((entry) => entry.id === section) ?? SECTIONS[0]!;
+  const activeExtension = extensionSection(extensions, extensionId);
+  const extensionEntry: SectionEntry | null = activeExtension ? extensionEntryOf(activeExtension) : null;
+  const current = (section === 'host-page' && hostEntry) ? hostEntry
+    : (section === 'extension' && extensionEntry) ? extensionEntry
+      : [...SECTIONS, SETTINGS].find((entry) => entry.id === section) ?? SECTIONS[0]!;
   const connection = describeConnection(connections.find((row) => row.accountId === key));
   // A frozen screen with no explanation is the failure this whole scheduler exists to remove,
   // so when an account is not refreshing the window says which problem it is.
@@ -644,8 +679,18 @@ export function App(): React.JSX.Element {
 
   /** Opens one market name on the Items page, remembering the page it came from for Back. */
   const openItem = (name: string, from: Section): void => {
-    setItemView({ name, from });
+    // A visit from another page is that page's: its Back is the only one, so no grid waits behind it.
+    setItemView({ name, from, chips: [] });
     setSection('items');
+  };
+  /**
+   * The item inspector's *Go to listing*: the Listings page, opened on that listing. Its account is
+   * put in scope when the window is narrowed to another, so the page can show it.
+   */
+  const openListing = (target: NamedListing): void => {
+    setListingFocus(target);
+    if (scope !== null && scope !== target.accountId) setScope(target.accountId);
+    setSection('listings');
   };
   /** From a listing workspace row, which is over whatever page is open: on Items already, only the name changes. */
   const openItemFromWorkspace = (name: string): void => {
@@ -656,9 +701,10 @@ export function App(): React.JSX.Element {
   // Back is offered only to an item opened from another page; from the sidebar there is nowhere to
   // go back to. Going back keeps the name, so Items reopens on it, and forgets where it came from.
   const itemsFrom = itemView.from;
+  const extensionLabel = extensionEntry?.label ?? null;
   const backFromItems = useMemo(() => {
     if (itemsFrom === null) return null;
-    const label = [...SECTIONS, SETTINGS].find((entry) => entry.id === itemsFrom)?.label ?? 'the last page';
+    const label = (itemsFrom === 'extension' ? extensionLabel : [...SECTIONS, SETTINGS].find((entry) => entry.id === itemsFrom)?.label) ?? 'the last page';
     return {
       label,
       onBack: () => {
@@ -666,7 +712,7 @@ export function App(): React.JSX.Element {
         setSection(itemsFrom);
       }
     };
-  }, [itemsFrom]);
+  }, [itemsFrom, extensionLabel]);
 
   const pick = (entry: SectionEntry): void => {
     // The sidebar is a fresh visit: Items keeps the item it last showed, but there is no Back.
@@ -749,6 +795,29 @@ export function App(): React.JSX.Element {
             </React.Fragment>
           );
         })}
+        {/* The pages a build's extensions supply, under their own label: the shell lists them and
+            shows one; what each is about is the extension's business. The public desktop has none. */}
+        {extensions.sections.length > 0 ? (
+          <>
+            <div className="nav-label">{extensions.group ?? EXTENSIONS_GROUP}</div>
+            {extensions.sections.map((ext) => (
+              <button
+                key={ext.id}
+                type="button"
+                className="nav-item"
+                data-selected={section === 'extension' && extensionId === ext.id}
+                aria-current={section === 'extension' && extensionId === ext.id ? 'page' : undefined}
+                aria-label={ext.label}
+                title={`${ext.label}. ${ext.blurb}`}
+                data-testid={`nav-extension-${ext.id}`}
+                onClick={() => { setExtensionId(ext.id); pick(extensionEntryOf(ext)); }}
+              >
+                <Icon name={ext.icon} size={16} />
+                <span className="nav-text">{ext.label}</span>
+              </button>
+            ))}
+          </>
+        ) : null}
         {/* The pages a connected host serves, under its label (plan D12): the window lists them and
             shows one; what each is about is the host's business. */}
         {engineStatus?.kind === 'remote' && hostPages.length > 0 ? (
@@ -816,7 +885,7 @@ export function App(): React.JSX.Element {
               // launch sweep, and the CS2 session not yet up, so it reads nothing. That is not a
               // refresh done: say what happened, and that the rest arrives on its own.
               const read = Object.values(refreshed).flat().length;
-              return read === 0 ? 'Refreshing now — nothing new to read: everything is current or still loading, and will refresh on its own' : undefined;
+              return read === 0 ? 'Nothing new to read. Everything is current or still loading.' : undefined;
             })}
           >
             <Icon name="refresh" size={16} />
@@ -953,6 +1022,22 @@ export function App(): React.JSX.Element {
               </Panel>
             ) : null}
             {section === 'host-page' && hostPage ? <HostPageView page={hostPage} /> : null}
+            {section === 'extension' && activeExtension ? (
+              <activeExtension.component
+                key={activeExtension.id}
+                accountIds={scope ? [scope] : accountIds}
+                accounts={accountNames}
+                scope={scope}
+                activeAccount={activeAccount}
+                navigate={(route) => {
+                  const entry = [...SECTIONS, SETTINGS].find((candidate) => candidate.id === route.section);
+                  if (entry) pick(entry);
+                  // Set last, so the per-account fallback in `pick` cannot overwrite it; `null` is every account.
+                  if (route.accountId !== undefined) setScope(route.accountId);
+                }}
+                openItem={(name) => openItem(name, 'extension')}
+              />
+            ) : null}
 
             {/* Gated on `loaded` for the same reason the account list is: before the runtime has
                 answered, "no accounts yet" is a guess, and it is the one guess that reads as a
@@ -966,8 +1051,11 @@ export function App(): React.JSX.Element {
               >
                 <ItemsView
                   name={itemView.name}
+                  chips={itemView.chips}
                   accountIds={scope ? [scope] : accountIds}
                   onOpen={(name) => setItemView((view) => ({ ...view, name }))}
+                  // Browsing is a visit of its own: the tiles replace the item, and Back to another page is gone.
+                  onBrowse={(chips) => setItemView({ name: null, from: null, chips })}
                   back={backFromItems}
                   staged={stagedForCurve}
                 />
@@ -1008,7 +1096,7 @@ export function App(): React.JSX.Element {
             ) : null}
 
             {section === 'inventory' && activeAccount && !connection.gcReady ? (
-              <Notice tone={connection.tone === 'blocked' ? 'warn' : 'unknown'} role="status" title={`Inventory needs a CS2 Game Coordinator session — ${connection.label}`}>
+              <Notice tone={connection.tone === 'blocked' ? 'warn' : 'unknown'} role="status" title={`Inventory needs a CS2 Game Coordinator session: ${connection.label}`}>
                 {connection.detail}
               </Notice>
             ) : null}
@@ -1020,6 +1108,8 @@ export function App(): React.JSX.Element {
                 selection={inventorySelection}
                 onSelection={setInventorySelection}
                 onStage={(selected) => listing.stage(stageItems(selected))}
+                onReprice={(staged) => reprice.stage(staged)}
+                onOpenListing={openListing}
                 onOpenItem={(name) => openItem(name, 'inventory')}
               />
             ) : null}
@@ -1043,7 +1133,7 @@ export function App(): React.JSX.Element {
               <RecordsView key={`${recordTab}:${scope ?? 'all'}`} domain={recordTab} accountIds={scope ? [scope] : accountIds} accounts={accountNames} />
             ) : null}
             {section === 'listings' && accountIds.length > 0 ? (
-              <ListingsView accountIds={scope ? [scope] : accountIds} accounts={accountNames} setUp={marketplaces} onAddVenue={addVenue} reprice={reprice} />
+              <ListingsView accountIds={scope ? [scope] : accountIds} accounts={accountNames} setUp={marketplaces} onAddVenue={addVenue} reprice={reprice} onOpenItem={(name) => openItem(name, 'listings')} focus={listingFocus} onFocusTaken={() => setListingFocus(null)} />
             ) : null}
             {section === 'listings' && loaded && accountIds.length === 0 ? (
               <Panel><Empty icon="layers" title="No accounts yet" action={addAccount} /></Panel>

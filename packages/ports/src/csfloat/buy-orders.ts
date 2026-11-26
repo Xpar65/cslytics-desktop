@@ -68,9 +68,28 @@ export type CsfloatBuyOrderEdit = {
   constraints: CsfloatBuyOrderConstraints;
 };
 
+/**
+ * A new order for any item of one market name, in the flat shape `POST /buy-orders` takes
+ * (captured 2026-11-07 with the developer key alone). No item constraints: the create route's
+ * filters have not been captured, so none is sent.
+ */
+export type CsfloatBuyOrderCreate = {
+  marketHashName: string;
+  /** The limit per item, buyer side, in integer USD cents. The venue calls it `max_price`. */
+  maxPriceCents: number;
+  /** How many to buy in all. The venue reads it as an unsigned byte and takes 1 to 249. */
+  quantity: number;
+};
+
 export interface CsfloatBuyOrderPort {
   /** One page of the account's own book. `page` counts from zero; `limit` is rows per page. */
   getPage(accountId: AccountId, credential: CsfloatCredentialRef, page: number, limit: number): Promise<CsfloatReadResult<CsfloatBuyOrderPage>>;
+  /**
+   * `POST /buy-orders`. The venue takes a second order for a name the account already bids on, so
+   * a create whose answer was lost is settled by a walk of the book, never by sending it again.
+   * An acknowledgement carries the new order's id in `raw.id`.
+   */
+  create(accountId: AccountId, credential: CsfloatCredentialRef, order: CsfloatBuyOrderCreate): Promise<MutationOutcome>;
   /** `PATCH /buy-orders/{id}`: price, quantity and every constraint, absolutely. */
   update(accountId: AccountId, credential: CsfloatCredentialRef, orderId: string, edit: CsfloatBuyOrderEdit): Promise<MutationOutcome>;
   /** `DELETE /buy-orders/{id}`. Quantity already matched into a trade is unaffected. */

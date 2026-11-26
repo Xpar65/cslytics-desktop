@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import type { ListingVenue } from '@cslytics/engine';
+import { instantOf } from '../../lib/clock.js';
 import { formatAmount } from '../../lib/money.js';
+import { STEAM_PRICE_CHANGE, STEAM_PRICE_CHANGE_HELD } from '../../lib/labels.js';
 import { dollars, type PricedEntry, type StagedEntry, type WorkspaceIntent } from '../../components/listing-workspace-store.js';
 import { listingKey, listingTitle, type NamedListing } from './listing-parts.js';
 import { VENUE_ID } from '../../lib/marketplaces.js';
@@ -26,12 +28,24 @@ const VENUE_SUPPORT: Readonly<Record<ListingVenue, { reprice: boolean; delist: b
   CSFLOAT: { reprice: true, delist: true }
 };
 
-/** Why this listing cannot be repriced, as a predicate phrase, or `null` when it can. */
+/** Why a Steam listing waiting for its own confirmation cannot be repriced: it is not on sale at any price yet. */
+export const NOT_YET_LISTED = 'not on the market yet, waiting for its own confirmation';
+
+/**
+ * Why this listing cannot be repriced, as a predicate phrase, or `null` when it can.
+ *
+ * A Steam listing not yet on the market comes first: Steam changes the price of a live listing
+ * only, the engine refuses the change before anything is sent, and nothing else about the row
+ * matters until it is live (`repriceState` ranks it first for the same reason).
+ */
 export function repriceBlocked(row: NamedListing): string | null {
   if (!VENUE_SUPPORT[row.venue].reprice) return 'on a marketplace that cannot change a price';
   if (row.venue === 'CSFLOAT') return row.state === 'listed' ? null : 'not an active CSFloat listing';
-  // Steam has no edit: a reprice is a delist and a relist of the item, so it needs the item.
-  return row.localId ? null : 'not matched to an item this app holds';
+  if (row.awaitingConfirmation === 1) return NOT_YET_LISTED;
+  // The command that changes a Steam price names the item, not the listing, so it needs the item.
+  if (!row.localId) return 'not matched to an item this app holds';
+  // One change at a time: until the lower price is confirmed or given up, a second is refused.
+  return row.pendingPriceChange ? 'waiting for the confirmation of a lower price' : null;
 }
 
 /** Why this listing cannot be delisted, or `null` when it can. */
@@ -57,6 +71,9 @@ export type StagedListing = StagedEntry & { listing: NamedListing };
 export function stageListing(row: NamedListing): StagedListing {
   // The figure the venue's own call takes. Steam's is unknown only if the walk never named it.
   const listed = row.venue === 'STEAM' ? row.receiveCents : row.buyerPriceCents;
+  // When Steam will take a price change on this listing, when the read knows of a wait. The row
+  // counts down to it; one already past shows nothing.
+  const readyAt = row.venue === 'STEAM' ? instantOf(row.repriceReadyAt) : null;
   return {
     key: listingKey(row),
     accountId: row.accountId,
@@ -65,9 +82,11 @@ export function stageListing(row: NamedListing): StagedListing {
     marketHashName: row.hashName,
     imageUrl: row.imageUrl,
     paintWear: row.paintWear,
+    accessories: row.accessories,
     localId: row.localId,
     place: { icon: 'tag', label: `Listed at ${formatAmount(row.buyerPriceCents, row.currency)}` },
-    ...(row.venue === 'STEAM' ? { caption: { icon: 'smartphone' as const, short: 'Phone confirm', text: 'Steam has no price edit: the listing is removed and a new one created, which asks for a phone confirmation.' } } : {}),
+    ...(row.venue === 'STEAM' ? { caption: { icon: 'shield-check' as const, short: STEAM_PRICE_CHANGE.short, text: STEAM_PRICE_CHANGE.text } } : {}),
+    ...(readyAt !== null ? { heldUntil: { at: readyAt, why: STEAM_PRICE_CHANGE_HELD } } : {}),
     venues: [VENUE_ID[row.venue]],
     seed: listed === null
       ? { price: dollars(row.buyerPriceCents), basis: 'buyer' }
@@ -80,6 +99,9 @@ export function stageListing(row: NamedListing): StagedListing {
 /**
  * Repricing: Steam's rows are one `REPRICE` command, atomic like any other; CSFloat edits one
  * listing per call, so each of its rows is a batch of one and is refused or accepted alone.
+ *
+ * Either way the price changes on the listing that is there. A Steam row sent inside its listing's
+ * cooldown is admitted and held by the engine until the cooldown ends; the work panel counts it down.
  */
 export const REPRICE_INTENT: WorkspaceIntent<StagedListing> = {
   verb: 'Reprice',

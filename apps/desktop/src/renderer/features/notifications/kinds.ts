@@ -97,8 +97,8 @@ export const NOTIFICATION_KINDS = {
     shape: 'event',
     severity: 'error',
     icon: 'x-circle',
-    title: 'A CSFloat listing from storage was not created',
-    body: 'CSFloat did not see the item within 10 minutes of it leaving the unit. It is in your inventory and not listed; list it again once CSFloat shows it.',
+    title: 'A CSFloat listing was not created',
+    body: 'CSFloat did not show the item in its inventory in time. It is in your inventory and not listed; list it again once CSFloat shows it.',
     action: { label: 'Open work panel', route: { section: 'inventory', panel: 'work' } }
   },
   // Facts the engine observed and wrote as `event` rows, read past this desktop's watermark

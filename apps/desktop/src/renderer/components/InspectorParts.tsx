@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { realToNorm, resizedImageUrl, type PaintRange } from '@cslytics/catalogue';
-import { Thumbnail } from './ui.js';
+import { Badge, Thumbnail } from './ui.js';
+import { Tip } from './Tip.js';
 import { Icon } from './Icon.js';
 import { formatFloat, wearTier } from '../lib/format.js';
 
@@ -26,8 +27,12 @@ const PREVIEW_KEY = 'cslytics.inventory.preview';
  * with real detail behind it (Steam's source art is 512×384; anything larger is upscaled). The
  * row's own picture, already in this window, stands in until the sharp one arrives. One size
  * serves both states, so collapsing and expanding never refetch.
+ *
+ * What is on the item's picture, its stickers and charm (`beneath`), sits in the picture's own tile
+ * along its foot when the preview is expanded, and across the aside under the collapsed picture and
+ * the name beside it.
  */
-export function InspectorHero({ name, imageUrl, rarity, collection, account, heading }: {
+export function InspectorHero({ name, imageUrl, rarity, collection, account, heading, beneath }: {
   name: string;
   imageUrl: string | null;
   rarity: { name: string; colour: string } | null;
@@ -39,6 +44,8 @@ export function InspectorHero({ name, imageUrl, rarity, collection, account, hea
    * place, and the catalogue name moves under it to say what kind of thing this is.
    */
   heading?: React.ReactNode;
+  /** Drawn in the picture's tile, under the picture: the strip of what is applied to the item. */
+  beneath?: React.ReactNode;
 }): React.JSX.Element {
   const detailUrl = resizedImageUrl(imageUrl, 512) ?? imageUrl;
   const [open, setOpen] = useState(() => (
@@ -53,19 +60,24 @@ export function InspectorHero({ name, imageUrl, rarity, collection, account, hea
 
   return (
     <div className="inspector-hero" data-preview={open ? 'expanded' : 'collapsed'}>
-      <button
-        type="button"
-        className="inspector-preview"
-        aria-expanded={open}
-        aria-label={open ? 'Collapse item preview' : 'Expand item preview'}
-        title={open ? 'Collapse preview' : 'Expand preview'}
-        onClick={toggle}
-      >
-        <Thumbnail url={detailUrl} standIn={imageUrl} name={name} size={96} fill={open} />
-        <span className="inspector-preview-toggle" aria-hidden="true">
-          <Icon name={open ? 'chevron-up' : 'chevron-down'} size={14} />
-        </span>
-      </button>
+      {/* One tile for the picture and what is on it. The strip is beside the button, not in it,
+          because each sticker is a focus stop of its own and a button cannot hold one. */}
+      <div className="inspector-picture">
+        <button
+          type="button"
+          className="inspector-preview"
+          aria-expanded={open}
+          aria-label={open ? 'Collapse item preview' : 'Expand item preview'}
+          title={open ? 'Collapse preview' : 'Expand preview'}
+          onClick={toggle}
+        >
+          <Thumbnail url={detailUrl} standIn={imageUrl} name={name} size={96} fill={open} />
+          <span className="inspector-preview-toggle" aria-hidden="true">
+            <Icon name={open ? 'chevron-up' : 'chevron-down'} size={14} />
+          </span>
+        </button>
+        {beneath}
+      </div>
       <div className="inspector-hero-text">
         {heading ?? <div className="inspector-name">{name}</div>}
         {heading ? <div className="inspector-meta quiet">{name}</div> : null}
@@ -92,13 +104,15 @@ export function InspectorKind({ rarity, collection }: {
 }
 
 /**
- * The float as a marker on the scale from Factory New to Battle-Scarred, with the norm float and the
- * pattern beside it.
+ * The float as a marker on the scale from Factory New to Battle-Scarred, with the number beside it
+ * and the pattern after that. Everything else about it is in the tip the line opens when hovered or
+ * focused: the wear tier, the float, and the norm float.
  *
- * The bare number is the real float, the one the tier is read from and the markets filter on. The
- * norm float is always named, because the two are both 0 to 1 and a trader who confuses them
- * misprices by the width of the skin's range. It needs the skin's range from the catalogue, so an
- * unresolved or unranged item shows the real float alone rather than a guess.
+ * The line is two numbers and no sentence. The tier is already in the item's name, so it is not
+ * printed again. The bare number is the real float, the one the tier is read from and the markets
+ * filter on. The norm float is always named, in the tip, because the two are both 0 to 1 and a
+ * trader who confuses them misprices by the width of the skin's range. It needs the skin's range
+ * from the catalogue, so an unresolved or unranged item has the real float alone rather than a guess.
  */
 export function InspectorWear({ paintWear, paintSeed, range }: {
   paintWear: number | null;
@@ -110,19 +124,33 @@ export function InspectorWear({ paintWear, paintSeed, range }: {
   const tier = wearTier(paintWear);
   const norm = range ? realToNorm(paintWear, range) : null;
   return (
-    <div className="inspector-wear">
-      <span className="wear-bar">
-        <span className="wear-marker" style={{ left: `${Math.min(100, Math.max(0, paintWear * 100))}%` }} />
-      </span>
-      <span className="caption">
-        {tier ? `${tier.label} · ` : ''}<span className="num">{formatFloat(paintWear)}</span>
+    <div className="inspector-wear" data-testid="inspector-wear">
+      <Tip content={<>
+        {tier ? <span className="tip-line">{tier.label}</span> : null}
+        <span className="tip-line">Float {formatFloat(paintWear)}</span>
         {norm !== null && range ? (
-          <span title={`Where the float sits in this skin's own range, ${range.minFloat} to ${range.maxFloat}: 0 is the lowest float it can have, 1 the highest.`}>
-            {' · norm float '}<span className="num">{formatFloat(norm)}</span>
-          </span>
+          <span className="tip-line">Norm float {formatFloat(norm)}, its place in this skin's own range of {range.minFloat} to {range.maxFloat}</span>
         ) : null}
-        {paintSeed !== null ? <> · pattern <span className="num">{paintSeed}</span></> : null}
-      </span>
+        {paintSeed !== null ? <span className="tip-line">Pattern {paintSeed}</span> : null}
+      </>}>
+        <span className="wear-bar">
+          <span className="wear-marker" style={{ left: `${Math.min(100, Math.max(0, paintWear * 100))}%` }} />
+        </span>
+        <span className="num">{formatFloat(paintWear)}</span>
+        {paintSeed !== null ? <span className="quiet">pattern <span className="num">{paintSeed}</span></span> : null}
+      </Tip>
     </div>
+  );
+}
+
+/**
+ * Why an inspector offers nothing to do: an open command already names the item. A chip, with the
+ * sentence in its tip, where the item inspector and the listing inspector both used to print it.
+ */
+export function InspectorBusy({ several = false }: { several?: boolean | undefined }): React.JSX.Element {
+  return (
+    <Tip content={`An open command already names ${several ? 'one of these items' : 'this item'}. Its actions return when the work leaves the panel.`}>
+      <Badge tone="quiet" icon="hourglass">Busy</Badge>
+    </Tip>
   );
 }

@@ -1,6 +1,10 @@
+import { buyerPaysFor } from '@cslytics/ports';
+import { feeTermsNow, latestWalletStatement, type WalletStatement } from '../../kernel/wallet-terms.js';
 import type { EngineDatabase } from '../../db/database.js';
 import { assertAccountScope, bounded } from './paging.js';
 import type { CommandAuthority } from '../../db/alphabets.js';
+import { OPEN_STEP_STATES_SQL } from '../../db/work.js';
+import { priceChangeConfirmer } from '../../kernel/listing-price.js';
 
 /**
  * Everything a walk has observed to be waiting on the person rather than on this app.
@@ -51,12 +55,20 @@ import type { CommandAuthority } from '../../db/alphabets.js';
  */
 
 /** Which kind of tap is owed. Two sources, one obligation; never merged into one vocabulary. */
-export type WaitingKind = 'SELL_LISTING' | 'TRADE_OFFER';
+/**
+ * A listing or an offer a walk shows waiting for a tap, or a buy order Steam answered with a
+ * confirmation to tap before it places it. The buy order has no row on any book yet, so its row is
+ * read from the create's own answer, and it is not placed by the tap alone: the request goes again.
+ * `LISTING_PRICE_CHANGE` is a lower price of ours on a live listing that Steam's answer said it
+ * holds for a confirmation: no walk shows it, because the book keeps the listing at its old price
+ * until the tap, so its row is read from the price change and its answer (in-place reprice plan D17).
+ */
+export type WaitingKind = 'SELL_LISTING' | 'TRADE_OFFER' | 'BUY_ORDER' | 'LISTING_PRICE_CHANGE';
 
 export type WaitingRow = {
   accountId: string;
   kind: WaitingKind;
-  /** The listing id, or the trade offer id. Identifiers never reach the screen; the host shortens. */
+  /** The listing id, the trade offer id, or the confirmation id Steam named for a buy order. Identifiers never reach the screen; the host shortens. */
   id: string;
   /**
    * What the venue calls the item. A listing always has one. An offer has one only when its first
@@ -73,13 +85,25 @@ export type WaitingRow = {
   quality: number | null;
   paintWear: number | null;
   paintSeed: number | null;
-  /** Listings only. An offer moves items, not money, and carries no price this app was told. */
+  /**
+   * A listing's buyer price, or a buy order's limit for one unit. An offer moves items, not money,
+   * and carries no price this app was told. For a price change, the new price, the one that waits:
+   * the buyer's by the fee rule at the moment Steam answered, and the seller's as it was asked for.
+   */
   buyerPriceCents: number | null;
   receiveCents: number | null;
   currency: number | null;
+  /** A price change only: the price the listing is still on sale at while the new one waits, as the record holds it. `null` on every other kind. */
+  currentBuyerPriceCents: number | null;
+  currentReceiveCents: number | null;
+  /**
+   * Who confirms it, where the venue said: a price change waits for the Steam mobile app or for a
+   * link sent by e-mail, which no phone confirmation can press. `null` for the kinds that do not say.
+   */
+  confirmBy: 'phone' | 'email' | null;
   /** Offers only: who it was sent to. */
   counterparty: string | null;
-  /** How many items the tap releases: one for a listing, the given lines for an offer. */
+  /** How many items the tap releases: one for a listing, the given lines for an offer, the units a buy order asks for. */
   items: number;
   /**
    * How many different items those are, by the identity of the joined `item` row, with an
@@ -89,13 +113,17 @@ export type WaitingRow = {
    */
   distinctItems: number;
   /**
-   * When the walk that *first* saw this row finished — not when the mutation was sent.
+   * When the walk that *first* saw this row finished — not when the mutation was sent. For a buy
+   * order, which no walk shows until it is placed, when Steam answered asking for the tap.
    *
    * The distance between the two is the part worth showing: an item that has been waiting since
    * this morning is not earning, and that is the fact that makes a person go and tap.
    */
   waitingSince: string | null;
-  /** Offers expire. A listing does not, which is why this is `null` for half these rows. */
+  /**
+   * Offers expire. A listing does not, which is why this is `null` for half these rows. A price
+   * change is withdrawn at its deadline (`PRICE_CHANGE_CONFIRM_DEADLINE_MS`): this is that moment.
+   */
   expiresAt: string | null;
   /** The walk that last saw it, and whether that walk finished (rule 5). */
   observedAt: string | null;
@@ -108,6 +136,11 @@ export type WaitingRow = {
    */
   commandId: string | null;
   authority: CommandAuthority | null;
+  /**
+   * A buy order's create, which `buyOrder.continue` sends again once the confirmation is tapped
+   * elsewhere. `null` for a listing or an offer: those are placed by the tap itself.
+   */
+  actionId: string | null;
   /**
    * The engine's own confirmation of it, where a host composed the port: the hop's state, how many
    * presses went out, the last one, and why it is waiting or stopped. `null` where there is none,
@@ -148,8 +181,10 @@ const ITEM_MATCH_SQL = matchSql('i');
  * Oldest first because this is a to-do list and the thing that has been waiting longest is the
  * thing most likely to have been forgotten — the opposite order from `pageOpenWork`, where the
  * newest row is the one the person just caused and is watching for.
+ *
+ * `now` is the engine's clock: a lower price past its deadline is no longer waiting on anyone.
  */
-export function pageWaiting(database: EngineDatabase, request: { accountIds: readonly string[] }): WaitingPage {
+export function pageWaiting(database: EngineDatabase, request: { accountIds: readonly string[] }, now: string = new Date().toISOString()): WaitingPage {
   const accounts = assertAccountScope(database, request.accountIds);
   const marks = accounts.map(() => '?').join(',');
 
@@ -161,15 +196,17 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
       i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
       s.buyer_price_cents AS buyerPriceCents, m.price_cents AS receiveCents,
       COALESCE(m.currency, (SELECT w.currency FROM wallet_snapshot w WHERE w.account_id=m.account_id ORDER BY w.id DESC LIMIT 1)) AS currency,
+      NULL AS currentBuyerPriceCents, NULL AS currentReceiveCents, NULL AS confirmBy,
       NULL AS counterparty, 1 AS items, 1 AS distinctItems,
       first.finished_at AS waitingSince, NULL AS expiresAt,
       last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete,
-      mc.id AS commandId, mc.authority AS authority, ${CONFIRMATION_COLUMNS}
+      mc.id AS commandId, mc.authority AS authority, NULL AS actionId, ${CONFIRMATION_COLUMNS}
     FROM venue_order m
     JOIN steam_order s ON s.account_id=m.account_id AND s.order_id=m.order_id
     LEFT JOIN work_step ms ON ms.action_id=m.action_id
     LEFT JOIN command mc ON mc.id=ms.command_id
     LEFT JOIN work_step k ON k.account_id=m.account_id AND k.kind='CONFIRM' AND k.target_id=m.venue_order_id
+      AND IFNULL(json_extract(k.params_json, '$.target.kind'), '')<>'LISTING_PRICE_CHANGE'
     LEFT JOIN item i ON i.account_id=m.account_id AND i.local_id=m.local_id
     LEFT JOIN observation last ON last.id=m.last_seen_obs
     LEFT JOIN observation first ON first.id=m.first_seen_obs
@@ -193,6 +230,7 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
       i.def_index AS defIndex, i.paint_index AS paintIndex, i.quality AS quality,
       i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
       NULL AS buyerPriceCents, NULL AS receiveCents, NULL AS currency,
+      NULL AS currentBuyerPriceCents, NULL AS currentReceiveCents, NULL AS confirmBy,
       t.counterparty_steam_id64 AS counterparty,
       (SELECT COUNT(*) FROM trade_line l
         WHERE l.account_id=t.account_id AND l.offer_id=t.offer_id AND l.side='GIVE') AS items,
@@ -201,7 +239,7 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
         WHERE l.account_id=t.account_id AND l.offer_id=t.offer_id AND l.side='GIVE') AS distinctItems,
       first.finished_at AS waitingSince, t.expires_at AS expiresAt,
       last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete,
-      oc.id AS commandId, oc.authority AS authority, ${CONFIRMATION_COLUMNS}
+      oc.id AS commandId, oc.authority AS authority, NULL AS actionId, ${CONFIRMATION_COLUMNS}
     FROM trade_offer t
     LEFT JOIN trade_line g ON g.account_id=t.account_id AND g.offer_id=t.offer_id AND g.side='GIVE'
       AND g.line_key=(SELECT MIN(l.line_key) FROM trade_line l
@@ -216,9 +254,79 @@ export function pageWaiting(database: EngineDatabase, request: { accountIds: rea
     WHERE t.account_id IN (${marks}) AND t.direction='SENT' AND t.status='PENDING_CONFIRMATION'
   `).all(...accounts) as RawWaitingRow[];
 
+  // A buy order Steam answered with a confirmation to tap (standing buy orders plan D9). The create
+  // is `READY` and waiting; the confirmation id is the one its latest answer named, never copied.
+  const buyOrders = database.raw().prepare(`
+    SELECT a.account_id AS accountId, 'BUY_ORDER' AS kind,
+      CAST(json_extract(t.response_ref, '$.confirmation.confirmation_id') AS TEXT) AS id,
+      o.hash_name AS hashName, NULL AS localId, '' AS matchKey,
+      NULL AS defIndex, NULL AS paintIndex, NULL AS quality, NULL AS paintWear, NULL AS paintSeed,
+      o.price_cents AS buyerPriceCents, NULL AS receiveCents,
+      json_extract(a.params_json, '$.request.currency') AS currency,
+      NULL AS currentBuyerPriceCents, NULL AS currentReceiveCents, NULL AS confirmBy,
+      NULL AS counterparty, o.quantity AS items, 1 AS distinctItems,
+      t.finished_at AS waitingSince, NULL AS expiresAt,
+      t.finished_at AS observedAt, 1 AS observationComplete,
+      bc.id AS commandId, bc.authority AS authority, a.id AS actionId, ${CONFIRMATION_COLUMNS}
+    FROM action a
+    JOIN venue_order o ON o.account_id=a.account_id AND o.action_id=a.id
+    JOIN attempt t ON t.id=(SELECT p.id FROM attempt p WHERE p.action_id=a.id ORDER BY p.rowid DESC LIMIT 1)
+    LEFT JOIN work_step bs ON bs.id=a.step_id
+    LEFT JOIN command bc ON bc.id=bs.command_id
+    LEFT JOIN work_step k ON k.account_id=a.account_id AND k.kind='CONFIRM'
+      AND k.target_id=CAST(json_extract(t.response_ref, '$.confirmation.confirmation_id') AS TEXT)
+    WHERE a.account_id IN (${marks}) AND a.state='READY' AND a.kind='CREATE_BUY_ORDER' AND a.resolution='AWAITING_CONFIRMATION'
+      AND json_extract(t.response_ref, '$.confirmation.confirmation_id') IS NOT NULL
+  `).all(...accounts) as RawWaitingRow[];
+
+  // A lower price of ours Steam holds for its confirmation (in-place reprice plan D17). The book still
+  // shows the listing at its old price, so the row is the price change's: its hop, its action, the
+  // answer that said so (when, and who confirms), the listing it names for the price still current.
+  // While its discard is out it is no longer waiting on anyone, and it leaves this list; a stopped
+  // command's is never on it, because Stop withdraws it and nobody should confirm it (D21); nor is
+  // one past its deadline, which is about to be withdrawn whether or not the wake that does it has
+  // run yet (D15, D29).
+  // One wallet statement an account, asked only for the accounts a waiting price change names.
+  const wallets = new Map<string, WalletStatement | null>();
+  const walletOf = (accountId: string): WalletStatement | null => {
+    if (!wallets.has(accountId)) wallets.set(accountId, latestWalletStatement(database, accountId));
+    return wallets.get(accountId) ?? null;
+  };
+  const priceChanges = (database.raw().prepare(`
+    SELECT s.account_id AS accountId, 'LISTING_PRICE_CHANGE' AS kind, s.target_id AS id,
+      v.hash_name AS hashName, s.local_id AS localId,
+      IFNULL(${ITEM_MATCH_SQL}, '') AS matchKey,
+      i.def_index AS defIndex, i.paint_index AS paintIndex, i.quality AS quality,
+      i.paint_wear AS paintWear, i.paint_seed AS paintSeed,
+      NULL AS buyerPriceCents, json_extract(s.params_json, '$.priceReceiveCents') AS receiveCents,
+      json_extract(s.params_json, '$.currency') AS currency,
+      o.buyer_price_cents AS currentBuyerPriceCents, v.price_cents AS currentReceiveCents,
+      NULL AS counterparty, 1 AS items, 1 AS distinctItems,
+      t.finished_at AS waitingSince, s.deadline_at AS expiresAt,
+      last.finished_at AS observedAt, IFNULL(last.complete, 0) AS observationComplete,
+      c.id AS commandId, c.authority AS authority, NULL AS actionId, t.response_ref AS response, ${CONFIRMATION_COLUMNS}
+    FROM work_step s INDEXED BY work_step_account_state
+    JOIN command c ON c.id=s.command_id
+    JOIN action a ON a.id=s.action_id
+    JOIN attempt t ON t.id=(SELECT p.id FROM attempt p WHERE p.action_id=a.id ORDER BY p.rowid DESC LIMIT 1)
+    LEFT JOIN venue_order v INDEXED BY order_venue_id ON v.account_id=s.account_id AND v.venue='steam' AND v.venue_order_id=s.target_id
+    LEFT JOIN steam_order o ON o.account_id=v.account_id AND o.order_id=v.order_id
+    LEFT JOIN item i ON i.account_id=s.account_id AND i.local_id=s.local_id
+    LEFT JOIN observation last ON last.id=v.last_seen_obs
+    LEFT JOIN work_step k ON k.account_id=s.account_id AND k.kind='CONFIRM' AND k.target_id=s.target_id AND json_extract(k.params_json, '$.stepId')=s.id
+    WHERE s.account_id IN (${marks}) AND s.state IN ${OPEN_STEP_STATES_SQL} AND s.kind='EDIT_PRICE' AND s.target_id IS NOT NULL
+      AND a.state='AWAITING_OBSERVATION' AND a.resolution='AWAITING_CONFIRMATION' AND c.state<>'STOPPED'
+      AND (s.deadline_at IS NULL OR s.deadline_at > ?)
+  `).all(...accounts, now) as Array<RawWaitingRow & { response: string | null }>).map(({ response, ...row }): RawWaitingRow => ({
+    ...row,
+    // The buyer pays the new price by the wallet's own stated minimum, or by the fee table as it stood when Steam answered, as the listings page reads it.
+    buyerPriceCents: row.receiveCents === null ? null : buyerPaysFor('steam', row.receiveCents, feeTermsNow(walletOf(row.accountId), row.waitingSince ?? new Date(0).toISOString(), row.currency)),
+    confirmBy: priceChangeConfirmer(response) ?? 'phone'
+  }));
+
   // A row whose first walk has no finished time sorts last rather than first: "unknown" is not
   // "longest waiting", and guessing the urgent end of the list is the one place it would matter.
-  const rows = [...listings, ...offers].map(withConfirmation)
+  const rows = [...listings, ...offers, ...buyOrders, ...priceChanges].map(withConfirmation)
     .sort((left, right) => order(left.waitingSince).localeCompare(order(right.waitingSince))
       || left.accountId.localeCompare(right.accountId)
       || left.id.localeCompare(right.id))

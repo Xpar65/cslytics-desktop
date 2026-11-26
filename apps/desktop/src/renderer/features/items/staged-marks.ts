@@ -1,6 +1,7 @@
 import { convert, type FxRates } from '@cslytics/market-data';
 import { buyerCentsOf, venueCurrency, type StagedEntry, type StagedRow, type Venue } from '../../components/listing-workspace-store.js';
 import { currencyCodeOf, formatAmount, formatConverted } from '../../lib/money.js';
+import { feeTermsNow } from '../../lib/wallet-minimums.js';
 
 /**
  * The listing workspaces' rows, as the Items page marks them on the float curve.
@@ -30,25 +31,28 @@ export type StagedUnit = {
 /**
  * The units of every row on screen. A handed row is the outbox's until the engine answers and is
  * not drawn; a refused row is back on screen and is. A row with no market name has no curve, and
- * one with no float has nowhere on it to sit.
+ * one with no float has nowhere on it to sit. Each is priced as it would list at `now`, on its own
+ * wallet.
  */
 export function stagedUnits(
   rows: ReadonlyArray<StagedRow<StagedEntry>>,
-  accounts: ReadonlyArray<{ id: string; currency?: number | null | undefined }>
+  accounts: ReadonlyArray<{ id: string; currency?: number | null | undefined }>,
+  now: Date
 ): StagedUnit[] {
   const units: StagedUnit[] = [];
   for (const row of rows) {
     if (row.state === 'handed') continue;
     const name = row.entry.marketHashName;
     if (typeof name !== 'string' || name === '' || row.entry.paintWear === null) continue;
+    const currency = venueCurrency(row.venue, accounts.find((account) => account.id === row.entry.accountId)?.currency);
     units.push({
       key: row.key,
       marketHashName: name,
       imageUrl: row.entry.imageUrl,
       float: row.entry.paintWear,
       venue: row.venue,
-      buyerCents: buyerCentsOf(row.venue, row.price, row.basis),
-      currency: venueCurrency(row.venue, accounts.find((account) => account.id === row.entry.accountId)?.currency)
+      buyerCents: buyerCentsOf(row.venue, row.price, row.basis, feeTermsNow(currency, now)),
+      currency
     });
   }
   return units;

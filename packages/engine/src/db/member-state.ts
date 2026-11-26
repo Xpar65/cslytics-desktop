@@ -7,9 +7,10 @@ import { OPEN_STEP_STATES_SQL } from './work.js';
  * (`COMMAND_MEMBER_STATES` in `db/alphabets.ts`): refused before any hop existed, stopped before
  * any was sent, sold out from under its chain. Everything else is its hops in `work_step`
  * (consolidation plan D2): a store is one hop, a transfer between units a retrieve then a store, a
- * reprice a delist then a listing, a listing from a unit a retrieve then the listing. The hop a
- * member is on is its earliest open hop, else its latest failed one (the hops after it were never
- * reached, and the failure is what there is to say), else its last settled one.
+ * reprice one price change in place, a relist a delist then a listing, a listing from a unit a
+ * retrieve then the listing. The hop a member is on is its earliest open hop, else its latest
+ * failed one (the hops after it were never reached, and the failure is what there is to say),
+ * else its last settled one.
  *
  * These fragments are shared by `read/queries/work.ts` and `orchestrate/command.ts`, so the work
  * panel and `command.read` cannot disagree. They expect the command aliased `c` and the member
@@ -20,10 +21,19 @@ import { OPEN_STEP_STATES_SQL } from './work.js';
  * The hop's stored state is the one truth: its driver reflects its action onto it as the action
  * moves (`WorkStore.reflectAction`), and what the venue shows meanwhile (a listing waiting on the
  * phone, an offer waiting on the phone or the buyer, a retrieved item CSFloat has not seen yet) is
- * read from the venue's rows here and never copied onto the hop. A queued hop with a reason is one
- * nothing will send until a person acts on the reason: `BLOCKED` (OP-08). A hop proved not
- * applied reads `RETRYING` until its resend goes out, and the resend's own state from then on.
+ * read from the venue's rows here and never copied onto the hop; a lower listing price Steam holds
+ * until it is confirmed is read from the answer that said so, kept on the hop's action. A queued
+ * hop with a reason is one nothing will send until a person acts on the reason: `BLOCKED` (OP-08).
+ * A hop proved not applied reads `RETRYING` until its resend goes out, and the resend's own state
+ * from then on.
  */
+
+/**
+ * The reason a CSFloat listing carries while it waits for CSFloat's copy of the inventory to show
+ * its item (`403 code 17`, CSF-58). The panel reads such a hop as `AWAITING_VENUE`, not as a
+ * resend of something a walk proved absent, and the window shows the reason with the countdown.
+ */
+export const CSFLOAT_INVENTORY_WAIT_REASON = 'Waiting for CSFloat to show the item in its inventory';
 
 /** The action the row is drawn on: the hop's own, or the last an earlier hop of the member had. */
 export const STEP_ACTION_SQL = `COALESCE(s.action_id, (
@@ -40,6 +50,7 @@ const EFFECTIVE_STATE_SQL = `(CASE
 export const STEP_STATE_SQL = `CASE
       WHEN s.state='DONE' THEN 'COMPLETE'
       WHEN s.state IN ('FAILED','STOPPED') THEN s.state
+      WHEN s.kind='CSFLOAT_CREATE' AND ${EFFECTIVE_STATE_SQL}='RETRYING' AND s.reason='${CSFLOAT_INVENTORY_WAIT_REASON}' THEN 'AWAITING_VENUE'
       WHEN ${EFFECTIVE_STATE_SQL}='RETRYING' THEN 'RETRYING'
       WHEN s.state='QUEUED' AND s.reason IS NOT NULL THEN 'BLOCKED'
       WHEN s.kind='RETRIEVE' AND ${EFFECTIVE_STATE_SQL} IN ('SENT','AWAITING_OBSERVATION') AND EXISTS (
@@ -60,6 +71,7 @@ export const STEP_STATE_SQL = `CASE
       WHEN ${EFFECTIVE_STATE_SQL}='AWAITING_OBSERVATION' AND s.kind='LIST' AND EXISTS (
         SELECT 1 FROM venue_order l WHERE l.account_id=s.account_id AND l.local_id=s.local_id AND l.venue='steam' AND l.side='SELL'
           AND l.state='PENDING_EXTERNAL' AND l.gone_obs IS NULL) THEN 'AWAITING_CONFIRMATION'
+      WHEN ${EFFECTIVE_STATE_SQL}='AWAITING_OBSERVATION' AND s.kind='EDIT_PRICE' AND own.resolution='AWAITING_CONFIRMATION' THEN 'AWAITING_CONFIRMATION'
       WHEN ${EFFECTIVE_STATE_SQL}='SENT' THEN 'RUNNING'
       WHEN ${EFFECTIVE_STATE_SQL}='AWAITING_OBSERVATION' THEN 'AWAITING_OBSERVATION'
       ELSE 'QUEUED'

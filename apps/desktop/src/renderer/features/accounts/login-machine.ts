@@ -53,9 +53,9 @@ export function waitingDetail(step: LoginStep, elapsedMs: number): string | null
   const seconds = Math.floor(elapsedMs / 1000);
   if (seconds < 4) return null;
   if (seconds < 15) {
-    return step === 'starting-qr' ? 'Steam usually answers in a moment.' : `Waiting on Steam — ${seconds}s.`;
+    return step === 'starting-qr' ? 'Steam usually answers in a moment.' : `Waiting on Steam (${seconds}s).`;
   }
-  if (seconds < 40) return `Still waiting on Steam — ${seconds}s. Slow answers are normal under load.`;
+  if (seconds < 40) return `Still waiting on Steam (${seconds}s). Slow answers are normal under load.`;
   return `Steam has not answered in ${seconds}s. You can keep waiting, or cancel and try again.`;
 }
 
@@ -64,7 +64,7 @@ export function deadlineFailure(step: LoginStep): Failure {
   return {
     title: 'Steam did not answer',
     detail:
-      `${stepLabel(step)} — no response in ${Math.round(RESPONSE_DEADLINE_MS / 1000)}s. `
+      `${stepLabel(step)}: no response in ${Math.round(RESPONSE_DEADLINE_MS / 1000)}s. `
       + 'The attempt may still be running at Steam, so this is not proof that it failed. '
       + 'Check the Steam mobile app for a pending approval before trying again.',
     resume: 'restart',
@@ -108,7 +108,7 @@ export function classifyFailure(error: unknown): Failure {
   if (/^(InvalidLoginAuthCode|ExpiredLoginAuthCode)$/i.test(reason)) {
     return {
       title: 'That email code was not accepted',
-      detail: 'Steam emails a code to the address on the account. Use the newest one — older codes expire.',
+      detail: 'Steam emails a code to the address on the account. Use the newest one; older codes expire.',
       resume: 'guard',
       ambiguous: false
     };
@@ -132,7 +132,7 @@ export function classifyFailure(error: unknown): Failure {
   if (/^(RateLimitExceeded|AccountLoginDeniedThrottle)$/i.test(reason)) {
     return {
       title: 'Steam is rate-limiting sign-ins',
-      detail: 'Too many attempts came from this machine. Wait roughly 30 minutes — retrying now only extends the block.',
+      detail: 'Too many attempts came from this machine. Wait about 30 minutes; retrying sooner extends the block.',
       resume: 'restart',
       ambiguous: false
     };
@@ -261,7 +261,7 @@ export function describeQr(state: QrState, remainingMs: number): QrProgress {
     return {
       kind: 'waiting',
       tone: 'busy',
-      title: 'Scanned — waiting for approval',
+      title: 'Scanned, waiting for approval',
       detail: `Your phone has the request. Approve it there. ${seconds}s left.`
     };
   }

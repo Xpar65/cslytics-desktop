@@ -32,6 +32,7 @@ export function stageItems(staged: readonly StagedItem[]): StagedListItem[] {
       marketHashName: row.marketHashName,
       imageUrl: row.imageUrl,
       paintWear: row.paintWear ?? null,
+      accessories: row.accessories,
       localId: row.localId,
       place: { icon: place.icon ?? 'package', label: place.label },
       ...(row.location === 'CASKET' ? {

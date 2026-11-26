@@ -1,10 +1,10 @@
 import React, { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from './Icon.js';
 import { chipLabel } from '../lib/labels.js';
-import { addChip, completions, ownedSuggestions, parse, removeChip, type ChipKind, type FilterChip, type ScopeAccount, type ScopeUnit } from './filter-grammar.js';
+import { addChip, completions, distinctSuggestions, ownedSuggestions, parse, removeChip, type ChipKind, type FilterChip, type ScopeAccount, type ScopeUnit } from './filter-grammar.js';
 
 /** A row in the list: a chip to add, or, with `fill`, text to put in the box and keep typing. */
-type Suggestion = {
+export type Suggestion = {
   id: string;
   group: string;
   label: string;
@@ -13,6 +13,53 @@ type Suggestion = {
   chip?: FilterChip | undefined;
   fill?: string | undefined;
 };
+
+/** What `catalogue.suggest` answers. `weapons` and the `skins` counts come only when asked to browse. */
+export type SuggestAnswer = {
+  items?: Array<{ name: string; category: string; owned?: number }>;
+  collections?: Array<{ id: string; name: string; skins?: number }>;
+  keywords?: Array<{ kind: 'item' | 'rarity'; text: string; label: string; rarityId?: string; skins?: number }>;
+  weapons?: Array<{ name: string; category: string; skins: number }>;
+  pending?: boolean;
+} | null | undefined;
+
+/**
+ * The catalogue's answer as the Items page's rows, in the order they are offered.
+ *
+ * The names that stand for many items come first: a type, a weapon, a collection, a grade. Main
+ * matches those by whole words, so they are only here when the text really names one, and `awp`
+ * then Enter shows every AWP. A typed skin (`awp asiimov`) names none of them, so its first row is
+ * the item, and Enter opens it as it always did. A category is a `type` chip here, never the
+ * `item` chip the other pages make of it, because on this page an `item` opens a page.
+ */
+export function browseRows(result: SuggestAnswer): Suggestion[] {
+  const count = (skins: number | undefined): string | undefined =>
+    (skins === undefined ? undefined : `${skins.toLocaleString()} ${skins === 1 ? 'item' : 'items'}`);
+  const keywords = result?.keywords ?? [];
+  return [
+    ...keywords.filter((keyword) => keyword.kind === 'item').map((keyword) => ({
+      id: `type:${keyword.text}`, group: 'Type', label: keyword.label, detail: count(keyword.skins),
+      kind: 'type' as const, chip: { kind: 'type' as const, text: keyword.text }
+    })),
+    ...(result?.weapons ?? []).map((weapon) => ({
+      id: `weapon:${weapon.name}`, group: 'Weapon', label: weapon.name, detail: count(weapon.skins),
+      kind: 'weapon' as const, chip: { kind: 'weapon' as const, text: weapon.name }
+    })),
+    ...(result?.collections ?? []).map((collection) => ({
+      id: `collection:${collection.id}`, group: 'Collection', label: collection.name, detail: count(collection.skins),
+      kind: 'collection' as const, chip: { kind: 'collection' as const, text: collection.name }
+    })),
+    ...keywords.filter((keyword) => keyword.kind === 'rarity').map((keyword) => ({
+      id: `keyword:rarity:${keyword.text}`, group: 'Rarity', label: keyword.label,
+      kind: 'rarity' as const, chip: { kind: 'rarity' as const, text: keyword.text, ...(keyword.rarityId ? { rarityId: keyword.rarityId } : {}) }
+    })),
+    ...(result?.items ?? []).map((item) => ({
+      id: `item:${item.name}`, group: 'Items', label: item.name,
+      detail: item.owned ? `${item.category} · ${item.owned.toLocaleString()} owned` : item.category,
+      kind: 'item' as const, chip: { kind: 'item' as const, text: item.name }
+    }))
+  ];
+}
 
 /** Long enough that a fast typist makes one round trip per word, short enough to feel immediate. */
 const DEBOUNCE_MS = 60;
@@ -59,7 +106,7 @@ const PENDING_ASKS = 20;
  * one, Left and Right move along them, Home and End go to the first chip and back to the box, and
  * Backspace or Delete removes the one in focus. Backspace in an empty box removes the last chip.
  */
-export function FilterBar({ chips, onChange, accounts = NONE, units = NONE, kinds, holdingsOf, itemsOnly = false, label = 'Filter inventory', placeholder = 'Filter: awp fn st, f > 0.15, nf < 0.01' }: {
+export function FilterBar({ chips, onChange, accounts = NONE, units = NONE, kinds, holdingsOf, browse = false, label = 'Filter inventory', placeholder = 'Filter: awp fn st, f > 0.15, nf < 0.01' }: {
   chips: readonly FilterChip[];
   onChange: (next: FilterChip[]) => void;
   /** The scope's accounts, so typing one's name narrows to it. */
@@ -75,11 +122,11 @@ export function FilterBar({ chips, onChange, accounts = NONE, units = NONE, kind
    */
   holdingsOf?: readonly string[] | undefined;
   /**
-   * Offer the catalogue's item names and nothing else. A category comes back as an `item` chip
-   * too (it narrows by name), so `kinds` alone cannot leave it out; the Items page, which opens
-   * one item rather than filtering many, has no use for one.
+   * The Items page's bar, which looks through the catalogue rather than through holdings. The
+   * catalogue is asked for the names that stand for many items too, weapons among them, and they
+   * are listed ahead of the item names (`browseRows`); nothing applied to an item is offered.
    */
-  itemsOnly?: boolean | undefined;
+  browse?: boolean | undefined;
   label?: string | undefined;
   placeholder?: string | undefined;
 }): React.JSX.Element {
@@ -161,30 +208,33 @@ export function FilterBar({ chips, onChange, accounts = NONE, units = NONE, kind
     let timer: ReturnType<typeof setTimeout>;
     const ask = (): void => {
       asked += 1;
-      void window.trading.invoke({ type: 'catalogue.suggest', text: trimmed, limit: 8, ...(holdingScope ? { accountIds: holdingScope.split('\0') } : {}) })
+      void window.trading.invoke({ type: 'catalogue.suggest', text: trimmed, limit: 8, ...(holdingScope ? { accountIds: holdingScope.split('\0') } : {}), ...(browse ? { browse: true } : {}) })
         .then((answer) => {
           if (!live) return;
-          const result = answer as {
-            items?: Array<{ name: string; category: string; owned?: number }>;
-            collections?: Array<{ id: string; name: string }>;
-            keywords?: Array<{ kind: 'item' | 'rarity'; text: string; label: string; rarityId?: string }>;
-            pending?: boolean;
-          };
+          const result = answer as SuggestAnswer;
           // Main was still counting what the accounts hold, so this list is in the plain order.
           // Asking again picks the counts up once they land; the highlight is held by id, so a row
           // that moves keeps it.
           if (result?.pending && asked < PENDING_ASKS) timer = setTimeout(ask, DEBOUNCE_MS);
+          if (browse) { setRemote(browseRows(result)); return; }
+          const items = result?.items ?? [];
           setRemote([
-            ...(result?.items ?? []).map((item) => ({
+            ...items.map((item) => ({
               id: `item:${item.name}`, group: 'Items', label: item.name,
               detail: item.owned ? `${item.category} · ${item.owned.toLocaleString()} owned` : item.category,
               kind: 'item' as const, chip: { kind: 'item' as const, text: item.name }
+            })),
+            // A sticker, patch or charm is also something an item can carry, so it is offered a
+            // second way: the items that have it applied. A bar that cannot ask that drops the row.
+            ...items.filter((item) => APPLIED_CATEGORIES.has(item.category)).map((item) => ({
+              id: `applied:${item.name}`, group: 'Applied', label: `With ${item.name}`, detail: `${item.category} applied`,
+              kind: 'applied' as const, chip: { kind: 'applied' as const, text: item.name }
             })),
             ...(result?.collections ?? []).map((collection) => ({
               id: `collection:${collection.id}`, group: 'Collection', label: collection.name,
               kind: 'collection' as const, chip: { kind: 'collection' as const, text: collection.name }
             })),
-            ...(itemsOnly ? [] : result?.keywords ?? []).map((keyword) => ({
+            ...(result?.keywords ?? []).map((keyword) => ({
               id: `keyword:${keyword.kind}:${keyword.text}`, group: keyword.kind === 'rarity' ? 'Rarity' : 'Category', label: keyword.label,
               kind: keyword.kind, chip: { kind: keyword.kind, text: keyword.text, ...(keyword.rarityId ? { rarityId: keyword.rarityId } : {}) } as FilterChip
             }))
@@ -194,12 +244,13 @@ export function FilterBar({ chips, onChange, accounts = NONE, units = NONE, kind
     };
     timer = setTimeout(ask, DEBOUNCE_MS);
     return () => { live = false; clearTimeout(timer); };
-  }, [text, holdingScope, itemsOnly]);
+  }, [text, holdingScope, browse]);
 
   // The grammar's strong forms first, which is what stops the item matcher eating `fn`. Names the
-  // user chose come before the catalogue's: a unit called "Knives" is what "knives" meant.
+  // user chose come before the catalogue's: a unit called "Knives" is what "knives" meant. A chip
+  // two lists both offer (a rarity the grammar parses and the catalogue suggests) is listed once.
   const suggestions = useMemo(
-    () => [...local, ...owned, ...remote].filter((suggestion) => allowed(suggestion.kind)),
+    () => distinctSuggestions([...local, ...owned, ...remote]).filter((suggestion) => allowed(suggestion.kind)),
     [local, owned, remote, kinds]
   );
   const groups = useMemo(() => {
@@ -413,5 +464,11 @@ const GROUP: Readonly<Record<string, string>> = {
   item: 'Items',
   name: 'Items',
   unit: 'Storage unit',
-  account: 'Account'
+  account: 'Account',
+  applied: 'Applied',
+  weapon: 'Weapon',
+  type: 'Type'
 };
+
+/** The catalogue's categories of things an owner applies to an item rather than holds on their own. */
+const APPLIED_CATEGORIES: ReadonlySet<string> = new Set(['Sticker', 'Patch', 'Charm']);

@@ -1,14 +1,23 @@
 import React from 'react';
 import type { ListingPageRow, ListingVenue } from '@cslytics/engine';
+import type { AppliedValue, NamedAccessory } from '../../../shared/accessories.js';
 import { Button, Spinner } from '../../components/ui.js';
 import { stopTilePress } from '../../components/ItemTile.js';
-import { currencyCodeOf, formatAmount } from '../../lib/money.js';
+import { amountParts } from '../../lib/money.js';
 import { CSFLOAT_STATE, LISTING_STATUS, stateLabel, type StateLabel } from '../../lib/labels.js';
 
 /**
  * What the Listings page, its tiles and its inspector all say the same way: whose venue a
  * listing is on, what state it is in, what it is called, and money with its currency.
  */
+
+/**
+ * A lower price asked for on a Steam listing and not yet confirmed, as the listings read reports
+ * it: what the seller would receive and a buyer pay at the new price, when Steam answered that it
+ * holds it (an ISO-8601 instant), and who confirms it. Until it is confirmed, the listing stays on
+ * sale at the price it has.
+ */
+export type PendingPriceChange = NonNullable<ListingPageRow['pendingPriceChange']>;
 
 /** A listing after the main process has attached what the catalogue knows. The engine supplies none of it. */
 export type NamedListing = ListingPageRow & {
@@ -20,6 +29,10 @@ export type NamedListing = ListingPageRow & {
   /** The skin's paint range, for the norm float. `null` when the catalogue does not know the item or it has no wear. */
   minFloat: number | null;
   maxFloat: number | null;
+  /** What is applied to the holding the listing names, named; absent when it names none or could not be read. */
+  accessories?: readonly NamedAccessory[];
+  /** What the stickers and the charm are estimated to add to the item; `null` or absent when nothing applied has a price. */
+  appliedValue?: AppliedValue | null;
 };
 
 /** Account-scoped and venue-scoped, because a listing id is only unique inside one venue's book. */
@@ -47,16 +60,18 @@ export function listingState(venue: ListingVenue, state: string): StateLabel {
  * Money, with the currency it is in — never without.
  *
  * `A$` and `$` differ by one character on a page that shows both, so the ISO code rides along
- * beside the amount. A currency nothing has observed prints the bare number and says so, which is
- * the one case where adding a symbol would be a claim rather than a formatting choice.
+ * beside the amount, printed smaller (`amountParts`). A currency nothing has observed prints the
+ * bare number and says so, which is the one case where adding a symbol would be a claim rather
+ * than a formatting choice. The code is printed once: `formatAmount` carries it, so the figure here
+ * is the amount without it and the tag is the code.
  */
 export function Money({ cents, currency, tone }: { cents: number | null; currency: number | null; tone?: 'quiet' | undefined }): React.JSX.Element {
   if (cents === null) return <span className="quiet">—</span>;
-  const code = currencyCodeOf(currency);
+  const { amount, code } = amountParts(cents, currency);
   return (
     <span className="money" data-tone={tone}>
-      <span className="num">{formatAmount(cents, currency)}</span>
-      <span className="currency-tag">{code || 'currency not observed'}</span>
+      <span className="num">{amount}</span>
+      {code ? <span className="currency-tag">{code}</span> : null}
     </span>
   );
 }

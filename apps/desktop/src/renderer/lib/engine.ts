@@ -170,6 +170,12 @@ export const engine = {
   /** The currency section whole: the base code and the account-pages toggle. */
   writeCurrency: (currency: import('../../shared/api.js').CurrencySettings) =>
     invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.currency', currency }),
+  /** Which time zone dates are printed in: an IANA name, or null to follow Windows. */
+  writeTime: (time: import('../../shared/api.js').TimeSettings) =>
+    invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.time', time }),
+  /** The three shares the applied-value estimate is made from, whole. */
+  writeAppliedValue: (appliedValue: import('../../shared/api.js').AppliedValueSettings) =>
+    invoke<import('../../shared/api.js').DesktopSettings>({ type: 'settings.appliedValue', appliedValue }),
   // Which engine this desktop drives (remote engine host plan), answered by main. `connectHost` and
   // `disconnectHost` swap the engine under the window, which reloads once they answer; the token
   // goes one way and no answer carries it.
@@ -201,11 +207,19 @@ export const engine = {
   /** The market names one item is sold under, each with the units the scope holds. */
   itemVariants: (name: string, accountIds: readonly string[]) =>
     invoke<import('../../shared/market.js').ItemVariants>({ type: 'item.variants', name, accountIds: [...accountIds] }),
-  /** The catalogue's item names for a typed text, held ones first when a scope is named. */
-  suggestItems: (text: string, accountIds?: readonly string[]) =>
-    invoke<{ items?: Array<{ name: string; category: string; image?: string | null; owned?: number }>; pending?: boolean }>(
-      { type: 'catalogue.suggest', text, limit: 1, ...(accountIds && accountIds.length > 0 ? { accountIds: [...accountIds] } : {}) }
+  /**
+   * The catalogue's answer for a typed text, as the Items page's bar is given it: the names that
+   * stand for many items and the best item name, held ones first when a scope is named.
+   */
+  suggestBrowse: (text: string, accountIds?: readonly string[]) =>
+    invoke<import('../components/FilterBar.js').SuggestAnswer>(
+      { type: 'catalogue.suggest', text, limit: 1, browse: true, ...(accountIds && accountIds.length > 0 ? { accountIds: [...accountIds] } : {}) }
     ),
+  /** One page of the skins the Items page's chips name, from `offset`. */
+  catalogueSkins: (chips: readonly import('../components/filter-grammar.js').BrowseChip[], offset: number, limit: number) =>
+    invoke<import('../../shared/market.js').SkinPage>({ type: 'catalogue.skins', chips: [...chips], offset, limit }),
+  /** Every collection there is something to browse under, the newest release first. */
+  catalogueCollections: () => invoke<import('../../shared/market.js').CollectionTile[]>({ type: 'catalogue.collections' }),
   beginQrLogin: () =>
     withDeadline(invoke<{ challengeUrl: string; sessionHandle: string; expiresAtMs: number }>(
       { type: 'auth.beginQr' }

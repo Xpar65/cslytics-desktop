@@ -167,6 +167,17 @@ export function parseShard(bytes: string, ref: ShardRef, expectedRevision: strin
   return { schema: SUPPORTED_SCHEMA, revision, entries };
 }
 
+const RELEASE_DATE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+
+/**
+ * A collection's emblem arrives under two names, read differently on purpose.
+ *
+ * `image` is the emblem where Steam hosts it, and it has always been validated: one this build
+ * cannot load is a broken body. `icon` is the emblem as the catalogue itself serves it, and it may
+ * one day be served from somewhere this build has never heard of. That must cost one picture and
+ * not the name of every collection, so an `icon` that does not load is passed over and `image`
+ * stands in. A release date that is not a date is no date, for the same reason.
+ */
 export function parseCollections(body: unknown): readonly CatalogueCollection[] {
   const root = object(body, 'collections');
   schema(root, 'collections');
@@ -176,7 +187,14 @@ export function parseCollections(body: unknown): readonly CatalogueCollection[] 
     const collection = object(item, `collections[${i}]`);
     const image = collection['image'] ?? null;
     if (image !== null && !isLoadableRef(image)) throw new CatalogueParseError(`collections[${i}].image is not a loadable reference`);
-    return { id: text(collection['id'], `collections[${i}].id`), name: text(collection['name'], `collections[${i}].name`), image: image as string | null };
+    const icon = collection['icon'];
+    const released = collection['release_date'];
+    return {
+      id: text(collection['id'], `collections[${i}].id`),
+      name: text(collection['name'], `collections[${i}].name`),
+      image: isLoadableRef(icon) ? icon : image as string | null,
+      releaseDate: typeof released === 'string' && RELEASE_DATE.test(released) ? released : null
+    };
   });
 }
 

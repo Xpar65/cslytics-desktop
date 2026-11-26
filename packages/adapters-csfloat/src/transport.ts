@@ -1,4 +1,4 @@
-import type { CredentialVault } from '@cslytics/ports';
+import type { CredentialVault, CsfloatBudgetState } from '@cslytics/ports';
 
 /**
  * The one place a CSFloat API key meets the network.
@@ -49,6 +49,29 @@ export type CsfloatRequest = {
   path: string;
   key: string;
   body?: unknown;
+  /**
+   * A call that finishes work already under way: following and telling CSFloat about a sale already
+   * accepted, or a purchase on its way to us. It may spend the shared counter's reserve; nothing else
+   * may (`CsfloatBudgetState`). It never passes a spent counter, nor a route's own small-bucket reserve.
+   */
+  essential?: boolean;
+};
+
+/** What one request did to the shared counter, for a host that logs or measures it. Never carries the key. */
+export type CsfloatRequestEvent = {
+  at: number;
+  accountId: string | null;
+  method: CsfloatRequest['method'];
+  /** The route with ids as `:id` and no query: `GET /api/v1/users/:id/stall`. */
+  route: string;
+  essential: boolean;
+  /** Whether the route draws on the shared counter, as the corpus lists it or as its own headers showed. */
+  shared: boolean;
+  /** The venue's status; null when no answer came back. */
+  status: number | null;
+  /** Why nothing was sent: the shared counter's reserve or its exhaustion, or the route's own cooldown. */
+  blocked: 'reserve' | 'spent' | 'cooldown' | null;
+  rate: CsfloatRate | null;
 };
 
 /**
@@ -58,12 +81,60 @@ export type CsfloatRequest = {
  */
 export const CSFLOAT_HEADROOM = 0.1;
 
+/**
+ * The routes on the counter of 50,000 a day that CSFloat keeps per egress IP across keys
+ * (captured 2026-09-23, 2026-11-12 and 2026-11-13).
+ * A route the list misses joins it the first time its own headers name a counter that large.
+ */
+export const CSFLOAT_SHARED_ROUTES: readonly string[] = [
+  'GET /api/v1/me',
+  'GET /api/v1/users/:id/stall',
+  'GET /api/v1/me/transactions',
+  'GET /api/v1/me/buy-orders',
+  'GET /api/v1/me/account-standing',
+  'DELETE /api/v1/buy-orders/:id',
+  'POST /api/v1/listings',
+  'GET /api/v1/listings/:id'
+];
+
+/** A counter this large is the shared one: every per-key or per-order bucket on record is 2,000 or less. */
+const SHARED_COUNTER_MIN_LIMIT = 10_000;
+
+/** The wait a refusal earns when the venue named none. */
+const DEFAULT_WAIT_MS = 60_000;
+
+type SharedCounter = { limit: number | null; remaining: number | null; resetAtMs: number | null; observedAtMs: number; spentUntilMs: number };
+
 export class CsfloatTransport {
   private readonly cooldowns = new Map<string, number>();
+  private readonly sharedRoutes = new Set<string>(CSFLOAT_SHARED_ROUTES);
+  private shared: SharedCounter | null = null;
   constructor(
     private readonly fetchImpl: typeof fetch = fetch,
-    private readonly timeoutMs = 30_000
+    private readonly timeoutMs = 30_000,
+    private readonly onRequest?: (event: CsfloatRequestEvent) => void
   ) {}
+
+  /**
+   * The shared counter as the last response on it said. A reset that has passed opens it: the venue
+   * starts a new window, and the next response says how much of it is left.
+   */
+  budget(nowMs = Date.now()): CsfloatBudgetState {
+    const counter = this.shared;
+    if (!counter) return { phase: 'open', limit: null, remaining: null, resetAt: null, observedAt: null };
+    const rolled = counter.resetAtMs !== null && nowMs >= counter.resetAtMs;
+    const reserve = counter.limit === null ? 0 : Math.floor(counter.limit * CSFLOAT_HEADROOM);
+    const phase = counter.spentUntilMs > nowMs ? 'spent'
+      : rolled || counter.remaining === null ? 'open'
+        : counter.remaining <= reserve ? 'reserve' : 'open';
+    return {
+      phase,
+      limit: counter.limit,
+      remaining: rolled ? null : counter.remaining,
+      resetAt: counter.resetAtMs === null ? null : new Date(counter.resetAtMs).toISOString(),
+      observedAt: new Date(counter.observedAtMs).toISOString()
+    };
+  }
 
   async send(request: CsfloatRequest): Promise<CsfloatTransportResult> {
     const url = resolve(request.path);
@@ -72,9 +143,26 @@ export class CsfloatTransport {
     // buy-order edit is two a minute, `fixtures/csfloat/INDEX.md`).
     const route = new URL(url).pathname.replace(/\/(listings|trades|buy-orders)\/\d+/, '/$1/:id');
     const lane = `${request.accountId ?? 'transport-contract'}:${request.method}:${route}`;
+    const family = `${request.method} ${route.replace(/\/users\/\d+\//, '/users/:id/')}`;
+    const essential = request.essential === true;
+    const event = (status: number | null, blocked: CsfloatRequestEvent['blocked'], rate: CsfloatRate | null): void =>
+      this.onRequest?.({ at: Date.now(), accountId: request.accountId ?? null, method: request.method, route: family, essential,
+        shared: this.sharedRoutes.has(family), status, blocked, rate });
+    const refuse = (blocked: NonNullable<CsfloatRequestEvent['blocked']>, until: number): CsfloatTransportResult => {
+      const rate = { limit: null, remaining: 0, resetAtMs: until, retryAfterMs: Math.max(0, until - Date.now()) };
+      event(429, blocked, rate);
+      return { kind: 'response', status: 429, ok: false, body: null, text: '', rate };
+    };
+    // The shared counter first: in its reserve only work already under way is sent, and once it is
+    // spent nothing on it is, whichever account or route asks.
+    if (this.sharedRoutes.has(family)) {
+      const phase = this.budget().phase;
+      const until = Math.max(this.shared?.spentUntilMs ?? 0, this.shared?.resetAtMs ?? 0, Date.now() + DEFAULT_WAIT_MS);
+      if (phase === 'spent') return refuse('spent', until);
+      if (phase === 'reserve' && !essential) return refuse('reserve', until);
+    }
     const notBefore = this.cooldowns.get(lane) ?? 0;
-    if (notBefore > Date.now()) return { kind: 'response', status: 429, ok: false, body: null, text: '',
-      rate: {limit:null,remaining:0,resetAtMs:notBefore,retryAfterMs:notBefore-Date.now()} };
+    if (notBefore > Date.now()) return refuse('cooldown', notBefore);
     const headers = new Headers({ Accept: 'application/json', Authorization: request.key });
     if (request.body !== undefined) headers.set('Content-Type', 'application/json');
     let response: Response;
@@ -90,6 +178,7 @@ export class CsfloatTransport {
       const message = error instanceof Error ? error.message : String(error);
       const lower = message.toLowerCase();
       const timedOut = lower.includes('timeout') || lower.includes('abort');
+      event(null, null, null);
       return { kind: 'failure', cause: timedOut ? 'timeout' : 'transport', detail: message };
     }
     // `redirect: 'manual'` surfaces a 30x as an opaque redirect in some runtimes and as a real
@@ -104,9 +193,34 @@ export class CsfloatTransport {
       return { kind: 'failure', cause: 'transport', detail: error instanceof Error ? error.message : String(error) };
     }
     const rate = readRate(response.headers, Date.now());
-    const reserve = rate.limit === null ? 0 : Math.floor(rate.limit * CSFLOAT_HEADROOM);
-    if (response.status === 429 || (rate.remaining !== null && rate.remaining <= reserve)) this.cooldowns.set(lane,Math.max(Date.now()+(rate.retryAfterMs ?? 60_000),rate.resetAtMs ?? 0));
+    if (rate.limit !== null && rate.limit >= SHARED_COUNTER_MIN_LIMIT) this.sharedRoutes.add(family);
+    if (this.sharedRoutes.has(family)) {
+      // The shared counter is judged as a whole (`budget`), never route by route: a 429 or nothing
+      // left spends it until the reset, and its reserve stops all but essential work.
+      this.observeShared(response.status, rate);
+    } else {
+      const reserve = rate.limit === null ? 0 : Math.floor(rate.limit * CSFLOAT_HEADROOM);
+      if (response.status === 429 || (rate.remaining !== null && rate.remaining <= reserve)) {
+        this.cooldowns.set(lane, Math.max(Date.now() + (rate.retryAfterMs ?? DEFAULT_WAIT_MS), rate.resetAtMs ?? 0));
+      }
+    }
+    event(response.status, null, rate);
     return { kind: 'response', status: response.status, ok: response.ok, body: parseJson(text), text, rate };
+  }
+
+  private observeShared(status: number, rate: CsfloatRate): void {
+    const nowMs = Date.now();
+    const previous = this.shared;
+    const exhausted = status === 429 || rate.remaining === 0;
+    const spentUntilMs = exhausted ? Math.max(nowMs + (rate.retryAfterMs ?? DEFAULT_WAIT_MS), rate.resetAtMs ?? 0) : 0;
+    // A refusal without headers says nothing about the count: it keeps what the last answer said.
+    this.shared = {
+      limit: rate.limit ?? previous?.limit ?? null,
+      remaining: rate.remaining ?? (status === 429 ? 0 : previous?.remaining ?? null),
+      resetAtMs: rate.resetAtMs ?? previous?.resetAtMs ?? null,
+      observedAtMs: nowMs,
+      spentUntilMs: Math.max(spentUntilMs, previous && previous.spentUntilMs > nowMs ? previous.spentUntilMs : 0)
+    };
   }
 }
 

@@ -3,6 +3,7 @@ import { ENGINE_HOST_SURFACE, type EngineStatus } from '../../../shared/api.js';
 import { engine } from '../../lib/engine.js';
 import { Button, Field, KeyValue, Notice, Panel, PanelHeader, StatusBadge } from '../../components/ui.js';
 import type { Tone } from '../../lib/labels.js';
+import { formatDateTime } from '../../lib/time.js';
 
 /**
  * Settings › This desktop › Engine host (remote engine host plan D2, D8): which engine this window
@@ -86,7 +87,7 @@ export function EngineHostPanel(): React.JSX.Element {
           ...(remote ? [
             { label: 'Host build', value: remote.build ?? 'Not reported by this host' },
             { label: 'Accounts', value: remote.accounts.length === 0 ? (remote.state === 'connected' ? 'None' : '…') : remote.accounts.join(', ') },
-            { label: 'Since', value: new Date(remote.since).toLocaleString() }
+            { label: 'Since', value: formatDateTime(remote.since) }
           ] : [])
         ]} />
         {remote?.detail && remote.state !== 'connected' ? (
